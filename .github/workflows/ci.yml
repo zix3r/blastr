@@ -3,7 +3,13 @@ name: CI
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "LICENSE-*"
   pull_request:
+    paths-ignore:
+      - "**/*.md"
+      - "LICENSE-*"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -15,10 +21,29 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  # No debug info at all in CI: it slows compiling and linking and bloats the cache.
+  CARGO_PROFILE_DEV_DEBUG: 0
+  RUST_BACKTRACE: 1
 
+# The jobs are split so they run in parallel: clippy only produces check
+# metadata while tests need full codegen, so running them in separate jobs
+# (instead of one after the other) avoids building the dependency tree twice.
 jobs:
-  check:
-    name: Check (${{ matrix.os }})
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Show pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+  clippy:
+    name: Clippy (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -57,18 +82,79 @@ jobs:
 
       - name: Cache Rust builds
         uses: Swatinem/rust-cache@v2
-
-      - name: Check formatting
-        run: cargo fmt --all --check
+        with:
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            clang \
+            lld \
+            pkg-config \
+            libssl-dev \
+            libzstd-dev \
+            libsqlite3-dev \
+            libgit2-dev \
+            libglib2.0-dev \
+            libfontconfig-dev \
+            libwayland-dev \
+            libx11-xcb-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libvulkan1 \
+            libvulkan-dev \
+            libasound2-dev
+
+      - name: Show pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
+
+  headless:
+    name: Headless build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # No GUI system packages here on purpose: the headless build must not need them.
+      - name: Show pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Clippy without the GUI feature
-        run: cargo clippy -p blastr --no-default-features --all-targets -- -D warnings
+        run: cargo clippy -p blastr --no-default-features --all-targets --locked -- -D warnings
 
       - name: Test without the GUI feature
-        run: cargo test -p blastr --no-default-features
+        run: cargo test -p blastr --no-default-features --locked

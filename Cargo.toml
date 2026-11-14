@@ -40,3 +40,12 @@ unsafe_code = "deny"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+
+# Keep backtraces useful for our own crates, but skip the full debug info:
+# it costs compile and link time and tens of gigabytes of target directory.
+[profile.dev]
+debug = "line-tables-only"
+
+# No debug info for dependencies.
+[profile.dev.package."*"]
+debug = false
