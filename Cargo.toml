@@ -1,0 +1,42 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/zix3r/blastr"
+
+[workspace.dependencies]
+blastr-git = { path = "crates/blastr-git", version = "0.1.0" }
+blastr-store = { path = "crates/blastr-store", version = "0.1.0" }
+blastr-core = { path = "crates/blastr-core", version = "0.1.0" }
+blastr-gui = { path = "crates/blastr-gui", version = "0.1.0" }
+
+ra_ap_syntax = "=0.0.358"
+
+gpui-kit = "=0.9.1"
+
+clap = { version = "4.6", features = ["derive"] }
+clap_complete = "4.6"
+directories = "6"
+gix = "0.90"
+rusqlite = { version = "0.42", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
+
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
