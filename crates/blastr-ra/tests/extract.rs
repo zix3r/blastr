@@ -670,3 +670,363 @@ fn only_references_that_do_not_resolve_at_all_are_reported() {
         Certainty::Resolved,
     );
 }
+
+const MACROS_AND_REST: &str = r#"/// Doubles its argument.
+macro_rules! twice {
+    ($value:expr) => {
+        $value * 2
+    };
+}
+
+/// Invokes `twice!` twice, from its own expansion.
+macro_rules! four_times {
+    ($value:expr) => {
+        twice!(twice!($value))
+    };
+}
+
+/// Adds one to `value`.
+pub fn increment(value: u32) -> u32 {
+    value + 1
+}
+
+/// Invokes a macro of this crate.
+pub fn doubled(value: u32) -> u32 {
+    twice!(value)
+}
+
+/// Invokes a macro whose expansion invokes another one.
+pub fn quadrupled(value: u32) -> u32 {
+    four_times!(value)
+}
+
+/// Calls a function in the argument of a macro.
+pub fn doubled_increment(value: u32) -> u32 {
+    twice!(increment(value))
+}
+
+/// Uses only macros of the standard library.
+pub fn counted(value: u32) -> usize {
+    vec![value, value].len()
+}
+
+/// A labelled point.
+pub struct Point {
+    /// The x coordinate.
+    pub x: u32,
+    /// The y coordinate.
+    pub y: u32,
+    /// The label.
+    pub label: &'static str,
+}
+
+/// A pair of numbers.
+pub struct Pair(pub u32, pub u32);
+
+/// Names every field.
+pub fn full(x: u32, y: u32, label: &'static str) -> Point {
+    Point { x, y, label }
+}
+
+/// Takes the other fields from another point.
+pub fn shifted(base: Point) -> Point {
+    Point { x: base.x + 1, ..base }
+}
+
+/// Matches every field.
+pub fn exact(point: Point) -> u32 {
+    let Point { x, y, label: _ } = point;
+    x + y
+}
+
+/// Matches some of the fields.
+pub fn partial(point: Point) -> u32 {
+    let Point { x, .. } = point;
+    x
+}
+
+/// Matches a tuple struct without every field.
+pub fn first(pair: Pair) -> u32 {
+    let Pair(first, ..) = pair;
+    first
+}
+
+/// An enum.
+pub enum State {
+    /// Nothing to do.
+    Idle,
+    /// At work.
+    Busy {
+        /// How far along.
+        progress: u8,
+    },
+}
+
+/// Names every variant.
+pub fn code(state: State) -> u8 {
+    match state {
+        State::Idle => 0,
+        State::Busy { progress } => progress,
+    }
+}
+
+/// Catches the rest.
+pub fn loose(state: State) -> u8 {
+    match state {
+        State::Idle => 0,
+        _ => 1,
+    }
+}
+
+/// Catches a variant with a rest pattern.
+pub fn is_busy(state: &State) -> bool {
+    match state {
+        State::Busy { .. } => true,
+        _ => false,
+    }
+}
+"#;
+
+#[test]
+fn macro_invocations_and_rest_patterns_carry_their_details() {
+    let dir = tempfile::tempdir().expect("a temporary directory is created");
+    write_project(dir.path(), "impact", MACROS_AND_REST);
+    let Some(workspace) = load(dir.path()) else {
+        return;
+    };
+    let graph = extract(&workspace);
+
+    // The macros of the crate are symbols, so invocations of them are edges and
+    // invocations of `vec!` are not.
+    assert_eq!(find(&graph, "impact::twice").path.kind, SymbolKind::Macro);
+    assert_eq!(
+        find(&graph, "impact::four_times").path.kind,
+        SymbolKind::Macro
+    );
+    let mut expands: Vec<(&str, &str)> = graph
+        .edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::Expands)
+        .map(|edge| {
+            assert_eq!(edge.certainty, Certainty::Resolved);
+            assert_eq!(edge.detail, EdgeDetail::None);
+            (
+                graph.symbols[edge.from.0 as usize].path.path.as_str(),
+                graph.symbols[edge.to.0 as usize].path.path.as_str(),
+            )
+        })
+        .collect();
+    expands.sort_unstable();
+    assert_eq!(
+        expands,
+        [
+            ("impact::doubled", "impact::twice"),
+            ("impact::doubled_increment", "impact::twice"),
+            ("impact::quadrupled", "impact::four_times"),
+            ("impact::quadrupled", "impact::twice"),
+        ],
+        "unexpected `Expands` edges"
+    );
+
+    // The site of an invocation is the call in the real file, also for a macro
+    // that the expansion of another macro invokes.
+    let direct = edge(
+        &graph,
+        "impact::doubled",
+        "impact::twice",
+        EdgeKind::Expands,
+        EdgeDetail::None,
+    );
+    assert_eq!(
+        text_at(MACROS_AND_REST, direct),
+        "twice!(value)",
+        "wrong site for a direct invocation"
+    );
+    let nested = edge(
+        &graph,
+        "impact::quadrupled",
+        "impact::four_times",
+        EdgeKind::Expands,
+        EdgeDetail::None,
+    );
+    let inner = edge(
+        &graph,
+        "impact::quadrupled",
+        "impact::twice",
+        EdgeKind::Expands,
+        EdgeDetail::None,
+    );
+    assert_eq!(
+        text_at(MACROS_AND_REST, nested),
+        "four_times!(value)",
+        "wrong site for the outer invocation"
+    );
+    assert_eq!(
+        nested.site, inner.site,
+        "an invocation in an expansion is located at the outer call"
+    );
+
+    // A call written in the argument of a macro is found in its expansion.
+    let argument_call = edge(
+        &graph,
+        "impact::doubled_increment",
+        "impact::increment",
+        EdgeKind::Calls,
+        EdgeDetail::None,
+    );
+    assert_eq!(argument_call.certainty, Certainty::Resolved);
+    let argument_macro = edge(
+        &graph,
+        "impact::doubled_increment",
+        "impact::twice",
+        EdgeKind::Expands,
+        EdgeDetail::None,
+    );
+    assert_eq!(
+        text_at(MACROS_AND_REST, argument_macro),
+        "twice!(increment(value))",
+        "wrong site for the macro invocation"
+    );
+    assert!(
+        argument_macro.site.span.start <= argument_call.site.span.start
+            && argument_call.site.span.end <= argument_macro.site.span.end,
+        "a call in a macro argument is located inside the invocation"
+    );
+
+    // A literal that names every field has nothing to leave out, one with a
+    // spread has.
+    let literal = edge(
+        &graph,
+        "impact::full",
+        "impact::Point",
+        EdgeKind::Constructs,
+        EdgeDetail::None,
+    );
+    assert_eq!(literal.certainty, Certainty::Resolved);
+    let spread = edge(
+        &graph,
+        "impact::shifted",
+        "impact::Point",
+        EdgeKind::Constructs,
+        EdgeDetail::WithRest,
+    );
+    assert_eq!(spread.certainty, Certainty::Resolved);
+    assert_edge(
+        &graph,
+        "impact::shifted",
+        "impact::Point::x",
+        EdgeKind::ReadsField,
+        Certainty::Resolved,
+    );
+
+    // The same holds for patterns, in a record pattern and in a tuple-struct
+    // pattern.
+    let whole = edge(
+        &graph,
+        "impact::exact",
+        "impact::Point",
+        EdgeKind::Matches,
+        EdgeDetail::None,
+    );
+    assert_eq!(whole.certainty, Certainty::Resolved);
+    edge(
+        &graph,
+        "impact::partial",
+        "impact::Point",
+        EdgeKind::Matches,
+        EdgeDetail::WithRest,
+    );
+    edge(
+        &graph,
+        "impact::first",
+        "impact::Pair",
+        EdgeKind::Matches,
+        EdgeDetail::WithRest,
+    );
+
+    // A pattern of an enum variant keeps the details of the `match` it is in.
+    edge(
+        &graph,
+        "impact::code",
+        "impact::State",
+        EdgeKind::Matches,
+        EdgeDetail::MatchExhaustive,
+    );
+    edge(
+        &graph,
+        "impact::code",
+        "impact::State::Busy",
+        EdgeKind::Matches,
+        EdgeDetail::MatchExhaustive,
+    );
+    edge(
+        &graph,
+        "impact::loose",
+        "impact::State",
+        EdgeKind::Matches,
+        EdgeDetail::MatchWildcard,
+    );
+    edge(
+        &graph,
+        "impact::loose",
+        "impact::State::Idle",
+        EdgeKind::Matches,
+        EdgeDetail::MatchWildcard,
+    );
+    // A rest in a variant pattern leaves the detail of the `match` alone.
+    edge(
+        &graph,
+        "impact::is_busy",
+        "impact::State",
+        EdgeKind::Matches,
+        EdgeDetail::MatchWildcard,
+    );
+    edge(
+        &graph,
+        "impact::is_busy",
+        "impact::State::Busy",
+        EdgeKind::Matches,
+        EdgeDetail::MatchWildcard,
+    );
+
+    // No variant, and no tuple struct, ever carries `WithRest` unless it has a
+    // rest pattern of its own.
+    for edge in &graph.edges {
+        if edge.detail != EdgeDetail::WithRest {
+            continue;
+        }
+        let kind = &graph.symbols[edge.to.0 as usize].path.kind;
+        assert_eq!(
+            *kind,
+            SymbolKind::Struct,
+            "`WithRest` on a `{}` instead of a struct",
+            kind
+        );
+    }
+}
+
+/// The edge of `kind` and `detail` between two paths, which must exist.
+fn edge<'a>(
+    graph: &'a RevisionGraph,
+    from: &str,
+    to: &str,
+    kind: EdgeKind,
+    detail: EdgeDetail,
+) -> &'a blastr_model::Edge {
+    let from_id = symbol_id(graph, find(graph, from));
+    let to_id = symbol_id(graph, find(graph, to));
+    graph
+        .edges
+        .iter()
+        .find(|edge| {
+            edge.from == from_id && edge.to == to_id && edge.kind == kind && edge.detail == detail
+        })
+        .unwrap_or_else(|| panic!("no `{kind}` edge with `{detail:?}` from `{from}` to `{to}`"))
+}
+
+/// The text of `source` that `edge` points at.
+fn text_at<'a>(source: &'a str, edge: &blastr_model::Edge) -> &'a str {
+    assert_eq!(edge.site.file, RelPath::new("src/lib.rs"));
+    let span = edge.site.span;
+    &source[span.start as usize..span.end as usize]
+}

@@ -40,12 +40,21 @@ fn collect(node: &SyntaxNode, skip: &[SyntaxNode], out: &mut Vec<String>) {
     }
 }
 
-/// The tokens of `node` concatenated without whitespace or comments.
+/// The tokens of `node` joined without whitespace or comments, except for one
+/// space where two words would otherwise run together (`&mut T`, `dyn Trait`).
 ///
-/// Used for the `<impl Trait for Type>` path segments, where the contract asks
-/// for the source text with all whitespace removed.
+/// Used for the `<impl Trait for Type>` path segments, which must not depend
+/// on how the source is formatted but are read by people.
 pub(crate) fn text_without_ws(node: &SyntaxNode) -> String {
-    tokens(node, &[]).concat()
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let mut text = String::new();
+    for token in tokens(node, &[]) {
+        if text.ends_with(is_word) && token.starts_with(is_word) {
+            text.push(' ');
+        }
+        text.push_str(&token);
+    }
+    text
 }
 
 /// [`hash_tokens`] over an already collected token sequence.
@@ -170,7 +179,16 @@ mod tests {
     #[test]
     fn text_without_ws_joins_tokens() {
         let node = item_of("struct S<T>(T);");
-        assert!(text_without_ws(&node).starts_with("structS<T>(T);"));
+        assert!(text_without_ws(&node).starts_with("struct S<T>(T);"));
+    }
+
+    #[test]
+    fn text_without_ws_keeps_words_apart() {
+        let node = item_of("impl<'a>  Tr  for  &'a   mut   dyn  Other< u8 > {}");
+        assert_eq!(
+            text_without_ws(&node),
+            "impl<'a>Tr for&'a mut dyn Other<u8>{}"
+        );
     }
 
     #[test]

@@ -33,7 +33,8 @@ use std::collections::HashSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use blastr_model::{
-    Certainty, Edge, EdgeDetail, EdgeKind, Location, RevisionGraph, SymbolId, UnresolvedRef,
+    Certainty, Edge, EdgeDetail, EdgeKind, Location, RevisionGraph, SymbolId, SymbolKind,
+    UnresolvedRef,
 };
 use ra_ap_hir::{
     Adt, AsAssocItem, AssocItem, AssocItemContainer, Crate, Field, Function, HirFileId, Impl,
@@ -121,6 +122,7 @@ pub(crate) fn collect(input: Input<'_, '_>) -> Output {
             .collect(),
         impls: Vec::new(),
         quiet: false,
+        expansion_site: None,
     };
     collector.run();
     Output {
@@ -158,6 +160,13 @@ struct Collector<'a, 'db> {
     /// `#[cfg(feature = "x")] fn f() { .. }`). A failure there says nothing
     /// about the reference, so nothing is reported from those regions.
     quiet: bool,
+    /// The location of the outermost macro call whose expansion is being
+    /// walked, if any.
+    ///
+    /// Everything a nested invocation of a workspace macro produces is located at
+    /// that call, because the tokens of the inner call are part of the outer call
+    /// in the real file.
+    expansion_site: Option<Location>,
 }
 
 impl Collector<'_, '_> {
@@ -279,14 +288,14 @@ impl Collector<'_, '_> {
             return;
         }
         if let Some(pat) = ast::TupleStructPat::cast(node.clone()) {
-            self.pattern_path(pat.path(), pat.syntax(), from);
+            self.pattern_path(pat.path(), pat.syntax(), from, tuple_struct_has_rest(&pat));
             for field in pat.fields() {
                 self.visit(field.syntax(), from, depth, false);
             }
             return;
         }
         if let Some(pat) = ast::PathPat::cast(node.clone()) {
-            self.pattern_path(pat.path(), pat.syntax(), from);
+            self.pattern_path(pat.path(), pat.syntax(), from, false);
             return;
         }
         if let Some(expr) = ast::FormatArgsExpr::cast(node.clone()) {
@@ -306,11 +315,13 @@ impl Collector<'_, '_> {
         }
     }
 
-    /// Expands a macro call and walks the expansion.
+    /// Adds the `Expands` edge of a macro call and walks its expansion.
     ///
-    /// The site of every edge found in the expansion is mapped back to the range
-    /// of the macro call in the real file by [`Collector::site`].
+    /// A reference found in the expansion is located at the macro call in the
+    /// real file by [`Collector::site`], and the calls another workspace macro's
+    /// expansion makes are located at the outermost call.
     fn macro_call(&mut self, call: &ast::MacroCall, from: SymbolId, depth: u32) {
+        self.expands(call, from);
         if depth >= MAX_EXPANSION_DEPTH {
             return;
         }
@@ -322,8 +333,48 @@ impl Collector<'_, '_> {
         }
         let previous = self.quiet;
         self.quiet = previous || self.generates_disabled_code(call);
+        // An invocation inside this expansion is still written in this call.
+        let site = self
+            .expansion_site
+            .clone()
+            .or_else(|| self.site(call.syntax()));
+        let outer = std::mem::replace(&mut self.expansion_site, site);
         self.visit(&expanded.value, from, depth + 1, true);
+        self.expansion_site = outer;
         self.quiet = previous;
+    }
+
+    /// Adds the `Expands` edge of an invocation of a workspace macro.
+    ///
+    /// Only macros defined by a workspace member are symbols of the graph; an
+    /// invocation of a macro of the standard library or of a dependency
+    /// resolves to no symbol and produces nothing.
+    fn expands(&mut self, call: &ast::MacroCall, from: SymbolId) {
+        let Some(macro_) = self.guard(|| self.input.sema.resolve_macro_call(call)) else {
+            return;
+        };
+        let Some(id) = self.input.symbols.get(DefKey::Macro(macro_)) else {
+            return;
+        };
+        // An invocation that a macro produced is written where the outermost
+        // call is; the inner call has no text of its own in the real file.
+        let site = match self.expansion_site.clone() {
+            Some(site) => site,
+            None => {
+                let Some(site) = self.site(call.syntax()) else {
+                    return;
+                };
+                site
+            }
+        };
+        self.push(
+            from,
+            id,
+            EdgeKind::Expands,
+            Certainty::Resolved,
+            site,
+            EdgeDetail::None,
+        );
     }
 
     /// Whether the expansion of `call` holds code that the configuration
@@ -374,10 +425,10 @@ impl Collector<'_, '_> {
             }
             // `Wrapper(1)` and `State::Busy(1)` are constructor calls.
             Some(PathResolution::Def(ModuleDef::Adt(adt))) => {
-                self.constructs_adt(adt, from, path.syntax());
+                self.constructs_adt(adt, from, path.syntax(), false);
             }
             Some(PathResolution::Def(ModuleDef::EnumVariant(variant))) => {
-                self.constructs_variant_key(DefKey::Variant(variant), from, path.syntax());
+                self.constructs_variant_key(DefKey::Variant(variant), from, path.syntax(), false);
             }
             Some(_) => {}
             None => self.record_unresolved_path(path),
@@ -549,14 +600,18 @@ impl Collector<'_, '_> {
     /// Visits a struct or variant literal.
     fn record_expr(&mut self, expr: &ast::RecordExpr, from: SymbolId, depth: u32) {
         let path = expr.path();
+        // A spread leaves the other fields to the value it copies them from.
+        let spread = expr
+            .record_expr_field_list()
+            .is_some_and(|list| list.spread().is_some());
         match self.guard(|| self.input.sema.resolve_variant(expr.clone())) {
-            Some(variant) => self.constructs_variant(&variant, from, expr.syntax()),
+            Some(variant) => self.constructs_variant(&variant, from, expr.syntax(), spread),
             None => {
                 if let Some(path) = &path
                     && let Some(PathResolution::Def(ModuleDef::Adt(adt))) =
                         self.guard(|| self.input.sema.resolve_path(path))
                 {
-                    self.constructs_adt(adt, from, path.syntax());
+                    self.constructs_adt(adt, from, path.syntax(), spread);
                 }
             }
         }
@@ -612,7 +667,7 @@ impl Collector<'_, '_> {
 
     /// Visits a record pattern: it matches the struct or variant and its fields.
     fn record_pat(&mut self, pat: &ast::RecordPat, from: SymbolId, depth: u32) {
-        self.pattern_path(pat.path(), pat.syntax(), from);
+        self.pattern_path(pat.path(), pat.syntax(), from, record_pat_has_rest(pat));
         let Some(list) = pat.record_pat_field_list() else {
             return;
         };
@@ -639,13 +694,22 @@ impl Collector<'_, '_> {
 
     /// Adds the `Matches` edge of a pattern that names a struct, variant or
     /// constant.
-    fn pattern_path(&mut self, path: Option<ast::Path>, node: &SyntaxNode, from: SymbolId) {
+    ///
+    /// `rest` says that the pattern ends with `..`, which is recorded on the edge
+    /// to a struct: the pattern then matches whatever fields the struct grows.
+    fn pattern_path(
+        &mut self,
+        path: Option<ast::Path>,
+        node: &SyntaxNode,
+        from: SymbolId,
+        rest: bool,
+    ) {
         let Some(path) = path else {
             return;
         };
-        let detail = self.match_detail(node);
         match self.guard(|| self.input.sema.resolve_path(&path)) {
             Some(PathResolution::Def(def)) => {
+                let leaves_fields_out = rest && matches!(def, ModuleDef::Adt(Adt::Struct(_)));
                 let key = match def {
                     ModuleDef::Adt(adt) => Some(DefKey::Adt(adt)),
                     ModuleDef::EnumVariant(variant) => Some(DefKey::Variant(variant)),
@@ -655,6 +719,11 @@ impl Collector<'_, '_> {
                 if let Some(key) = key
                     && let Some(id) = self.input.symbols.get(key)
                 {
+                    let detail = if leaves_fields_out {
+                        EdgeDetail::WithRest
+                    } else {
+                        self.match_detail(node)
+                    };
                     self.located_edge(
                         from,
                         id,
@@ -801,32 +870,65 @@ impl Collector<'_, '_> {
     }
 
     /// Adds the `Constructs` edge of a struct, union or enum variant literal.
-    fn constructs_variant(&mut self, variant: &Variant, from: SymbolId, node: &SyntaxNode) {
+    ///
+    /// `spread` says that the literal ends with `..base`, which is recorded on the
+    /// edge to a struct.
+    fn constructs_variant(
+        &mut self,
+        variant: &Variant,
+        from: SymbolId,
+        node: &SyntaxNode,
+        spread: bool,
+    ) {
         let key = match variant {
             Variant::Struct(item) => DefKey::Adt(Adt::Struct(*item)),
             Variant::Union(item) => DefKey::Adt(Adt::Union(*item)),
             Variant::EnumVariant(item) => DefKey::Variant(*item),
         };
-        self.constructs_variant_key(key, from, node);
+        self.constructs_variant_key(key, from, node, spread);
     }
 
     /// Adds a `Constructs` edge to the symbol of `key`, when it has one.
-    fn constructs_variant_key(&mut self, key: DefKey, from: SymbolId, node: &SyntaxNode) {
+    fn constructs_variant_key(
+        &mut self,
+        key: DefKey,
+        from: SymbolId,
+        node: &SyntaxNode,
+        spread: bool,
+    ) {
         if let Some(id) = self.input.symbols.get(key) {
+            let detail = self.constructs_detail(id, spread);
             self.located_edge(
                 from,
                 id,
                 EdgeKind::Constructs,
                 Certainty::Resolved,
                 node,
-                EdgeDetail::None,
+                detail,
             );
         }
     }
 
     /// Adds a `Constructs` edge to a struct or union.
-    fn constructs_adt(&mut self, adt: Adt, from: SymbolId, node: &SyntaxNode) {
-        self.constructs_variant_key(DefKey::Adt(adt), from, node);
+    fn constructs_adt(&mut self, adt: Adt, from: SymbolId, node: &SyntaxNode, spread: bool) {
+        self.constructs_variant_key(DefKey::Adt(adt), from, node, spread);
+    }
+
+    /// The detail of a `Constructs` edge to `id`.
+    ///
+    /// Only a struct can be built from another value of its type, and only the
+    /// literal that does it leaves fields out; a variant literal keeps the detail
+    /// its kind always has.
+    fn constructs_detail(&self, id: SymbolId, spread: bool) -> EdgeDetail {
+        if !spread {
+            return EdgeDetail::None;
+        }
+        let symbol = &self.input.graph.symbols[id.0 as usize];
+        if symbol.path.kind == SymbolKind::Struct {
+            EdgeDetail::WithRest
+        } else {
+            EdgeDetail::None
+        }
     }
 
     /// The detail of a `Matches` edge written at `node`.
@@ -1027,6 +1129,18 @@ fn same_kind(left: AssocItem, right: AssocItem) -> bool {
             | (AssocItem::Const(_), AssocItem::Const(_))
             | (AssocItem::TypeAlias(_), AssocItem::TypeAlias(_))
     )
+}
+
+/// Whether a tuple-struct pattern ends with a rest pattern (`Pair(a, ..)`).
+fn tuple_struct_has_rest(pat: &ast::TupleStructPat) -> bool {
+    pat.fields()
+        .any(|field| matches!(field, ast::Pat::RestPat(_)))
+}
+
+/// Whether a record pattern ends with `..` (`Point { x, .. }`).
+fn record_pat_has_rest(pat: &ast::RecordPat) -> bool {
+    pat.record_pat_field_list()
+        .is_some_and(|list| list.rest_pat().is_some())
 }
 
 /// Whether `node` is the target of an assignment or of a mutable borrow.
