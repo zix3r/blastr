@@ -5,7 +5,10 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use crate::{Error, Result};
+/// The error returned when an operation was cancelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("cancelled")]
+pub struct Cancelled;
 
 /// A cheap, cloneable flag used to cancel a running operation from another thread.
 #[derive(Debug, Clone, Default)]
@@ -29,10 +32,10 @@ impl CancelToken {
         self.cancelled.load(Ordering::SeqCst)
     }
 
-    /// Returns `Err(Error::Cancelled)` once cancellation has been requested.
-    pub fn check(&self) -> Result<()> {
+    /// Returns `Err(Cancelled)` once cancellation has been requested.
+    pub fn check(&self) -> Result<(), Cancelled> {
         if self.is_cancelled() {
-            Err(Error::Cancelled)
+            Err(Cancelled)
         } else {
             Ok(())
         }
@@ -58,6 +61,6 @@ mod tests {
         clone.cancel();
 
         assert!(token.is_cancelled());
-        assert!(matches!(token.check(), Err(Error::Cancelled)));
+        assert!(matches!(token.check(), Err(Cancelled)));
     }
 }

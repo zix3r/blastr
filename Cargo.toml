@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+exclude = ["fixtures"]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,26 +11,43 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/zix3r/blastr"
 
 [workspace.dependencies]
+blastr-model = { path = "crates/blastr-model", version = "0.1.0" }
+blastr-ra = { path = "crates/blastr-ra", version = "0.1.0" }
 blastr-git = { path = "crates/blastr-git", version = "0.1.0" }
 blastr-store = { path = "crates/blastr-store", version = "0.1.0" }
 blastr-core = { path = "crates/blastr-core", version = "0.1.0" }
 blastr-gui = { path = "crates/blastr-gui", version = "0.1.0" }
 
+ra_ap_hir = "=0.0.358"
+ra_ap_ide = "=0.0.358"
+ra_ap_ide_db = "=0.0.358"
+ra_ap_load-cargo = "=0.0.358"
+ra_ap_paths = "=0.0.358"
+ra_ap_project_model = "=0.0.358"
 ra_ap_syntax = "=0.0.358"
+ra_ap_vfs = "=0.0.358"
 
 gpui-kit = "=0.9.1"
 
+blake3 = "1"
 clap = { version = "4.6", features = ["derive"] }
 clap_complete = "4.6"
 directories = "6"
 gix = "0.90"
+postcard = { version = "1", features = ["use-std"] }
 rusqlite = { version = "0.42", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+similar = "3.2"
 thiserror = "2"
+toml = "1"
+# Held back: ra_ap_hir_def 0.0.358 pins unicode-ident to a Unicode 17 release,
+# and ra-ap-rustc_lexer refuses to build unless unicode-properties matches.
+unicode-properties = { version = "=0.1.4", default-features = false }
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
+zstd = "0.14"
 
 assert_cmd = "2"
 predicates = "3"
