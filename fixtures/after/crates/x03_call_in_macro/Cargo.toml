@@ -1,0 +1,8 @@
+[package]
+name = "x03-call-in-macro"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "x03_call_in_macro"
+path = "src/lib.rs"

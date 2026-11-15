@@ -1,0 +1,8 @@
+[package]
+name = "c13-macro-def"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "c13_macro_def"
+path = "src/lib.rs"

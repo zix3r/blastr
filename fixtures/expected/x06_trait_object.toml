@@ -1,0 +1,90 @@
+# Dispatch through a trait object.
+crates = ["x06_trait_object"]
+exact_changes = true
+
+[[symbol]]
+path = "x06_trait_object::Shape"
+kind = "trait"
+side = "both"
+
+[[symbol]]
+path = "x06_trait_object::Shape::area"
+kind = "method"
+side = "both"
+
+[[symbol]]
+path = "x06_trait_object::Circle"
+kind = "struct"
+side = "both"
+
+[[symbol]]
+path = "x06_trait_object::Square"
+kind = "struct"
+side = "both"
+
+[[symbol]]
+path = "x06_trait_object::<impl Shape for Circle>"
+kind = "impl"
+side = "both"
+
+[[symbol]]
+path = "x06_trait_object::<impl Shape for Square>"
+kind = "impl"
+side = "both"
+
+[[symbol]]
+path = "x06_trait_object::<impl Shape for Circle>::area"
+kind = "method"
+side = "both"
+
+[[symbol]]
+path = "x06_trait_object::<impl Shape for Square>::area"
+kind = "method"
+side = "both"
+
+[[symbol]]
+path = "x06_trait_object::total"
+kind = "function"
+side = "both"
+
+[[edge]]
+from = "x06_trait_object::total"
+to = "x06_trait_object::Shape::area"
+kind = "calls"
+certainty = "resolved"
+
+[[edge]]
+from = "x06_trait_object::total"
+to = "x06_trait_object::<impl Shape for Circle>::area"
+kind = "may-dispatch-to"
+certainty = "candidate"
+
+[[edge]]
+from = "x06_trait_object::total"
+to = "x06_trait_object::<impl Shape for Square>::area"
+kind = "may-dispatch-to"
+certainty = "candidate"
+
+[[edge]]
+from = "x06_trait_object::<impl Shape for Circle>"
+to = "x06_trait_object::Shape"
+kind = "implements"
+certainty = "resolved"
+
+[[edge]]
+from = "x06_trait_object::<impl Shape for Square>"
+to = "x06_trait_object::Shape"
+kind = "implements"
+certainty = "resolved"
+
+[[edge]]
+from = "x06_trait_object::<impl Shape for Circle>::area"
+to = "x06_trait_object::Shape::area"
+kind = "implements"
+certainty = "resolved"
+
+[[edge]]
+from = "x06_trait_object::<impl Shape for Square>::area"
+to = "x06_trait_object::Shape::area"
+kind = "implements"
+certainty = "resolved"

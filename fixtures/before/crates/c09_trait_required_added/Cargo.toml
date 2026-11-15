@@ -1,0 +1,8 @@
+[package]
+name = "c09-trait-required-added"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "c09_trait_required_added"
+path = "src/lib.rs"

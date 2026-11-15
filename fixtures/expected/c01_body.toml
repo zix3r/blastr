@@ -1,0 +1,10 @@
+crates = ["c01_body"]
+exact_changes = true
+
+[[change]]
+kind = "body"
+symbol = "c01_body::total"
+
+[[no_change]]
+symbol = "c01_body::seed"
+kind = "body"

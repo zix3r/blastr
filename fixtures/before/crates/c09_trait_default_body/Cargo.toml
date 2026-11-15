@@ -1,0 +1,8 @@
+[package]
+name = "c09-trait-default-body"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "c09_trait_default_body"
+path = "src/lib.rs"

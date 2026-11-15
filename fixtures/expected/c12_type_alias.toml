@@ -1,0 +1,10 @@
+crates = ["c12_type_alias"]
+exact_changes = true
+
+[[change]]
+kind = "type-alias"
+symbol = "c12_type_alias::Id"
+
+[[no_change]]
+symbol = "c12_type_alias::next"
+kind = "body"

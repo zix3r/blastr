@@ -1,0 +1,8 @@
+[package]
+name = "x08-field-access"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "x08_field_access"
+path = "src/lib.rs"

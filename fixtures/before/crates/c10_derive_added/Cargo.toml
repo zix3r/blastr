@@ -1,0 +1,8 @@
+[package]
+name = "c10-derive-added"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "c10_derive_added"
+path = "src/lib.rs"

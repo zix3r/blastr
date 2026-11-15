@@ -1,0 +1,56 @@
+# Cross-crate call and type reference.
+crates = ["x04_cross_crate", "x04_cross_crate_lib"]
+exact_changes = true
+
+[[symbol]]
+path = "x04_cross_crate_lib::Widget"
+kind = "struct"
+side = "both"
+
+[[symbol]]
+path = "x04_cross_crate_lib::Widget::width"
+kind = "field"
+side = "both"
+
+[[symbol]]
+path = "x04_cross_crate_lib::make"
+kind = "function"
+side = "both"
+
+[[symbol]]
+path = "x04_cross_crate::Holder"
+kind = "struct"
+side = "both"
+
+[[symbol]]
+path = "x04_cross_crate::Holder::widget"
+kind = "field"
+side = "both"
+
+[[symbol]]
+path = "x04_cross_crate::build"
+kind = "function"
+side = "both"
+
+[[symbol]]
+path = "x04_cross_crate::direct"
+kind = "function"
+side = "both"
+
+[[edge]]
+from = "x04_cross_crate::build"
+to = "x04_cross_crate_lib::make"
+kind = "calls"
+certainty = "resolved"
+
+[[edge]]
+from = "x04_cross_crate::direct"
+to = "x04_cross_crate_lib::make"
+kind = "calls"
+certainty = "resolved"
+
+[[edge]]
+from = "x04_cross_crate::direct"
+to = "x04_cross_crate_lib::Widget"
+kind = "uses-type"
+certainty = "resolved"

@@ -1,0 +1,8 @@
+[package]
+name = "x06-trait-object"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "x06_trait_object"
+path = "src/lib.rs"

@@ -1,0 +1,8 @@
+[package]
+name = "x09-construct"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "x09_construct"
+path = "src/lib.rs"

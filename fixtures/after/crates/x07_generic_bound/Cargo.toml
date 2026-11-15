@@ -1,0 +1,8 @@
+[package]
+name = "x07-generic-bound"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "x07_generic_bound"
+path = "src/lib.rs"

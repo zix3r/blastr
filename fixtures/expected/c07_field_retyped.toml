@@ -1,0 +1,15 @@
+crates = ["c07_field_retyped"]
+exact_changes = true
+
+[[change]]
+kind = "field"
+detail = "member-modified"
+symbol = "c07_field_retyped::Counter::count"
+
+[[change]]
+kind = "signature"
+symbol = "c07_field_retyped::Counter::double"
+
+[[no_change]]
+symbol = "c07_field_retyped::Counter::new"
+kind = "body"

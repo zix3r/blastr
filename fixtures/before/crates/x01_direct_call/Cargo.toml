@@ -1,0 +1,8 @@
+[package]
+name = "x01-direct-call"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "x01_direct_call"
+path = "src/lib.rs"

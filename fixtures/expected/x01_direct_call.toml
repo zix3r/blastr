@@ -1,0 +1,19 @@
+# Direct call: one free function calling another.
+crates = ["x01_direct_call"]
+exact_changes = true
+
+[[symbol]]
+path = "x01_direct_call::callee"
+kind = "function"
+side = "both"
+
+[[symbol]]
+path = "x01_direct_call::caller"
+kind = "function"
+side = "both"
+
+[[edge]]
+from = "x01_direct_call::caller"
+to = "x01_direct_call::callee"
+kind = "calls"
+certainty = "resolved"

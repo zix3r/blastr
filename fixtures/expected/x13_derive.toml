@@ -1,0 +1,43 @@
+# Derived impls and a hand-written impl.
+crates = ["x13_derive"]
+exact_changes = true
+
+[[symbol]]
+path = "x13_derive::Point"
+kind = "struct"
+side = "both"
+
+[[symbol]]
+path = "x13_derive::Point::x"
+kind = "field"
+side = "both"
+
+[[symbol]]
+path = "x13_derive::Point::y"
+kind = "field"
+side = "both"
+
+[[symbol]]
+path = "x13_derive::<impl Debug for Point>"
+kind = "impl"
+side = "both"
+
+[[symbol]]
+path = "x13_derive::<impl Clone for Point>"
+kind = "impl"
+side = "both"
+
+[[symbol]]
+path = "x13_derive::<impl PartialEq for Point>"
+kind = "impl"
+side = "both"
+
+[[symbol]]
+path = "x13_derive::<impl Default for Point>"
+kind = "impl"
+side = "both"
+
+[[symbol]]
+path = "x13_derive::<impl Default for Point>::default"
+kind = "function"
+side = "both"

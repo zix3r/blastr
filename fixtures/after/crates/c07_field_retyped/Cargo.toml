@@ -1,0 +1,8 @@
+[package]
+name = "c07-field-retyped"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "c07_field_retyped"
+path = "src/lib.rs"

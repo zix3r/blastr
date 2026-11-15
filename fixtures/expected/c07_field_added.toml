@@ -1,0 +1,15 @@
+crates = ["c07_field_added"]
+exact_changes = true
+
+[[change]]
+kind = "field"
+detail = "member-added"
+symbol = "c07_field_added::Config::level"
+
+[[change]]
+kind = "body"
+symbol = "c07_field_added::Config::new"
+
+[[no_change]]
+symbol = "c07_field_added::Config::name"
+kind = "body"

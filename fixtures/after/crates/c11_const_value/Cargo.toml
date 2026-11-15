@@ -1,0 +1,8 @@
+[package]
+name = "c11-const-value"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "c11_const_value"
+path = "src/lib.rs"

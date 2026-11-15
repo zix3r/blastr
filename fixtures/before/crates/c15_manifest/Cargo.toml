@@ -1,0 +1,8 @@
+[package]
+name = "c15-manifest"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "c15_manifest"
+path = "src/lib.rs"

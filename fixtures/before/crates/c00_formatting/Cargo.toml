@@ -1,0 +1,8 @@
+[package]
+name = "c00-formatting"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "c00_formatting"
+path = "src/lib.rs"

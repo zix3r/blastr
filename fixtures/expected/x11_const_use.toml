@@ -1,0 +1,30 @@
+# A const and a static used from a function.
+crates = ["x11_const_use"]
+exact_changes = true
+
+[[symbol]]
+path = "x11_const_use::LIMIT"
+kind = "const"
+side = "both"
+
+[[symbol]]
+path = "x11_const_use::NAME"
+kind = "static"
+side = "both"
+
+[[symbol]]
+path = "x11_const_use::describe"
+kind = "function"
+side = "both"
+
+[[edge]]
+from = "x11_const_use::describe"
+to = "x11_const_use::LIMIT"
+kind = "uses-value"
+certainty = "resolved"
+
+[[edge]]
+from = "x11_const_use::describe"
+to = "x11_const_use::NAME"
+kind = "uses-value"
+certainty = "resolved"

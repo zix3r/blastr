@@ -1,0 +1,11 @@
+crates = ["c10_derive_added"]
+exact_changes = true
+
+[[change]]
+kind = "impl"
+detail = "member-added"
+symbol = "c10_derive_added::<impl Clone for Label>"
+
+[[no_change]]
+symbol = "c10_derive_added::Label::new"
+kind = "body"

@@ -1,0 +1,17 @@
+crates = ["c09_trait_default_body"]
+exact_changes = true
+
+[[change]]
+kind = "trait-item"
+detail = "default-body"
+symbol = "c09_trait_default_body::Greeter::greet"
+
+[[no_change]]
+symbol = "c09_trait_default_body::<impl Greeter for Quiet>"
+
+[[no_change]]
+symbol = "c09_trait_default_body::<impl Greeter for Loud>"
+
+[[no_change]]
+symbol = "c09_trait_default_body::<impl Greeter for Loud>::greet"
+kind = "body"

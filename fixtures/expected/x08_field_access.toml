@@ -1,0 +1,44 @@
+# Field reads and writes.
+crates = ["x08_field_access"]
+exact_changes = true
+
+[[symbol]]
+path = "x08_field_access::Config"
+kind = "struct"
+side = "both"
+
+[[symbol]]
+path = "x08_field_access::Config::a"
+kind = "field"
+side = "both"
+
+[[symbol]]
+path = "x08_field_access::Config::b"
+kind = "field"
+side = "both"
+
+[[symbol]]
+path = "x08_field_access::read_a"
+kind = "function"
+side = "both"
+
+[[symbol]]
+path = "x08_field_access::write_b"
+kind = "function"
+side = "both"
+
+[[edge]]
+from = "x08_field_access::read_a"
+to = "x08_field_access::Config::a"
+kind = "reads-field"
+certainty = "resolved"
+
+[[edge]]
+from = "x08_field_access::write_b"
+to = "x08_field_access::Config::b"
+kind = "writes-field"
+certainty = "resolved"
+
+[[no_edge]]
+from = "x08_field_access::read_a"
+to = "x08_field_access::Config::b"

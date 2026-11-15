@@ -1,0 +1,10 @@
+crates = ["c11_const_value"]
+exact_changes = true
+
+[[change]]
+kind = "const-value"
+symbol = "c11_const_value::LIMIT"
+
+[[no_change]]
+symbol = "c11_const_value::limit"
+kind = "body"

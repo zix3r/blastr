@@ -1,0 +1,19 @@
+crates = ["c07_field_removed"]
+exact_changes = true
+
+[[change]]
+kind = "field"
+detail = "member-removed"
+symbol = "c07_field_removed::Account::balance"
+
+[[change]]
+kind = "body"
+symbol = "c07_field_removed::Account::open"
+
+[[change]]
+kind = "body"
+symbol = "c07_field_removed::Account::describe"
+
+[[no_change]]
+symbol = "c07_field_removed::Account::name"
+kind = "body"

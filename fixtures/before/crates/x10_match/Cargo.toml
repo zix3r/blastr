@@ -1,0 +1,8 @@
+[package]
+name = "x10-match"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "x10_match"
+path = "src/lib.rs"

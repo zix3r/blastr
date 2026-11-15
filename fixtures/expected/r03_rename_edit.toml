@@ -1,0 +1,16 @@
+crates = ["r03_rename_edit"]
+exact_changes = true
+
+[[change]]
+kind = "renamed"
+detail = "renamed"
+symbol = "r03_rename_edit::tally"
+from = "r03_rename_edit::total"
+
+[[change]]
+kind = "body"
+symbol = "r03_rename_edit::tally"
+
+[[no_change]]
+symbol = "r03_rename_edit::base"
+kind = "body"

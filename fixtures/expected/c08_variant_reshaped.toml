@@ -1,0 +1,19 @@
+crates = ["c08_variant_reshaped"]
+exact_changes = true
+
+[[change]]
+kind = "variant"
+detail = "member-modified"
+symbol = "c08_variant_reshaped::Shape::Circle"
+
+[[change]]
+kind = "body"
+symbol = "c08_variant_reshaped::radius"
+
+[[change]]
+kind = "body"
+symbol = "c08_variant_reshaped::circle"
+
+[[no_change]]
+symbol = "c08_variant_reshaped::Shape::Square"
+kind = "variant"

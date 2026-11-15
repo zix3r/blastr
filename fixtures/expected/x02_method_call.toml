@@ -1,0 +1,29 @@
+# Method call: the method path uses the type path, not the impl block path.
+crates = ["x02_method_call"]
+exact_changes = true
+
+[[symbol]]
+path = "x02_method_call::Counter"
+kind = "struct"
+side = "both"
+
+[[symbol]]
+path = "x02_method_call::<impl Counter>"
+kind = "impl"
+side = "both"
+
+[[symbol]]
+path = "x02_method_call::Counter::bump"
+kind = "method"
+side = "both"
+
+[[symbol]]
+path = "x02_method_call::drive"
+kind = "function"
+side = "both"
+
+[[edge]]
+from = "x02_method_call::drive"
+to = "x02_method_call::Counter::bump"
+kind = "calls"
+certainty = "resolved"

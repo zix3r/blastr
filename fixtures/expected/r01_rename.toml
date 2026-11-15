@@ -1,0 +1,24 @@
+crates = ["r01_rename"]
+exact_changes = true
+
+[[change]]
+kind = "renamed"
+detail = "renamed"
+symbol = "r01_rename::calculate"
+from = "r01_rename::compute"
+
+[[change]]
+kind = "body"
+symbol = "r01_rename::caller"
+
+[[no_change]]
+symbol = "r01_rename::calculate"
+kind = "added"
+
+[[no_change]]
+symbol = "r01_rename::compute"
+kind = "removed"
+
+[[no_change]]
+symbol = "r01_rename::untouched"
+kind = "body"

@@ -1,0 +1,35 @@
+# Calls that only appear inside macro expansions.
+crates = ["x03_call_in_macro"]
+exact_changes = true
+
+[[symbol]]
+path = "x03_call_in_macro::doubled"
+kind = "function"
+side = "both"
+
+[[symbol]]
+path = "x03_call_in_macro::describe"
+kind = "function"
+side = "both"
+
+[[symbol]]
+path = "x03_call_in_macro::tests"
+kind = "module"
+side = "both"
+
+[[symbol]]
+path = "x03_call_in_macro::tests::doubled_is_twice"
+kind = "function"
+side = "both"
+
+[[edge]]
+from = "x03_call_in_macro::tests::doubled_is_twice"
+to = "x03_call_in_macro::doubled"
+kind = "calls"
+certainty = "resolved"
+
+[[edge]]
+from = "x03_call_in_macro::describe"
+to = "x03_call_in_macro::doubled"
+kind = "calls"
+certainty = "resolved"

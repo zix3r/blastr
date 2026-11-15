@@ -1,0 +1,8 @@
+[package]
+name = "x12-type-alias"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "x12_type_alias"
+path = "src/lib.rs"

@@ -1,0 +1,8 @@
+[package]
+name = "x14-items"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "x14_items"
+path = "src/lib.rs"

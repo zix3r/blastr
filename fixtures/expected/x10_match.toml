@@ -1,0 +1,63 @@
+# Match patterns: exhaustive and with a wildcard arm.
+crates = ["x10_match"]
+exact_changes = true
+
+[[symbol]]
+path = "x10_match::Colour"
+kind = "enum"
+side = "both"
+
+[[symbol]]
+path = "x10_match::Colour::Red"
+kind = "variant"
+side = "both"
+
+[[symbol]]
+path = "x10_match::Colour::Green"
+kind = "variant"
+side = "both"
+
+[[symbol]]
+path = "x10_match::Colour::Blue"
+kind = "variant"
+side = "both"
+
+[[symbol]]
+path = "x10_match::all"
+kind = "function"
+side = "both"
+
+[[symbol]]
+path = "x10_match::partial"
+kind = "function"
+side = "both"
+
+[[edge]]
+from = "x10_match::all"
+to = "x10_match::Colour::Red"
+kind = "matches"
+detail = "match-exhaustive"
+
+[[edge]]
+from = "x10_match::all"
+to = "x10_match::Colour::Green"
+kind = "matches"
+detail = "match-exhaustive"
+
+[[edge]]
+from = "x10_match::all"
+to = "x10_match::Colour::Blue"
+kind = "matches"
+detail = "match-exhaustive"
+
+[[edge]]
+from = "x10_match::partial"
+to = "x10_match::Colour::Red"
+kind = "matches"
+detail = "match-wildcard"
+
+[[edge]]
+from = "x10_match::partial"
+to = "x10_match::Colour"
+kind = "matches"
+detail = "match-wildcard"

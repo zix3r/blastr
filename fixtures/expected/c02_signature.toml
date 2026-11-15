@@ -1,0 +1,14 @@
+crates = ["c02_signature"]
+exact_changes = true
+
+[[change]]
+kind = "signature"
+symbol = "c02_signature::scale"
+
+[[change]]
+kind = "body"
+symbol = "c02_signature::apply"
+
+[[no_change]]
+symbol = "c02_signature::identity"
+kind = "body"

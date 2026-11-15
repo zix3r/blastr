@@ -1,0 +1,40 @@
+# Struct literal and enum variant literal.
+crates = ["x09_construct"]
+exact_changes = true
+
+[[symbol]]
+path = "x09_construct::Point"
+kind = "struct"
+side = "both"
+
+[[symbol]]
+path = "x09_construct::Direction"
+kind = "enum"
+side = "both"
+
+[[symbol]]
+path = "x09_construct::Direction::Up"
+kind = "variant"
+side = "both"
+
+[[symbol]]
+path = "x09_construct::Direction::Down"
+kind = "variant"
+side = "both"
+
+[[symbol]]
+path = "x09_construct::build"
+kind = "function"
+side = "both"
+
+[[edge]]
+from = "x09_construct::build"
+to = "x09_construct::Point"
+kind = "constructs"
+certainty = "resolved"
+
+[[edge]]
+from = "x09_construct::build"
+to = "x09_construct::Direction::Up"
+kind = "constructs"
+certainty = "resolved"

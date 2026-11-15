@@ -1,0 +1,10 @@
+crates = ["c05_removed"]
+exact_changes = true
+
+[[change]]
+kind = "removed"
+symbol = "c05_removed::two"
+
+[[no_change]]
+symbol = "c05_removed::one"
+kind = "body"

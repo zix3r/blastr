@@ -1,0 +1,8 @@
+[package]
+name = "c08-variant-removed"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "c08_variant_removed"
+path = "src/lib.rs"

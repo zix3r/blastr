@@ -1,0 +1,10 @@
+crates = ["c00_formatting"]
+exact_changes = true
+
+[[change]]
+kind = "non-semantic"
+symbol = "c00_formatting"
+
+[[no_change]]
+symbol = "c00_formatting::add"
+kind = "body"

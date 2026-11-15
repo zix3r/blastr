@@ -1,0 +1,15 @@
+crates = ["c08_variant_removed"]
+exact_changes = true
+
+[[change]]
+kind = "variant"
+detail = "member-removed"
+symbol = "c08_variant_removed::Shape::Triangle"
+
+[[change]]
+kind = "body"
+symbol = "c08_variant_removed::describe"
+
+[[no_change]]
+symbol = "c08_variant_removed::is_round"
+kind = "body"

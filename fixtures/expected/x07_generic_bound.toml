@@ -1,0 +1,90 @@
+# Dispatch through a generic bound: same edges as the trait object case.
+crates = ["x07_generic_bound"]
+exact_changes = true
+
+[[symbol]]
+path = "x07_generic_bound::Shape"
+kind = "trait"
+side = "both"
+
+[[symbol]]
+path = "x07_generic_bound::Shape::area"
+kind = "method"
+side = "both"
+
+[[symbol]]
+path = "x07_generic_bound::Circle"
+kind = "struct"
+side = "both"
+
+[[symbol]]
+path = "x07_generic_bound::Square"
+kind = "struct"
+side = "both"
+
+[[symbol]]
+path = "x07_generic_bound::<impl Shape for Circle>"
+kind = "impl"
+side = "both"
+
+[[symbol]]
+path = "x07_generic_bound::<impl Shape for Square>"
+kind = "impl"
+side = "both"
+
+[[symbol]]
+path = "x07_generic_bound::<impl Shape for Circle>::area"
+kind = "method"
+side = "both"
+
+[[symbol]]
+path = "x07_generic_bound::<impl Shape for Square>::area"
+kind = "method"
+side = "both"
+
+[[symbol]]
+path = "x07_generic_bound::total"
+kind = "function"
+side = "both"
+
+[[edge]]
+from = "x07_generic_bound::total"
+to = "x07_generic_bound::Shape::area"
+kind = "calls"
+certainty = "resolved"
+
+[[edge]]
+from = "x07_generic_bound::total"
+to = "x07_generic_bound::<impl Shape for Circle>::area"
+kind = "may-dispatch-to"
+certainty = "candidate"
+
+[[edge]]
+from = "x07_generic_bound::total"
+to = "x07_generic_bound::<impl Shape for Square>::area"
+kind = "may-dispatch-to"
+certainty = "candidate"
+
+[[edge]]
+from = "x07_generic_bound::<impl Shape for Circle>"
+to = "x07_generic_bound::Shape"
+kind = "implements"
+certainty = "resolved"
+
+[[edge]]
+from = "x07_generic_bound::<impl Shape for Square>"
+to = "x07_generic_bound::Shape"
+kind = "implements"
+certainty = "resolved"
+
+[[edge]]
+from = "x07_generic_bound::<impl Shape for Circle>::area"
+to = "x07_generic_bound::Shape::area"
+kind = "implements"
+certainty = "resolved"
+
+[[edge]]
+from = "x07_generic_bound::<impl Shape for Square>::area"
+to = "x07_generic_bound::Shape::area"
+kind = "implements"
+certainty = "resolved"

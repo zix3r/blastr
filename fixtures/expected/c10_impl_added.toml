@@ -1,0 +1,11 @@
+crates = ["c10_impl_added"]
+exact_changes = true
+
+[[change]]
+kind = "impl"
+detail = "member-added"
+symbol = "c10_impl_added::<impl fmt::Display for Point>"
+
+[[no_change]]
+symbol = "c10_impl_added::Point::origin"
+kind = "body"

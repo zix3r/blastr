@@ -1,0 +1,8 @@
+[package]
+name = "c10-impl-removed"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "c10_impl_removed"
+path = "src/lib.rs"

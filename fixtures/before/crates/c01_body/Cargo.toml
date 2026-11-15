@@ -1,0 +1,8 @@
+[package]
+name = "c01-body"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "c01_body"
+path = "src/lib.rs"

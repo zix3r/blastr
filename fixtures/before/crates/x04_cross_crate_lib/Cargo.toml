@@ -1,0 +1,8 @@
+[package]
+name = "x04-cross-crate-lib"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "x04_cross_crate_lib"
+path = "src/lib.rs"

@@ -1,0 +1,11 @@
+crates = ["c03_visibility"]
+exact_changes = true
+
+[[change]]
+kind = "visibility"
+detail = "visibility"
+symbol = "c03_visibility::inc"
+
+[[no_change]]
+symbol = "c03_visibility::apply"
+kind = "body"

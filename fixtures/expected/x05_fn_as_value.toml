@@ -1,0 +1,35 @@
+# A function passed as a value is not a call.
+crates = ["x05_fn_as_value"]
+exact_changes = true
+
+[[symbol]]
+path = "x05_fn_as_value::double"
+kind = "function"
+side = "both"
+
+[[symbol]]
+path = "x05_fn_as_value::apply"
+kind = "function"
+side = "both"
+
+[[symbol]]
+path = "x05_fn_as_value::spread"
+kind = "function"
+side = "both"
+
+[[edge]]
+from = "x05_fn_as_value::spread"
+to = "x05_fn_as_value::double"
+kind = "takes-as-value"
+certainty = "resolved"
+
+[[edge]]
+from = "x05_fn_as_value::spread"
+to = "x05_fn_as_value::apply"
+kind = "calls"
+certainty = "resolved"
+
+[[no_edge]]
+from = "x05_fn_as_value::spread"
+to = "x05_fn_as_value::double"
+kind = "calls"

@@ -1,0 +1,8 @@
+[package]
+name = "r01-rename"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "r01_rename"
+path = "src/lib.rs"

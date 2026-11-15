@@ -1,0 +1,10 @@
+crates = ["c14_attribute"]
+exact_changes = true
+
+[[change]]
+kind = "attribute"
+symbol = "c14_attribute::inc"
+
+[[no_change]]
+symbol = "c14_attribute::add_two"
+kind = "body"

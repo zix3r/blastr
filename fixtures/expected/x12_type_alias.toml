@@ -1,0 +1,19 @@
+# A type alias used in a signature.
+crates = ["x12_type_alias"]
+exact_changes = true
+
+[[symbol]]
+path = "x12_type_alias::Counts"
+kind = "type-alias"
+side = "both"
+
+[[symbol]]
+path = "x12_type_alias::len"
+kind = "function"
+side = "both"
+
+[[edge]]
+from = "x12_type_alias::len"
+to = "x12_type_alias::Counts"
+kind = "uses-type"
+certainty = "resolved"

@@ -1,0 +1,118 @@
+# One of every item kind, with its canonical path.
+crates = ["x14_items"]
+exact_changes = true
+
+[[symbol]]
+path = "x14_items::describe"
+kind = "macro"
+side = "both"
+
+[[symbol]]
+path = "x14_items::nested"
+kind = "module"
+side = "both"
+
+[[symbol]]
+path = "x14_items::nested::helper"
+kind = "function"
+side = "both"
+
+[[symbol]]
+path = "x14_items::Pair"
+kind = "struct"
+side = "both"
+
+[[symbol]]
+path = "x14_items::Pair::0"
+kind = "field"
+side = "both"
+
+[[symbol]]
+path = "x14_items::Pair::1"
+kind = "field"
+side = "both"
+
+[[symbol]]
+path = "x14_items::Bits"
+kind = "union"
+side = "both"
+
+[[symbol]]
+path = "x14_items::Bits::whole"
+kind = "field"
+side = "both"
+
+[[symbol]]
+path = "x14_items::Bits::part"
+kind = "field"
+side = "both"
+
+[[symbol]]
+path = "x14_items::Work"
+kind = "trait"
+side = "both"
+
+[[symbol]]
+path = "x14_items::Work::run"
+kind = "method"
+side = "both"
+
+[[symbol]]
+path = "x14_items::Work::twice"
+kind = "method"
+side = "both"
+
+[[symbol]]
+path = "x14_items::Counter"
+kind = "struct"
+side = "both"
+
+[[symbol]]
+path = "x14_items::<impl Counter>"
+kind = "impl"
+side = "both"
+
+[[symbol]]
+path = "x14_items::Counter::START"
+kind = "const"
+side = "both"
+
+[[symbol]]
+path = "x14_items::Counter::new"
+kind = "function"
+side = "both"
+
+[[symbol]]
+path = "x14_items::Message"
+kind = "enum"
+side = "both"
+
+[[symbol]]
+path = "x14_items::Message::Quit"
+kind = "variant"
+side = "both"
+
+[[symbol]]
+path = "x14_items::Message::Move"
+kind = "variant"
+side = "both"
+
+[[symbol]]
+path = "x14_items::Message::Move::x"
+kind = "field"
+side = "both"
+
+[[symbol]]
+path = "x14_items::Message::Move::y"
+kind = "field"
+side = "both"
+
+[[symbol]]
+path = "x14_items::Message::Write"
+kind = "variant"
+side = "both"
+
+[[symbol]]
+path = "x14_items::Message::Write::0"
+kind = "field"
+side = "both"

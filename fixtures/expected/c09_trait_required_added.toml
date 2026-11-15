@@ -1,0 +1,15 @@
+crates = ["c09_trait_required_added"]
+exact_changes = true
+
+[[change]]
+kind = "trait-item"
+detail = "member-added"
+symbol = "c09_trait_required_added::Shape::perimeter"
+
+[[change]]
+kind = "added"
+symbol = "c09_trait_required_added::<impl Shape for Square>::perimeter"
+
+[[no_change]]
+symbol = "c09_trait_required_added::area_of"
+kind = "body"

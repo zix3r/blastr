@@ -1,0 +1,11 @@
+crates = ["c15_manifest"]
+exact_changes = true
+
+[[change]]
+kind = "manifest"
+detail = "manifest"
+symbol = "c15-manifest"
+
+[[no_change]]
+symbol = "c15_manifest::answer"
+kind = "body"

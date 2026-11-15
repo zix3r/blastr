@@ -1,0 +1,4 @@
+# Test data: the "after" side of every fixture case. Not part of the Blastr workspace.
+[workspace]
+resolver = "3"
+members = ["crates/*"]

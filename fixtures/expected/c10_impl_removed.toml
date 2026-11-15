@@ -1,0 +1,11 @@
+crates = ["c10_impl_removed"]
+exact_changes = true
+
+[[change]]
+kind = "impl"
+detail = "member-removed"
+symbol = "c10_impl_removed::<impl fmt::Display for Point>"
+
+[[no_change]]
+symbol = "c10_impl_removed::Point::origin"
+kind = "body"

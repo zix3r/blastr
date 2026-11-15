@@ -1,0 +1,8 @@
+[package]
+name = "c12-type-alias"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "c12_type_alias"
+path = "src/lib.rs"

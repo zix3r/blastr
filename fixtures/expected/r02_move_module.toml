@@ -1,0 +1,16 @@
+crates = ["r02_move_module"]
+exact_changes = true
+
+[[change]]
+kind = "renamed"
+detail = "renamed"
+symbol = "r02_move_module::b::helper"
+from = "r02_move_module::a::helper"
+
+[[change]]
+kind = "body"
+symbol = "r02_move_module::caller"
+
+[[no_change]]
+symbol = "r02_move_module::base"
+kind = "body"

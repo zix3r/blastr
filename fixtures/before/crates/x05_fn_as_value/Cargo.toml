@@ -1,0 +1,8 @@
+[package]
+name = "x05-fn-as-value"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "x05_fn_as_value"
+path = "src/lib.rs"
