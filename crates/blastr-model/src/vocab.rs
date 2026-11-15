@@ -6,6 +6,7 @@
 //! [`Display`](std::fmt::Display), so serialised data and human-readable output
 //! never disagree.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Generates the `ALL` constant, `as_str` and `Display` for a vocabulary enum.
@@ -32,7 +33,9 @@ macro_rules! model_enum {
 }
 
 /// The kind of definition a symbol is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum SymbolKind {
     /// A free function.
@@ -86,7 +89,7 @@ model_enum!(
 );
 
 /// A directed dependency edge from one symbol to another.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum EdgeKind {
     /// A statically resolved call.
@@ -112,6 +115,8 @@ pub enum EdgeKind {
     UsesValue,
     /// Module, type or impl containing an item.
     Contains,
+    /// An invocation of a `macro_rules!` macro defined in the workspace.
+    Expands,
 }
 
 model_enum!(
@@ -128,11 +133,12 @@ model_enum!(
         MayDispatchTo => "may-dispatch-to",
         UsesValue => "uses-value",
         Contains => "contains",
+        Expands => "expands",
     ]
 );
 
 /// How precisely a dependency edge was resolved.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum Certainty {
     /// Resolved to exactly one definition.
@@ -150,7 +156,7 @@ model_enum!(
 );
 
 /// What kind of change happened to a symbol between two revisions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum ChangeKind {
     /// Whitespace, comments or formatting only.
@@ -210,7 +216,7 @@ model_enum!(
 );
 
 /// Why a dependent symbol is affected by a change.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum ImpactClass {
     /// The code refers to something whose shape changed and must be made
@@ -229,7 +235,9 @@ model_enum!(
 );
 
 /// How strongly the analysis believes an impact is real.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum Confidence {
     /// The impact may exist but the evidence is weak.
@@ -250,7 +258,7 @@ model_enum!(
 );
 
 /// How much execution the analysis is allowed during a build.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum ExecMode {
     /// Build scripts and procedural macros run.
@@ -341,7 +349,7 @@ mod tests {
     #[test]
     fn all_contains_every_variant() {
         assert_eq!(SymbolKind::ALL.len(), 14);
-        assert_eq!(EdgeKind::ALL.len(), 11);
+        assert_eq!(EdgeKind::ALL.len(), 12);
         assert_eq!(Certainty::ALL.len(), 2);
         assert_eq!(ChangeKind::ALL.len(), 16);
         assert_eq!(ImpactClass::ALL.len(), 2);

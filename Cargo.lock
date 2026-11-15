@@ -736,6 +736,7 @@ name = "blastr-model"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "schemars",
  "serde",
  "serde_json",
  "thiserror 2.0.21",

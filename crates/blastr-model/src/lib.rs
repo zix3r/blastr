@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+mod analysis;
 mod cancel;
 mod hashing;
 mod impls;
@@ -14,6 +15,7 @@ mod progress;
 mod types;
 mod vocab;
 
+pub use analysis::*;
 pub use cancel::{CancelToken, Cancelled};
 pub use hashing::{hash_tokens, sketch_similarity, sketch_tokens};
 pub use index::GraphIndex;

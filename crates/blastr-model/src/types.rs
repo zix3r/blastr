@@ -7,6 +7,7 @@
 
 use std::path::PathBuf;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{Certainty, ChangeKind, EdgeKind, ExecMode, SymbolKind};
@@ -20,11 +21,13 @@ pub struct SymbolId(pub u32);
 pub struct CrateId(pub u32);
 
 /// A file path relative to the repository root, always with `/` separators.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 pub struct RelPath(pub String);
 
 /// A range of source text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct Span {
     /// Byte offset of the first character.
     pub start: u32,
@@ -37,7 +40,7 @@ pub struct Span {
 }
 
 /// A range of source text in a file.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct Location {
     /// The file, relative to the repository root.
     pub file: RelPath,
@@ -50,7 +53,9 @@ pub struct Location {
 /// `path` is the canonical path, starting with the crate name:
 /// `billing::discount::apply_discount`. The exact format is fixed by the
 /// extraction rules; two revisions of the same item produce the same value.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 pub struct SymbolPath {
     /// Canonical path, beginning with the crate name.
     pub path: String,
@@ -62,7 +67,9 @@ pub struct SymbolPath {
 }
 
 /// How widely an item can be named, from narrowest to widest.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum Visibility {
     /// Visible in its own module only.
@@ -134,7 +141,7 @@ pub struct Symbol {
 }
 
 /// The kind of Cargo target a crate was built from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum TargetKind {
     /// A library.
@@ -171,7 +178,7 @@ pub struct CrateInfo {
 }
 
 /// Extra information some edges carry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum EdgeDetail {
     /// Nothing extra.
@@ -180,6 +187,9 @@ pub enum EdgeDetail {
     MatchExhaustive,
     /// A `Matches` edge from a `match` that has a catch-all arm.
     MatchWildcard,
+    /// A `Constructs` or `Matches` edge to a struct whose literal or pattern
+    /// ends with `..`, so it does not name every field.
+    WithRest,
 }
 
 /// A dependency: `from` depends on `to`.
@@ -243,7 +253,7 @@ pub struct AnalysisOptions {
 
 /// Identifies exactly what a result describes. Two results with equal keys
 /// describe the same thing and may be shared.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct AnalysisKey {
     /// Identifies the repository.
     pub repository: String,
@@ -273,7 +283,7 @@ pub struct AnalysisKey {
 }
 
 /// One side of a comparison.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum Source {
     /// A committed tree.
@@ -292,7 +302,7 @@ pub enum Source {
 }
 
 /// The two sides being compared.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct Comparison {
     /// The older side.
     pub base: Source,
@@ -314,7 +324,7 @@ pub struct RevSpec {
 }
 
 /// How a file differs between the two sides.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum FileStatus {
     /// Present on the head side only.
@@ -328,7 +338,7 @@ pub enum FileStatus {
 }
 
 /// A file that differs between the two sides.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct ChangedFile {
     /// The path on the head side, or on the base side for a deleted file.
     pub path: RelPath,
@@ -356,7 +366,7 @@ pub struct CommitInfo {
 }
 
 /// Whether something appeared, disappeared or was altered.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum Delta {
     /// Present on the head side only.
@@ -368,7 +378,7 @@ pub enum Delta {
 }
 
 /// The specifics of a change, depending on its kind.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum ChangeDetail {
     /// The kind says everything.
@@ -391,10 +401,12 @@ pub enum ChangeDetail {
     },
     /// For `Manifest`: a one-line description.
     Manifest(String),
+    /// For `ConstValue`: the declared type changed, not only the value.
+    Retyped,
 }
 
 /// One structural difference between the two sides.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Change {
     /// What kind of change it is.
     pub kind: ChangeKind,
@@ -410,7 +422,7 @@ pub struct Change {
 }
 
 /// Something that limits how complete a result is.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum Limit {
     /// A changed range lies in code that is inactive under this configuration.
@@ -429,7 +441,7 @@ pub enum Limit {
 }
 
 /// The result of comparing two sides structurally.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct DiffResult {
     /// What was compared.
     pub comparison: Comparison,
