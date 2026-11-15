@@ -2,8 +2,9 @@
 //!
 //! [`Engine`] turns the two sides of a comparison into [`RevisionGraph`]
 //! values (from the cache when possible, by loading the project with
-//! rust-analyzer otherwise) and hands them to the structural comparison in
-//! [`crate::diff`].
+//! rust-analyzer otherwise), hands them to the structural comparison in
+//! [`crate::diff`], and on request carries the changes through the impact
+//! analysis of [`crate::impact`].
 
 use std::collections::BTreeMap;
 use std::ops::RangeInclusive;
@@ -13,13 +14,16 @@ use std::sync::Arc;
 
 use blastr_git::Repo;
 use blastr_model::{
-    AnalysisKey, AnalysisOptions, CancelToken, Change, ChangedFile, Comparison, DiffResult,
-    ExecMode, FileStatus, Limit, Progress, RelPath, RevSpec, RevisionGraph, Source,
+    Analysis, AnalysisKey, AnalysisOptions, AnalysisParams, Assume, CancelToken, Change,
+    ChangedFile, Comparison, DiffResult, ExecMode, FileStatus, Limit, Progress, RelPath, RevSpec,
+    RevisionGraph, Source,
 };
 
 use crate::codec::{decode_graph, encode_graph};
+use crate::config::IgnoreSet;
 use crate::error::{Error, Result};
 use crate::hunks::{changed_lines, overlaps};
+use crate::impact::ImpactInput;
 
 /// The toolchain recorded in an analysis key when `rustc --version` cannot be run.
 const UNKNOWN_TOOLCHAIN: &str = "unknown";
@@ -29,6 +33,16 @@ const MANIFEST_FILE: &str = "Cargo.toml";
 
 /// The file name that fixes the dependency graph of the project.
 const LOCK_FILE: &str = "Cargo.lock";
+
+/// Text hashed into every result key ahead of the two analysis keys, so that a
+/// result key can never repeat a digest computed for another purpose.
+const RESULT_KEY_DOMAIN: &[u8] = b"analysis-1";
+
+/// Compression level used for cached analyses.
+///
+/// A cached analysis is small next to the graphs it was computed from, but it
+/// is read as often, so the same middle level is used for both.
+const ANALYSIS_COMPRESSION_LEVEL: i32 = 3;
 
 /// Everything one call to [`Engine::graph_for`] needs beyond the source.
 struct GraphRequest<'a> {
@@ -75,6 +89,32 @@ struct OverlayRequest<'a> {
     cancel: &'a CancelToken,
 }
 
+/// Everything one structural comparison reads beyond the revision spec.
+struct CompareRequest<'a> {
+    /// The repository the two sides belong to.
+    repo: &'a Repo,
+    /// The two sides being compared.
+    comparison: &'a Comparison,
+    /// Configuration to analyse the project under.
+    options: &'a AnalysisOptions,
+    /// Toolchain version to record in the analysis keys; `None` when no key is built.
+    toolchain: Option<&'a str>,
+    /// Where progress is reported.
+    progress: &'a dyn Progress,
+    /// Cancellation flag.
+    cancel: &'a CancelToken,
+}
+
+/// A structural comparison together with the graphs it was computed from.
+struct Compared {
+    /// What was compared and what changed structurally.
+    diff: DiffResult,
+    /// The graph of the base side.
+    base: Arc<RevisionGraph>,
+    /// The graph of the head side.
+    head: Arc<RevisionGraph>,
+}
+
 /// Entry point of the analysis pipeline. Owns the cache.
 #[derive(Debug)]
 pub struct Engine {
@@ -109,6 +149,11 @@ impl Engine {
         &self.store
     }
 
+    /// The directory user-level configuration is read from.
+    pub fn config_dir(&self) -> &Path {
+        &self.paths.config_dir
+    }
+
     /// Compares two sides of the repository at `repo_root`.
     pub fn diff(
         &self,
@@ -122,15 +167,241 @@ impl Engine {
         let root = blastr_git::discover(repo_root)?;
         let repo = Repo::open(&root)?;
         let comparison = repo.resolve(spec)?;
-        let changed_files = repo.changed_files(&comparison)?;
         let toolchain = toolchain_version(repo.root());
 
-        let sides = match self.overlay_graphs(OverlayRequest {
-            repo: Some(&repo),
+        let compared = self.compare(CompareRequest {
+            repo: &repo,
             comparison: &comparison,
-            changed_files: &changed_files,
             options,
             toolchain: Some(toolchain.as_str()),
+            progress,
+            cancel,
+        })?;
+        Ok(compared.diff)
+    }
+
+    /// Full impact analysis of a comparison in the repository at `repo_root`.
+    /// Served from the result cache when possible.
+    ///
+    /// A comparison whose two graphs were analysed before with the same
+    /// parameters is answered from the result cache without a snapshot or a
+    /// project load. Otherwise progress reports the phases of
+    /// [`Engine::diff`] followed by `impact`.
+    pub fn analyze(
+        &self,
+        repo_root: &Path,
+        spec: &RevSpec,
+        options: &AnalysisOptions,
+        params: &AnalysisParams,
+        progress: &dyn Progress,
+        cancel: &CancelToken,
+    ) -> Result<Analysis> {
+        cancel.check()?;
+        let root = blastr_git::discover(repo_root)?;
+        let repo = Repo::open(&root)?;
+        let comparison = repo.resolve(spec)?;
+        let toolchain = toolchain_version(repo.root());
+
+        // Both analysis keys are known without loading anything, so a finished
+        // analysis is found before any snapshot or project load starts.
+        let base_key = self.key_for(
+            Some(&repo),
+            &comparison.base,
+            options,
+            Some(toolchain.as_str()),
+        )?;
+        let head_key = self.key_for(
+            Some(&repo),
+            &comparison.head,
+            options,
+            Some(toolchain.as_str()),
+        )?;
+        let key_hash = match (&base_key, &head_key) {
+            (Some(base_key), Some(head_key)) => Some(result_key(base_key, head_key, params)?),
+            // A side without a content id cannot be named, so its analysis
+            // cannot be shared through the cache.
+            _ => None,
+        };
+        if let Some(key_hash) = &key_hash
+            && let Some(bytes) = self.store.get_result(key_hash)?
+            && let Some(analysis) = decode_analysis(&bytes)
+        {
+            return Ok(analysis);
+        }
+
+        let compared = self.compare(CompareRequest {
+            repo: &repo,
+            comparison: &comparison,
+            options,
+            toolchain: Some(toolchain.as_str()),
+            progress,
+            cancel,
+        })?;
+
+        progress.report("impact", 0, None);
+        let ignore = IgnoreSet::new(&params.ignore)?;
+        let output = crate::impact::analyze(
+            &ImpactInput {
+                base: &compared.base,
+                head: &compared.head,
+                changes: &compared.diff.changes,
+                params,
+                ignore: &ignore,
+            },
+            cancel,
+        )?;
+        cancel.check()?;
+
+        let analysis = Analysis {
+            diff: compared.diff,
+            items: output.items,
+            tests: output.tests,
+            limits: output.limits,
+            params: params.clone(),
+        };
+        if let Some(key_hash) = &key_hash {
+            self.store
+                .put_result(key_hash, &encode_analysis(&analysis)?)?;
+        }
+        Ok(analysis)
+    }
+
+    /// The same for two plain directories; nothing is cached.
+    ///
+    /// Progress reports the phases of [`Engine::diff_dirs`] followed by
+    /// `impact`.
+    pub fn analyze_dirs(
+        &self,
+        base: &Path,
+        head: &Path,
+        options: &AnalysisOptions,
+        params: &AnalysisParams,
+        progress: &dyn Progress,
+        cancel: &CancelToken,
+    ) -> Result<Analysis> {
+        let compared = self.diff_dirs(base, head, options, progress, cancel)?;
+
+        progress.report("impact", 0, None);
+        let ignore = IgnoreSet::new(&params.ignore)?;
+        let output = crate::impact::analyze(
+            &ImpactInput {
+                base: &compared.base,
+                head: &compared.head,
+                changes: &compared.result.changes,
+                params,
+                ignore: &ignore,
+            },
+            cancel,
+        )?;
+        cancel.check()?;
+
+        Ok(Analysis {
+            diff: compared.result,
+            items: output.items,
+            tests: output.tests,
+            limits: output.limits,
+            params: params.clone(),
+        })
+    }
+
+    /// What-if: the impact of assuming `assume` happened to `symbol` in the
+    /// working tree.
+    ///
+    /// The change is invented, so it is reported as a comparison of the
+    /// working tree with itself: there are no changed files, and the assumed
+    /// change is the only one. The graph is cached like any other, the
+    /// analysis is not.
+    #[allow(clippy::too_many_arguments)]
+    pub fn what_if(
+        &self,
+        repo_root: &Path,
+        symbol: &str,
+        assume: Assume,
+        options: &AnalysisOptions,
+        params: &AnalysisParams,
+        progress: &dyn Progress,
+        cancel: &CancelToken,
+    ) -> Result<Analysis> {
+        cancel.check()?;
+        let root = blastr_git::discover(repo_root)?;
+        let repo = Repo::open(&root)?;
+        let toolchain = toolchain_version(repo.root());
+
+        let (graph, key, _) = self.graph_for(
+            Some(&repo),
+            &Source::Worktree,
+            GraphRequest {
+                options,
+                phase: "head",
+                toolchain: Some(toolchain.as_str()),
+                progress,
+                cancel,
+            },
+        )?;
+        cancel.check()?;
+        let change = crate::impact::whatif::assumed_change(&graph, symbol, assume)?;
+        // The working tree is compared with itself, so none of its lines
+        // changed and only the limits that come from the repository itself and
+        // from unresolved references apply.
+        let limits = collect_limits(Some(&repo), &graph, &[], &BTreeMap::new(), options)?;
+
+        progress.report("impact", 0, None);
+        let ignore = IgnoreSet::new(&params.ignore)?;
+        let changes = [change.clone()];
+        let output = crate::impact::analyze(
+            &ImpactInput {
+                base: &graph,
+                head: &graph,
+                changes: &changes,
+                params,
+                ignore: &ignore,
+            },
+            cancel,
+        )?;
+        cancel.check()?;
+
+        Ok(Analysis {
+            diff: DiffResult {
+                comparison: Comparison {
+                    base: Source::Worktree,
+                    head: Source::Worktree,
+                },
+                base_key: key.clone(),
+                head_key: key,
+                changed_files: Vec::new(),
+                changes: vec![change],
+                limits,
+            },
+            items: output.items,
+            tests: output.tests,
+            limits: output.limits,
+            params: params.clone(),
+        })
+    }
+
+    /// The structural comparison of both sides of `request`, together with the
+    /// two graphs it was computed from.
+    ///
+    /// Both [`Engine::diff`] and [`Engine::analyze`] start here; only the
+    /// impact step of the latter needs the graphs as well as the result.
+    fn compare(&self, request: CompareRequest<'_>) -> Result<Compared> {
+        let CompareRequest {
+            repo,
+            comparison,
+            options,
+            toolchain,
+            progress,
+            cancel,
+        } = request;
+        cancel.check()?;
+        let changed_files = repo.changed_files(comparison)?;
+
+        let sides = match self.overlay_graphs(OverlayRequest {
+            repo: Some(repo),
+            comparison,
+            changed_files: &changed_files,
+            options,
+            toolchain,
             progress,
             cancel,
         })? {
@@ -139,24 +410,24 @@ impl Engine {
                 // The two sides are different projects, or one of them is
                 // cached, so each side is loaded on its own.
                 let (base, base_key, _) = self.graph_for(
-                    Some(&repo),
+                    Some(repo),
                     &comparison.base,
                     GraphRequest {
                         options,
                         phase: "base",
-                        toolchain: Some(toolchain.as_str()),
+                        toolchain,
                         progress,
                         cancel,
                     },
                 )?;
                 cancel.check()?;
                 let (head, head_key, _) = self.graph_for(
-                    Some(&repo),
+                    Some(repo),
                     &comparison.head,
                     GraphRequest {
                         options,
                         phase: "head",
-                        toolchain: Some(toolchain.as_str()),
+                        toolchain,
                         progress,
                         cancel,
                     },
@@ -178,27 +449,27 @@ impl Engine {
             &changed_files,
             &crate::diff::MatchParams::default(),
         );
-        changes.extend(manifest_changes_of_repo(
-            &repo,
-            &comparison,
-            &changed_files,
-        )?);
-        let changed_lines = self.changed_lines_of(Some(&repo), &comparison, &changed_files)?;
+        changes.extend(manifest_changes_of_repo(repo, comparison, &changed_files)?);
+        let changed_lines = self.changed_lines_of(Some(repo), comparison, &changed_files)?;
         let limits = collect_limits(
-            Some(&repo),
+            Some(repo),
             &sides.head,
             &changed_files,
             &changed_lines,
             options,
         )?;
 
-        Ok(DiffResult {
-            comparison,
-            base_key: sides.base_key,
-            head_key: sides.head_key,
-            changed_files,
-            changes,
-            limits,
+        Ok(Compared {
+            diff: DiffResult {
+                comparison: comparison.clone(),
+                base_key: sides.base_key,
+                head_key: sides.head_key,
+                changed_files,
+                changes,
+                limits,
+            },
+            base: sides.base,
+            head: sides.head,
         })
     }
 
@@ -322,11 +593,15 @@ impl Engine {
     pub fn cache_status(&self) -> Result<CacheStatus> {
         let graphs = self.store.list_graphs()?.len() as u64;
         let graph_bytes = self.store.total_size()?;
+        let results = self.store.result_count()?;
+        let result_bytes = self.store.result_bytes()?;
         let snapshots_dir = self.paths.snapshots_dir();
         let (snapshots, snapshot_bytes) = directory_stats(&snapshots_dir)?;
         Ok(CacheStatus {
             graphs,
             graph_bytes,
+            results,
+            result_bytes,
             snapshots,
             snapshot_bytes,
             database: self.paths.database(),
@@ -765,13 +1040,19 @@ pub struct IndexReport {
     pub unresolved: usize,
 }
 
-/// What the cache holds and where it lives.
+/// What the cache holds and where it lives: revision graphs, the analyses
+/// computed from them, materialised snapshots and the database itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CacheStatus {
     /// Number of cached graphs.
     pub graphs: u64,
     /// Total size of the cached graphs, in bytes.
     pub graph_bytes: u64,
+    /// Number of cached analyses: comparisons whose impact analysis is
+    /// stored and reused instead of computed again.
+    pub results: u64,
+    /// Total size of the cached analyses, in bytes.
+    pub result_bytes: u64,
     /// Number of materialised snapshots.
     pub snapshots: u64,
     /// Total size of the snapshots on disk, in bytes.
@@ -790,6 +1071,43 @@ fn temporary_paths() -> blastr_store::Paths {
         cache_dir,
         config_dir,
     }
+}
+
+/// The cache key of an analysis: BLAKE3, as lowercase hexadecimal, of a fixed
+/// prefix, the two hex analysis keys and the parameters, in that order.
+///
+/// Equal keys mean the same two graphs were analysed under the same
+/// parameters, so the stored result describes exactly the same thing.
+fn result_key(base: &AnalysisKey, head: &AnalysisKey, params: &AnalysisParams) -> Result<String> {
+    let parameters = serde_json::to_vec(params).map_err(|error| {
+        Error::Codec(format!(
+            "could not serialise the analysis parameters: {error}"
+        ))
+    })?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(RESULT_KEY_DOMAIN);
+    hasher.update(base.hash().as_bytes());
+    hasher.update(head.hash().as_bytes());
+    hasher.update(&parameters);
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+/// Encodes an analysis for the cache: JSON compressed with zstd.
+fn encode_analysis(analysis: &Analysis) -> Result<Vec<u8>> {
+    let raw = serde_json::to_vec(analysis)
+        .map_err(|error| Error::Codec(format!("could not serialise the analysis: {error}")))?;
+    zstd::encode_all(raw.as_slice(), ANALYSIS_COMPRESSION_LEVEL)
+        .map_err(|error| Error::Codec(format!("could not compress the analysis: {error}")))
+}
+
+/// Decodes bytes produced by [`encode_analysis`]; `None` when they are not a
+/// readable analysis.
+///
+/// A damaged entry means the cache cannot be trusted, but it is not a failure
+/// of the current run: the analysis is computed again and stored over it.
+fn decode_analysis(bytes: &[u8]) -> Option<Analysis> {
+    let raw = zstd::decode_all(bytes).ok()?;
+    serde_json::from_slice(&raw).ok()
 }
 
 /// The output of `rustc --version` run in `dir`, or `unknown` when it cannot
@@ -992,6 +1310,8 @@ fn remove_dir_if_present(dir: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use blastr_model::{ImpactLimits, TestSelection};
+
     use super::*;
 
     fn paths_under(dir: &Path) -> blastr_store::Paths {
@@ -1017,6 +1337,8 @@ mod tests {
         let status = engine.cache_status().unwrap();
         assert_eq!(status.graphs, 0);
         assert_eq!(status.graph_bytes, 0);
+        assert_eq!(status.results, 0);
+        assert_eq!(status.result_bytes, 0);
         assert_eq!(status.snapshots, 0);
         assert_eq!(status.snapshot_bytes, 0);
         assert_eq!(status.database, dir.path().join("blastr.db"));
@@ -1028,6 +1350,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = blastr_store::Store::open_in_memory().unwrap();
         store.put_graph("key", "{}", b"graph").unwrap();
+        store.put_result("result", b"analysis").unwrap();
         let paths = paths_under(dir.path());
 
         let snapshot = paths.snapshots_dir().join("4f2a91c");
@@ -1042,12 +1365,132 @@ mod tests {
 
         assert_eq!(status.graphs, 1);
         assert_eq!(status.graph_bytes, 5);
+        assert_eq!(status.results, 1);
+        assert_eq!(status.result_bytes, 8);
         assert_eq!(status.snapshots, 1);
         assert_eq!(status.snapshot_bytes, 12);
         assert!(engine.store().list_graphs().unwrap().is_empty());
+        assert_eq!(engine.store().result_count().unwrap(), 0);
         assert!(!paths.snapshots_dir().exists());
         assert!(!paths.target_dir().exists());
         assert_eq!(engine.cache_status().unwrap().graphs, 0);
+        assert_eq!(engine.cache_status().unwrap().results, 0);
         assert_eq!(engine.cache_status().unwrap().snapshots, 0);
+    }
+
+    /// An analysis key with the fields fixed so that only `source` varies.
+    fn sample_key(source: &str) -> AnalysisKey {
+        AnalysisKey {
+            repository: "repo".to_owned(),
+            source: source.to_owned(),
+            features: vec!["default".to_owned()],
+            all_features: false,
+            target: None,
+            cfg_test: true,
+            cargo_lock: "lock".to_owned(),
+            toolchain: "rustc 1.100.0".to_owned(),
+            rust_analyzer: "0.0.358".to_owned(),
+            blastr: "0.1.0".to_owned(),
+            exec: ExecMode::Full,
+            manifest_dir: None,
+        }
+    }
+
+    /// An analysis with only the fields the codec could get wrong filled in.
+    fn sample_analysis() -> Analysis {
+        Analysis {
+            diff: DiffResult {
+                comparison: Comparison {
+                    base: Source::Worktree,
+                    head: Source::Worktree,
+                },
+                base_key: Some(sample_key("base")),
+                head_key: Some(sample_key("head")),
+                changed_files: Vec::new(),
+                changes: Vec::new(),
+                limits: vec![Limit::Restricted],
+            },
+            items: Vec::new(),
+            tests: TestSelection::default(),
+            limits: ImpactLimits {
+                unresolved_total: 3,
+                candidate_steps: 1,
+                ..ImpactLimits::default()
+            },
+            params: AnalysisParams::default(),
+        }
+    }
+
+    #[test]
+    fn the_result_key_is_stable_and_follows_its_inputs() {
+        let base = sample_key("base");
+        let head = sample_key("head");
+        let params = AnalysisParams::default();
+
+        let key = result_key(&base, &head, &params).unwrap();
+        assert_eq!(key, result_key(&base, &head, &params).unwrap());
+        assert_eq!(key.len(), 64);
+        assert!(
+            key.chars()
+                .all(|character| character.is_ascii_digit() || ('a'..='f').contains(&character))
+        );
+        // The two sides are not interchangeable.
+        assert_ne!(key, result_key(&head, &base, &params).unwrap());
+    }
+
+    #[test]
+    fn the_result_key_changes_with_the_parameters() {
+        let base = sample_key("base");
+        let head = sample_key("head");
+        let params = AnalysisParams::default();
+        let key = result_key(&base, &head, &params).unwrap();
+
+        let mut deeper = params.clone();
+        deeper.depth += 1;
+        assert_ne!(key, result_key(&base, &head, &deeper).unwrap());
+
+        let mut stricter = params.clone();
+        stricter.min_confidence = blastr_model::Confidence::Definite;
+        assert_ne!(key, result_key(&base, &head, &stricter).unwrap());
+
+        let mut ignored = params.clone();
+        ignored.ignore.push("vendor/**".to_owned());
+        assert_ne!(key, result_key(&base, &head, &ignored).unwrap());
+
+        let mut lighter = params.clone();
+        lighter.ranking.decay = 0.5;
+        assert_ne!(key, result_key(&base, &head, &lighter).unwrap());
+    }
+
+    #[test]
+    fn an_analysis_round_trips_through_the_codec() {
+        let analysis = sample_analysis();
+        let bytes = encode_analysis(&analysis).unwrap();
+        assert!(!bytes.is_empty());
+        assert_eq!(decode_analysis(&bytes), Some(analysis));
+    }
+
+    #[test]
+    fn a_damaged_analysis_blob_is_a_miss() {
+        assert_eq!(decode_analysis(b"not compressed at all"), None);
+
+        let mut truncated = encode_analysis(&sample_analysis()).unwrap();
+        truncated.truncate(truncated.len() / 2);
+        assert_eq!(decode_analysis(&truncated), None);
+    }
+
+    #[test]
+    fn cache_status_counts_stored_analyses() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = blastr_store::Store::open_in_memory().unwrap();
+        store.put_result("first", b"short").unwrap();
+        store.put_result("second", b"a longer payload").unwrap();
+        let engine = Engine::with_store_and_paths(store, paths_under(dir.path()));
+
+        let status = engine.cache_status().unwrap();
+        assert_eq!(status.results, 2);
+        assert_eq!(status.result_bytes, 5 + 16);
+        assert_eq!(status.graphs, 0);
+        assert_eq!(status.graph_bytes, 0);
     }
 }

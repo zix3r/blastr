@@ -22,6 +22,7 @@ fn text(change: &Change) -> String {
         ChangeDetail::Renamed { from } => format!("from {}", from.path),
         ChangeDetail::Visibility { from, to } => format!("{from:?}->{to:?}"),
         ChangeDetail::Manifest(description) => description.clone(),
+        ChangeDetail::Retyped => "retyped".to_owned(),
     };
     format!("{} {} {detail}", change.kind, change.symbol.path)
         .trim_end()
@@ -355,7 +356,10 @@ fn reports_const_value_changes() {
     let changes = classify_in(base.finish(), head.finish(), &[modified("src/lib.rs")]);
     assert_eq!(
         summary(&changes),
-        ["const-value krate::LIMIT", "const-value krate::OTHER"]
+        [
+            "const-value krate::LIMIT",
+            "const-value krate::OTHER retyped"
+        ]
     );
 }
 

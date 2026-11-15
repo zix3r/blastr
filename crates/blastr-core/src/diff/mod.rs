@@ -181,7 +181,9 @@ fn compare(old: &Symbol, new: &Symbol, out: &mut Vec<Change>) {
             }
         }
         SymbolKind::Const | SymbolKind::Static => {
-            if signature || body {
+            if signature {
+                out.push(change(ChangeKind::ConstValue, ChangeDetail::Retyped));
+            } else if body {
                 out.push(change(ChangeKind::ConstValue, ChangeDetail::None));
             }
         }

@@ -230,6 +230,10 @@ impl<'a> Context<'a> {
                 .cmp(&b.tier)
                 .then_with(|| b.similarity.total_cmp(&a.similarity))
                 .then_with(|| {
+                    self.distance(a.base, a.head)
+                        .cmp(&self.distance(b.base, b.head))
+                })
+                .then_with(|| {
                     self.base_symbol(a.base)
                         .path
                         .path
@@ -254,6 +258,21 @@ impl<'a> Context<'a> {
             if is_container(self.base_symbol(candidate.base).path.kind) {
                 self.members(candidate.base, candidate.head, matches);
             }
+        }
+    }
+
+    /// How far apart two symbols are declared: 0 in the same container, 1 in
+    /// the same crate, 2 in different crates. Equally good rename candidates
+    /// are paired nearest first.
+    fn distance(&self, base: SymbolId, head: SymbolId) -> u8 {
+        let old = &self.base_symbol(base).path;
+        let new = &self.head_symbol(head).path;
+        if container_of(&old.path) == container_of(&new.path) {
+            0
+        } else if old.crate_name() == new.crate_name() {
+            1
+        } else {
+            2
         }
     }
 
@@ -385,6 +404,12 @@ fn alias_counts(
         }
     }
     counts
+}
+
+/// The path text of the item a path is declared in.
+fn container_of(path: &str) -> &str {
+    path.rsplit_once("::")
+        .map_or("", |(container, _)| container)
 }
 
 /// True for kinds that own members and have no body of their own.

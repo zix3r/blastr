@@ -21,6 +21,15 @@ pub enum Error {
     /// The operation was cancelled through its `CancelToken`.
     #[error("cancelled")]
     Cancelled,
+    /// A configuration file could not be used.
+    #[error(transparent)]
+    Config(#[from] crate::config::ConfigError),
+    /// A symbol named on the command line could not be found.
+    #[error(transparent)]
+    Lookup(#[from] crate::impact::lookup::LookupError),
+    /// A what-if query does not fit the symbol it names.
+    #[error(transparent)]
+    WhatIf(#[from] crate::impact::whatif::WhatIfError),
     /// The feature exists in the interface but is not implemented yet.
     #[error("`{0}` is not implemented yet")]
     NotImplemented(&'static str),
@@ -30,6 +39,14 @@ impl Error {
     /// One line telling the user what to do next, when there is something useful to say.
     pub fn hint(&self) -> Option<String> {
         let hint = match self {
+            Error::Config(error) => return error.hint(),
+            Error::Lookup(error)
+            | Error::WhatIf(crate::impact::whatif::WhatIfError::Lookup(error)) => {
+                return lookup_hint(error);
+            }
+            Error::WhatIf(crate::impact::whatif::WhatIfError::WrongKind { .. }) => {
+                "run `blastr impact --help` for the kinds of change that can be assumed"
+            }
             Error::Git(blastr_git::Error::NotARepository { .. }) => {
                 "run blastr inside a Git repository, or pass its path"
             }
@@ -69,6 +86,23 @@ impl Error {
             }
         };
         Some(hint.to_owned())
+    }
+}
+
+/// What to try after a symbol lookup failed.
+fn lookup_hint(error: &crate::impact::lookup::LookupError) -> Option<String> {
+    use crate::impact::lookup::LookupError;
+    match error {
+        LookupError::NotFound { suggestions, .. } if suggestions.is_empty() => Some(
+            "write the path as `blastr diff` prints it, such as `my_crate::module::item`"
+                .to_owned(),
+        ),
+        LookupError::NotFound { suggestions, .. } => {
+            Some(format!("did you mean {}?", suggestions.join(", ")))
+        }
+        LookupError::Ambiguous { candidates, .. } => {
+            Some(format!("use a longer path: {}", candidates.join(", ")))
+        }
     }
 }
 
