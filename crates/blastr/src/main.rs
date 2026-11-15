@@ -57,7 +57,10 @@ fn run(cli: Cli) -> Result<Exit, blastr_core::Error> {
             Ok(Exit::Success)
         }
         #[cfg(not(feature = "gui"))]
-        Some(Command::Gui { .. }) => {
+        Some(Command::Gui { path }) => {
+            // The path belongs to the interface in every build; this one has no
+            // GUI to open it with.
+            let _ = path;
             eprintln!("error: this build of blastr has no GUI");
             eprintln!("hint: install the full build with `cargo install blastr`");
             Ok(Exit::Error)
@@ -75,10 +78,12 @@ fn run(cli: Cli) -> Result<Exit, blastr_core::Error> {
         Some(Command::Cache {
             command: CacheCommand::Clear,
         }) => commands::cache::clear(),
-        Some(Command::Analyze(_)) => Err(blastr_core::Error::NotImplemented("analyze")),
-        Some(Command::Tests(_)) => Err(blastr_core::Error::NotImplemented("tests")),
-        Some(Command::Impact { .. }) => Err(blastr_core::Error::NotImplemented("impact")),
-        Some(Command::Explain { .. }) => Err(blastr_core::Error::NotImplemented("explain")),
+        Some(Command::Analyze(args)) => commands::analyze::run(&globals, &args),
+        Some(Command::Tests(args)) => commands::tests::run(&globals, &args),
+        Some(Command::Impact { symbol, assume }) => {
+            commands::impact::run(&globals, &symbol, assume)
+        }
+        Some(Command::Explain { symbol, revs }) => commands::explain::run(&globals, &symbol, &revs),
     }
 }
 

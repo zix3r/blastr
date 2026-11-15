@@ -1,3 +1,9 @@
+//! Integration tests of the command line.
+//!
+//! Every test here stops before an analysis loads a Cargo project: they check
+//! the interface, the argument checks and the errors a run can meet before it
+//! looks at code, so the suite stays fast.
+
 use assert_cmd::Command;
 use predicates::prelude::*;
 use predicates::str::contains;
@@ -6,12 +12,29 @@ fn blastr() -> Command {
     assert_cmd::cargo::cargo_bin_cmd!("blastr")
 }
 
-fn assert_reaches_stub(args: &[&str]) {
+/// Runs the command in a directory that is not a repository, where every
+/// analysis stops; this proves the arguments were accepted.
+fn assert_runs_outside_a_repository(args: &[&str]) {
+    let temp = tempfile::tempdir().expect("create a temporary directory");
     blastr()
+        .current_dir(temp.path())
         .args(args)
         .assert()
         .code(1)
-        .stderr(contains("not implemented yet").and(contains("Usage:").not()));
+        .stderr(contains("is not inside a Git repository").and(contains("hint:")))
+        .stderr(contains("not implemented").not());
+}
+
+/// Creates a temporary directory holding a new Git repository.
+fn git_repository() -> tempfile::TempDir {
+    let temp = tempfile::tempdir().expect("create a temporary directory");
+    let status = std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(temp.path())
+        .status()
+        .expect("run git init");
+    assert!(status.success(), "git init failed");
+    temp
 }
 
 #[test]
@@ -70,20 +93,35 @@ fn help_lists_global_options() {
 }
 
 #[test]
-fn stub_commands_are_not_implemented() {
-    let cases: &[(&[&str], &str)] = &[
-        (&["analyze"], "analyze"),
-        (&["tests"], "tests"),
-        (&["impact", "crate::foo"], "impact"),
-        (&["explain", "crate::foo"], "explain"),
-    ];
-    for (args, name) in cases {
+fn every_analysis_command_has_help() {
+    for command in ["analyze", "tests", "impact", "explain"] {
         blastr()
-            .args(*args)
+            .args([command, "--help"])
+            .assert()
+            .success()
+            .stdout(contains("Usage:"))
+            .stdout(contains("--format"));
+    }
+}
+
+#[test]
+fn the_analysis_commands_fail_outside_a_repository() {
+    for args in [
+        &["analyze"][..],
+        &["tests"][..],
+        &["impact", "crate::foo"][..],
+        &["explain", "crate::foo"][..],
+    ] {
+        let temp = tempfile::tempdir().expect("create a temporary directory");
+        blastr()
+            .current_dir(temp.path())
+            .args(args)
             .assert()
             .code(1)
             .stdout(predicates::str::is_empty())
-            .stderr(contains(format!("`{name}` is not implemented yet")));
+            .stderr(contains("is not inside a Git repository"))
+            .stderr(contains("hint:"))
+            .stderr(contains("not implemented").not());
     }
 }
 
@@ -98,7 +136,7 @@ fn revision_arguments_are_accepted() {
         &["explain", "crate::foo", "HEAD~1"][..],
         &["analyze", "HEAD"][..],
     ] {
-        assert_reaches_stub(args);
+        assert_runs_outside_a_repository(args);
     }
 }
 
@@ -118,8 +156,8 @@ fn revision_arguments_conflict() {
 
 #[test]
 fn global_options_work_before_and_after_the_command() {
-    assert_reaches_stub(&["--format", "json", "analyze"]);
-    assert_reaches_stub(&[
+    assert_runs_outside_a_repository(&["--format", "json", "analyze"]);
+    assert_runs_outside_a_repository(&[
         "analyze",
         "--format",
         "json",
@@ -165,6 +203,62 @@ fn diff_rejects_the_markdown_format() {
 }
 
 #[test]
+fn analyze_and_impact_reject_the_cargo_format() {
+    for command in ["analyze", "impact"] {
+        blastr()
+            .args([command, "crate::foo", "--format", "cargo"])
+            .assert()
+            .code(1)
+            .stdout(predicates::str::is_empty())
+            .stderr(contains("only available for `blastr tests`"))
+            .stderr(contains("hint:"));
+    }
+}
+
+#[test]
+fn explain_rejects_every_format_but_human() {
+    for format in ["json", "markdown", "cargo"] {
+        blastr()
+            .args(["explain", "crate::foo", "--format", format])
+            .assert()
+            .code(1)
+            .stdout(predicates::str::is_empty())
+            .stderr(contains(format!("the {format} format is not available")))
+            .stderr(contains("hint:"));
+    }
+}
+
+#[test]
+fn a_depth_outside_the_range_is_rejected() {
+    for depth in ["0", "65"] {
+        blastr()
+            .args(["analyze", "--depth", depth])
+            .assert()
+            .code(1)
+            .stdout(predicates::str::is_empty())
+            .stderr(contains("--depth must be between 1 and 64"))
+            .stderr(contains("hint:"));
+    }
+}
+
+#[test]
+fn an_unknown_configuration_key_is_named_with_a_suggestion() {
+    let repo = git_repository();
+    std::fs::write(repo.path().join("blastr.toml"), "deoth = 3\n")
+        .expect("write the configuration file");
+
+    blastr()
+        .current_dir(repo.path())
+        .arg("analyze")
+        .assert()
+        .code(1)
+        .stdout(predicates::str::is_empty())
+        .stderr(contains("unknown key"))
+        .stderr(contains("deoth"))
+        .stderr(contains("did you mean `depth`?"));
+}
+
+#[test]
 fn cache_status_reports_the_cache() {
     blastr()
         .args(["cache", "status"])
@@ -172,6 +266,8 @@ fn cache_status_reports_the_cache() {
         .success()
         .stdout(contains("CACHE"))
         .stdout(contains("graphs"))
+        .stdout(contains("snapshots"))
+        .stdout(contains("results"))
         .stdout(contains("database"));
 }
 
@@ -206,7 +302,7 @@ fn assume_kinds_are_accepted() {
         "variant-added",
         "variant-removed",
     ] {
-        assert_reaches_stub(&["impact", "crate::foo", "--assume", kind]);
+        assert_runs_outside_a_repository(&["impact", "crate::foo", "--assume", kind]);
     }
 }
 

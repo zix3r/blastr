@@ -24,7 +24,6 @@ pub struct Cli {
 
 /// Options accepted before or after a command.
 #[derive(Debug, Args)]
-#[allow(dead_code)]
 pub struct Globals {
     /// Path to the Cargo.toml of the project
     #[arg(long, global = true, value_name = "PATH")]
@@ -72,7 +71,6 @@ pub struct Globals {
 
 /// A revision or range to compare against.
 #[derive(Debug, Args)]
-#[allow(dead_code)]
 pub struct RevArgs {
     /// Revision or range to compare, such as `HEAD~1` or `main..HEAD`
     #[arg(value_name = "REV", conflicts_with_all = ["worktree", "staged"])]
@@ -90,7 +88,6 @@ pub struct RevArgs {
 
 /// What to do.
 #[derive(Debug, Subcommand)]
-#[allow(dead_code)]
 pub enum Command {
     /// Full report: changes, impact, tests to run, limits
     Analyze(RevArgs),
@@ -144,7 +141,6 @@ pub enum Command {
 
 /// Cache operations.
 #[derive(Debug, Subcommand)]
-#[allow(dead_code)]
 pub enum CacheCommand {
     /// Show what the cache contains
     Status,
@@ -161,49 +157,49 @@ pub enum Format {
     Json,
     /// Markdown suitable for a pull request
     Markdown,
-    /// Cargo JSON diagnostic messages
+    /// `cargo test` commands, for `blastr tests`
     Cargo,
 }
 
 /// How certain an impact is.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum Confidence {
-    /// The change certainly breaks this
+    /// Only impacts that follow directly from a resolved reference
     Definite,
-    /// The change probably breaks this
+    /// Impacts that are probable but not proven
     Likely,
-    /// The change may break this
+    /// Every impact the analysis finds, however weak the evidence
     Possible,
 }
 
 /// The class of finding that makes the run fail.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum FailOn {
-    /// A caller no longer compiles
+    /// Code that still needs editing
     Adaptation,
-    /// Compiled code behaves differently
+    /// Code that may behave differently
     Behaviour,
 }
 
 /// A hypothetical change to a symbol.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum Assume {
-    /// The body changed
+    /// Its body or value changed
     Body,
-    /// The signature changed
+    /// Its signature or type changed
     Signature,
-    /// The item was removed
+    /// It was removed
     Removed,
-    /// The visibility changed
+    /// It was made private
     Visibility,
-    /// A field was removed
+    /// A field of it was removed
     FieldRemoved,
-    /// A field changed its type
+    /// A field of it changed its type
     FieldRetyped,
-    /// A field was added
+    /// It gained a field
     FieldAdded,
-    /// An enum variant was added
+    /// The enum it belongs to gained a variant
     VariantAdded,
-    /// An enum variant was removed
+    /// The enum it belongs to lost this variant
     VariantRemoved,
 }

@@ -9,7 +9,6 @@ pub enum Exit {
     /// Something went wrong.
     Error = 1,
     /// Findings of the class given to `--fail-on` were reported.
-    #[allow(dead_code)]
     Findings = 2,
 }
 
