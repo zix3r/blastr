@@ -8,6 +8,9 @@ use blastr_model::{
     AnalysisOptions, Change, ChangeDetail, ChangeKind, Delta, DiffResult, Limit, Visibility,
 };
 
+pub mod analysis;
+pub mod formats;
+
 /// The schema version the JSON output carries.
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -238,12 +241,17 @@ pub fn render_cache_status(status: &CacheStatus) -> String {
     labelled(
         &mut out,
         "graphs",
-        &graph_count(status.graphs, status.graph_bytes),
+        &count_and_size(status.graphs, status.graph_bytes),
     );
     labelled(
         &mut out,
         "snapshots",
-        &graph_count(status.snapshots, status.snapshot_bytes),
+        &count_and_size(status.snapshots, status.snapshot_bytes),
+    );
+    labelled(
+        &mut out,
+        "results",
+        &count_and_size(status.results, status.result_bytes),
     );
     labelled(&mut out, "database", &status.database.display().to_string());
     labelled(
@@ -260,18 +268,23 @@ pub fn render_cache_cleared(removed: &CacheStatus) -> String {
     labelled(
         &mut out,
         "graphs",
-        &graph_count(removed.graphs, removed.graph_bytes),
+        &count_and_size(removed.graphs, removed.graph_bytes),
     );
     labelled(
         &mut out,
         "snapshots",
-        &graph_count(removed.snapshots, removed.snapshot_bytes),
+        &count_and_size(removed.snapshots, removed.snapshot_bytes),
+    );
+    labelled(
+        &mut out,
+        "results",
+        &count_and_size(removed.results, removed.result_bytes),
     );
     out
 }
 
 /// Number of entries and their size, in one cell.
-fn graph_count(count: u64, bytes: u64) -> String {
+fn count_and_size(count: u64, bytes: u64) -> String {
     let size = format_size(bytes);
     format!("{count} · {size}")
 }
@@ -774,5 +787,54 @@ mod tests {
         assert_eq!(format_size(4_500_000), "4.5 MB");
         assert_eq!(format_size(1_200_000_000), "1.2 GB");
         assert_eq!(format_size(2_000_000_000_000), "2.0 TB");
+    }
+
+    /// A cache holding one graph, one snapshot and the results given.
+    fn cache_status(results: u64, result_bytes: u64) -> CacheStatus {
+        CacheStatus {
+            graphs: 2,
+            graph_bytes: 12_345,
+            snapshots: 1,
+            snapshot_bytes: 900,
+            results,
+            result_bytes,
+            database: std::path::PathBuf::from("blastr.sqlite"),
+            snapshots_dir: std::path::PathBuf::from("snapshots"),
+        }
+    }
+
+    /// The line the cache listing produces for this label and value.
+    fn cache_line(label: &str, value: &str) -> String {
+        let padding = LABEL_WIDTH.saturating_sub(label.len()).max(1);
+        format!("  {label}{}{value}", " ".repeat(padding))
+    }
+
+    #[test]
+    fn the_cache_listing_shows_graphs_snapshots_and_results() {
+        let text = render_cache_status(&cache_status(3, 4_500_000));
+        let lines: Vec<&str> = text.lines().collect();
+        let expected: Vec<String> = vec![
+            "CACHE".to_owned(),
+            cache_line("graphs", "2 \u{b7} 12.3 kB"),
+            cache_line("snapshots", "1 \u{b7} 900 B"),
+            cache_line("results", "3 \u{b7} 4.5 MB"),
+            cache_line("database", "blastr.sqlite"),
+            cache_line("snapshot dir", "snapshots"),
+        ];
+        assert_eq!(lines, expected);
+        assert!(text.ends_with('\n'), "{text}");
+    }
+
+    #[test]
+    fn clearing_the_cache_reports_the_results_too() {
+        let text = render_cache_cleared(&cache_status(1, 1000));
+        let lines: Vec<&str> = text.lines().collect();
+        let expected: Vec<String> = vec![
+            "CACHE CLEARED".to_owned(),
+            cache_line("graphs", "2 \u{b7} 12.3 kB"),
+            cache_line("snapshots", "1 \u{b7} 900 B"),
+            cache_line("results", "1 \u{b7} 1.0 kB"),
+        ];
+        assert_eq!(lines, expected);
     }
 }
