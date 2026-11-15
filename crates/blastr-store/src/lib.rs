@@ -11,12 +11,20 @@ use directories::ProjectDirs;
 use rusqlite::{Connection, OptionalExtension, params};
 
 /// The schema version this build reads and writes.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Statement creating the `graphs` table, also used when an old cache is rebuilt.
 const CREATE_GRAPHS: &str = "CREATE TABLE IF NOT EXISTS graphs (\
      key_hash TEXT PRIMARY KEY, \
      key_json TEXT NOT NULL, \
+     data BLOB NOT NULL, \
+     bytes INTEGER NOT NULL, \
+     created_at INTEGER NOT NULL, \
+     last_used_at INTEGER NOT NULL)";
+
+/// Statement creating the `results` table, which holds finished analyses.
+const CREATE_RESULTS: &str = "CREATE TABLE IF NOT EXISTS results (\
+     key_hash TEXT PRIMARY KEY, \
      data BLOB NOT NULL, \
      bytes INTEGER NOT NULL, \
      created_at INTEGER NOT NULL, \
@@ -214,9 +222,64 @@ impl Store {
         Ok(u64::try_from(total).unwrap_or(0))
     }
 
-    /// Removes every entry and shrinks the database file; returns how many
-    /// entries were removed.
+    /// Stored bytes of a cached analysis; also updates `last_used_at`.
+    ///
+    /// A missing key is not an error and returns `None`.
+    pub fn get_result(&self, key_hash: &str) -> Result<Option<Vec<u8>>, Error> {
+        let data: Option<Vec<u8>> = self
+            .connection
+            .query_row(
+                "SELECT data FROM results WHERE key_hash = ?1",
+                [key_hash],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if data.is_some() {
+            self.connection.execute(
+                "UPDATE results SET last_used_at = ?2 WHERE key_hash = ?1",
+                params![key_hash, now_secs()],
+            )?;
+        }
+        Ok(data)
+    }
+
+    /// Inserts the analysis for `key_hash`, replacing any existing row.
+    ///
+    /// Replacing resets `created_at` as well as the stored data.
+    pub fn put_result(&self, key_hash: &str, data: &[u8]) -> Result<(), Error> {
+        let now = now_secs();
+        // A slice length always fits in i64 on the targets Blastr supports.
+        let bytes = data.len() as i64;
+        self.connection.execute(
+            "INSERT OR REPLACE INTO results (key_hash, data, bytes, created_at, last_used_at) \
+             VALUES (?1, ?2, ?3, ?4, ?4)",
+            params![key_hash, data, bytes, now],
+        )?;
+        Ok(())
+    }
+
+    /// Number of cached analyses; 0 when none is stored.
+    pub fn result_count(&self) -> Result<u64, Error> {
+        let count: i64 = self
+            .connection
+            .query_row("SELECT COUNT(*) FROM results", [], |row| row.get(0))?;
+        Ok(u64::try_from(count).unwrap_or(0))
+    }
+
+    /// Sum of `bytes` over all cached analyses; 0 when none is stored.
+    pub fn result_bytes(&self) -> Result<u64, Error> {
+        let total: i64 = self.connection.query_row(
+            "SELECT COALESCE(SUM(bytes), 0) FROM results",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(u64::try_from(total).unwrap_or(0))
+    }
+
+    /// Removes every cached graph and analysis and shrinks the database file;
+    /// returns how many graph entries were removed.
     pub fn clear(&self) -> Result<u64, Error> {
+        self.connection.execute("DELETE FROM results", [])?;
         let removed = self.connection.execute("DELETE FROM graphs", [])?;
         // `VACUUM` returns no rows and cannot run inside a transaction.
         self.connection.execute("VACUUM", [])?;
@@ -258,6 +321,7 @@ fn init(connection: &mut Connection) -> Result<(), Error> {
     }
 
     transaction.execute(CREATE_GRAPHS, [])?;
+    transaction.execute(CREATE_RESULTS, [])?;
 
     transaction.commit()?;
     Ok(())
@@ -338,6 +402,18 @@ mod tests {
             .execute(
                 "INSERT INTO graphs (key_hash, key_json, data, bytes, created_at, last_used_at) \
                  VALUES ('old', '{}', x'00', 1, 1, 1)",
+                [],
+            )
+            .unwrap();
+    }
+
+    fn write_results_row(path: &Path) {
+        let connection = Connection::open(path).unwrap();
+        connection.execute(CREATE_RESULTS, []).unwrap();
+        connection
+            .execute(
+                "INSERT INTO results (key_hash, data, bytes, created_at, last_used_at) \
+                 VALUES ('old', x'00', 1, 1, 1)",
                 [],
             )
             .unwrap();
@@ -433,11 +509,33 @@ mod tests {
         write_graphs_row(&path);
 
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 2);
+        assert_eq!(store.schema_version().unwrap(), 3);
         assert!(store.list_graphs().unwrap().is_empty());
         assert_eq!(store.total_size().unwrap(), 0);
         store.put_graph("new", "{}", b"data").unwrap();
         assert_eq!(store.get_graph("new").unwrap(), Some(b"data".to_vec()));
+    }
+
+    #[test]
+    fn schema_two_cache_is_empty_and_upgraded_to_three() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blastr.db");
+        write_raw_schema(&path, "2", None);
+        write_graphs_row(&path);
+        write_results_row(&path);
+        assert!(table_exists(&path, "results"));
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 3);
+        assert!(store.list_graphs().unwrap().is_empty());
+        assert_eq!(store.total_size().unwrap(), 0);
+        assert_eq!(store.result_count().unwrap(), 0);
+        assert_eq!(store.result_bytes().unwrap(), 0);
+
+        store.put_graph("new", "{}", b"data").unwrap();
+        store.put_result("new", b"analysis").unwrap();
+        assert_eq!(store.get_graph("new").unwrap(), Some(b"data".to_vec()));
+        assert_eq!(store.get_result("new").unwrap(), Some(b"analysis".to_vec()));
     }
 
     #[test]
@@ -565,6 +663,115 @@ mod tests {
         let entries = store.list_graphs().unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].key_json, "json");
+    }
+
+    #[test]
+    fn put_result_then_get_result_returns_the_same_bytes() {
+        let store = Store::open_in_memory().unwrap();
+        store.put_result("k1", b"analysis-bytes").unwrap();
+        assert_eq!(
+            store.get_result("k1").unwrap(),
+            Some(b"analysis-bytes".to_vec())
+        );
+        assert_eq!(store.get_result("absent").unwrap(), None);
+    }
+
+    #[test]
+    fn get_result_updates_last_used_at() {
+        let store = Store::open_in_memory().unwrap();
+        store.put_result("k1", b"data").unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE results SET last_used_at = 5 WHERE key_hash = 'k1'",
+                [],
+            )
+            .unwrap();
+
+        assert!(store.get_result("k1").unwrap().is_some());
+
+        let last_used: i64 = store
+            .connection
+            .query_row(
+                "SELECT last_used_at FROM results WHERE key_hash = 'k1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(last_used > 5);
+    }
+
+    #[test]
+    fn put_result_twice_replaces_the_row() {
+        let store = Store::open_in_memory().unwrap();
+        store.put_result("k1", b"short").unwrap();
+        store.put_result("k1", b"a longer payload").unwrap();
+
+        assert_eq!(store.result_count().unwrap(), 1);
+        assert_eq!(
+            store.result_bytes().unwrap(),
+            b"a longer payload".len() as u64
+        );
+        assert_eq!(
+            store.get_result("k1").unwrap(),
+            Some(b"a longer payload".to_vec())
+        );
+    }
+
+    #[test]
+    fn result_count_and_result_bytes_describe_the_rows() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(store.result_count().unwrap(), 0);
+        assert_eq!(store.result_bytes().unwrap(), 0);
+
+        store.put_result("aaa", b"11111").unwrap();
+        store.put_result("bbb", b"222").unwrap();
+
+        assert_eq!(store.result_count().unwrap(), 2);
+        assert_eq!(store.result_bytes().unwrap(), 8);
+    }
+
+    #[test]
+    fn total_size_counts_graphs_but_not_results() {
+        let store = Store::open_in_memory().unwrap();
+        store.put_graph("g", "json", b"1234").unwrap();
+        store.put_result("r", b"1234567").unwrap();
+
+        assert_eq!(store.total_size().unwrap(), 4);
+        assert_eq!(store.result_bytes().unwrap(), 7);
+    }
+
+    #[test]
+    fn clear_removes_results_too() {
+        let store = Store::open_in_memory().unwrap();
+        store.put_graph("aaa", "json-a", b"12345").unwrap();
+        store.put_result("rrr", b"payload").unwrap();
+
+        assert_eq!(store.clear().unwrap(), 1);
+        assert!(store.list_graphs().unwrap().is_empty());
+        assert_eq!(store.result_count().unwrap(), 0);
+        assert_eq!(store.result_bytes().unwrap(), 0);
+        assert_eq!(store.get_result("rrr").unwrap(), None);
+
+        store.put_result("sss", b"abc").unwrap();
+        assert_eq!(store.get_result("sss").unwrap(), Some(b"abc".to_vec()));
+    }
+
+    #[test]
+    fn results_survive_closing_and_reopening_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blastr.db");
+        {
+            let store = Store::open(&path).unwrap();
+            store.put_result("k1", b"persisted-analysis").unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store.get_result("k1").unwrap(),
+            Some(b"persisted-analysis".to_vec())
+        );
+        assert_eq!(store.result_count().unwrap(), 1);
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
     }
 
     #[test]
