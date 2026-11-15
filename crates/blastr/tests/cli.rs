@@ -73,13 +73,9 @@ fn help_lists_global_options() {
 fn stub_commands_are_not_implemented() {
     let cases: &[(&[&str], &str)] = &[
         (&["analyze"], "analyze"),
-        (&["diff"], "diff"),
         (&["tests"], "tests"),
         (&["impact", "crate::foo"], "impact"),
         (&["explain", "crate::foo"], "explain"),
-        (&["index"], "index"),
-        (&["cache", "status"], "cache status"),
-        (&["cache", "clear"], "cache clear"),
     ];
     for (args, name) in cases {
         blastr()
@@ -96,11 +92,11 @@ fn revision_arguments_are_accepted() {
     for args in [
         &["analyze", "HEAD~1"][..],
         &["analyze", "main..HEAD"][..],
-        &["diff", "--worktree"][..],
-        &["diff", "--staged"][..],
+        &["analyze", "--worktree"][..],
+        &["analyze", "--staged"][..],
         &["tests", "HEAD", "--parent", "2"][..],
         &["explain", "crate::foo", "HEAD~1"][..],
-        &["index", "HEAD"][..],
+        &["analyze", "HEAD"][..],
     ] {
         assert_reaches_stub(args);
     }
@@ -109,8 +105,8 @@ fn revision_arguments_are_accepted() {
 #[test]
 fn revision_arguments_conflict() {
     for args in [
-        &["diff", "--worktree", "--staged"][..],
-        &["diff", "HEAD", "--worktree"][..],
+        &["analyze", "--worktree", "--staged"][..],
+        &["analyze", "HEAD", "--worktree"][..],
     ] {
         blastr()
             .args(args)
@@ -122,9 +118,9 @@ fn revision_arguments_conflict() {
 
 #[test]
 fn global_options_work_before_and_after_the_command() {
-    assert_reaches_stub(&["--format", "json", "diff"]);
+    assert_reaches_stub(&["--format", "json", "analyze"]);
     assert_reaches_stub(&[
-        "diff",
+        "analyze",
         "--format",
         "json",
         "--depth",
@@ -140,6 +136,43 @@ fn global_options_work_before_and_after_the_command() {
         "behaviour",
         "-vv",
     ]);
+}
+
+#[test]
+fn diff_outside_a_repository_fails_with_a_hint() {
+    let temp = tempfile::tempdir().expect("create a temporary directory");
+    blastr()
+        .current_dir(temp.path())
+        .arg("diff")
+        .assert()
+        .code(1)
+        .stdout(predicates::str::is_empty())
+        .stderr(contains("is not inside a Git repository"))
+        .stderr(contains("hint:"));
+}
+
+#[test]
+fn diff_rejects_the_markdown_format() {
+    let temp = tempfile::tempdir().expect("create a temporary directory");
+    blastr()
+        .current_dir(temp.path())
+        .args(["diff", "--format", "markdown"])
+        .assert()
+        .code(1)
+        .stdout(predicates::str::is_empty())
+        .stderr(contains("markdown").and(contains("not available")))
+        .stderr(contains("hint:"));
+}
+
+#[test]
+fn cache_status_reports_the_cache() {
+    blastr()
+        .args(["cache", "status"])
+        .assert()
+        .success()
+        .stdout(contains("CACHE"))
+        .stdout(contains("graphs"))
+        .stdout(contains("database"));
 }
 
 #[test]

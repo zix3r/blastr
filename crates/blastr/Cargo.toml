@@ -20,9 +20,12 @@ gui = ["dep:blastr-gui"]
 
 [dependencies]
 blastr-core.workspace = true
+blastr-model.workspace = true
 blastr-gui = { workspace = true, optional = true }
 clap.workspace = true
 clap_complete.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
@@ -32,3 +35,4 @@ windows-sys.workspace = true
 [dev-dependencies]
 assert_cmd.workspace = true
 predicates.workspace = true
+tempfile.workspace = true

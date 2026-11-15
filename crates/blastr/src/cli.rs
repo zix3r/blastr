@@ -62,6 +62,9 @@ pub struct Globals {
     /// Restricted mode: do not run build scripts or procedural macros
     #[arg(long, global = true)]
     pub no_exec: bool,
+    /// Print the duration of each analysis phase to stderr
+    #[arg(long, global = true, hide = true)]
+    pub timings: bool,
     /// Increase log verbosity; repeat for more detail
     #[arg(short = 'v', long, global = true, action = clap::ArgAction::Count)]
     pub verbose: u8,

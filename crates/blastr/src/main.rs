@@ -1,10 +1,13 @@
 //! The blastr binary: a desktop GUI without a command, a CLI with one.
 
 mod cli;
+mod commands;
 #[cfg(feature = "gui")]
 mod console;
 mod exit;
 mod logging;
+mod output;
+mod progress;
 
 use clap::{CommandFactory, Parser};
 
@@ -34,7 +37,8 @@ fn main() -> std::process::ExitCode {
 
 /// Dispatches the parsed command line.
 fn run(cli: Cli) -> Result<Exit, blastr_core::Error> {
-    match cli.command {
+    let Cli { globals, command } = cli;
+    match command {
         #[cfg(feature = "gui")]
         None => {
             console::detach_if_owned();
@@ -63,16 +67,18 @@ fn run(cli: Cli) -> Result<Exit, blastr_core::Error> {
             clap_complete::generate(shell, &mut Cli::command(), "blastr", &mut stdout);
             Ok(Exit::Success)
         }
+        Some(Command::Diff(args)) => commands::diff::run(&globals, &args),
+        Some(Command::Index { rev }) => commands::index::run(&globals, rev.as_deref()),
+        Some(Command::Cache {
+            command: CacheCommand::Status,
+        }) => commands::cache::status(),
+        Some(Command::Cache {
+            command: CacheCommand::Clear,
+        }) => commands::cache::clear(),
         Some(Command::Analyze(_)) => Err(blastr_core::Error::NotImplemented("analyze")),
-        Some(Command::Diff(_)) => Err(blastr_core::Error::NotImplemented("diff")),
         Some(Command::Tests(_)) => Err(blastr_core::Error::NotImplemented("tests")),
         Some(Command::Impact { .. }) => Err(blastr_core::Error::NotImplemented("impact")),
         Some(Command::Explain { .. }) => Err(blastr_core::Error::NotImplemented("explain")),
-        Some(Command::Index { .. }) => Err(blastr_core::Error::NotImplemented("index")),
-        Some(Command::Cache { command }) => match command {
-            CacheCommand::Status => Err(blastr_core::Error::NotImplemented("cache status")),
-            CacheCommand::Clear => Err(blastr_core::Error::NotImplemented("cache clear")),
-        },
     }
 }
 
