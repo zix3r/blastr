@@ -11,6 +11,8 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+blake3.workspace = true
+blastr-model.workspace = true
 gix.workspace = true
 thiserror.workspace = true
 

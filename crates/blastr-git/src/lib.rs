@@ -1,10 +1,27 @@
 //! Git access for Blastr.
 //!
 //! The crate talks to Git through the pure-Rust [`gix`] library, so no `git`
-//! executable is needed. At this stage it only locates the repository that a
-//! path belongs to.
+//! executable is needed. It locates the repository that a path belongs to,
+//! turns what the user typed into the two sides of a comparison, and reads
+//! trees, the index and working trees.
+
+#![forbid(unsafe_code)]
+
+mod changes;
+mod content;
+mod log;
+mod repo;
+mod snapshot;
+#[cfg(test)]
+mod test_support;
 
 use std::path::{Path, PathBuf};
+
+pub use changes::changed_files_between_dirs;
+pub use repo::Repo;
+
+/// The marker file that shows that a snapshot directory was written completely.
+pub(crate) const SNAPSHOT_MARKER: &str = ".blastr-complete";
 
 /// The root directory of a Git working tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,7 +36,7 @@ impl RepoRoot {
     }
 }
 
-/// Errors returned when locating a Git repository.
+/// Errors returned by this crate.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// `path` is not inside a Git repository.
@@ -31,6 +48,32 @@ pub enum Error {
     /// Any other failure reported by the Git library.
     #[error("git error: {0}")]
     Git(String),
+    /// A revision the user typed does not name a commit.
+    #[error("unknown revision `{0}`")]
+    UnknownRevision(String),
+    /// The parent that was asked for does not exist.
+    #[error("commit `{commit}` has {parents} parent(s); `--parent {requested}` is out of range")]
+    NoSuchParent {
+        /// The commit whose parents were asked for, in hexadecimal.
+        commit: String,
+        /// How many parents it has.
+        parents: u32,
+        /// The parent that was asked for, counting from one.
+        requested: u32,
+    },
+    /// A commit has no parent to compare against.
+    #[error("commit `{0}` has no parent to compare against")]
+    RootCommit(String),
+    /// The file system reported an error.
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+impl Error {
+    /// Wraps an error reported by the Git library.
+    pub(crate) fn git(error: impl std::fmt::Display) -> Error {
+        Error::Git(error.to_string())
+    }
 }
 
 /// The error for a path that has no repository above it.
