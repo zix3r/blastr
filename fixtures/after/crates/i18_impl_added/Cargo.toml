@@ -1,0 +1,8 @@
+[package]
+name = "i18-impl-added"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "i18_impl_added"
+path = "src/lib.rs"

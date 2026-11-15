@@ -1,0 +1,19 @@
+# A removed implementation: dynamic dispatch can no longer land in it.
+crates = ["i19_impl_removed"]
+exact_changes = true
+exact_impact = true
+
+[[change]]
+kind = "impl"
+detail = "member-removed"
+symbol = "i19_impl_removed::<impl Valued for Note>"
+
+[[impact]]
+symbol = "i19_impl_removed::total"
+class = "behaviour"
+confidence = "possible"
+reason = "impl-resolution-changed"
+distance = 1
+
+[[no_impact]]
+symbol = "i19_impl_removed::coin_value"

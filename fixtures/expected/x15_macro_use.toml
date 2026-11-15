@@ -1,0 +1,81 @@
+# Invocations of macros defined by the crate itself.
+crates = ["x15_macro_use"]
+exact_changes = true
+
+[[symbol]]
+path = "x15_macro_use::twice"
+kind = "macro"
+side = "both"
+
+[[symbol]]
+path = "x15_macro_use::four_times"
+kind = "macro"
+side = "both"
+
+[[symbol]]
+path = "x15_macro_use::increment"
+kind = "function"
+side = "both"
+
+[[symbol]]
+path = "x15_macro_use::doubled"
+kind = "function"
+side = "both"
+
+[[symbol]]
+path = "x15_macro_use::quadrupled"
+kind = "function"
+side = "both"
+
+[[symbol]]
+path = "x15_macro_use::doubled_increment"
+kind = "function"
+side = "both"
+
+[[symbol]]
+path = "x15_macro_use::counted"
+kind = "function"
+side = "both"
+
+[[edge]]
+from = "x15_macro_use::doubled"
+to = "x15_macro_use::twice"
+kind = "expands"
+certainty = "resolved"
+
+[[edge]]
+from = "x15_macro_use::quadrupled"
+to = "x15_macro_use::four_times"
+kind = "expands"
+certainty = "resolved"
+
+# The expansion of `four_times!` invokes `twice!`.
+[[edge]]
+from = "x15_macro_use::quadrupled"
+to = "x15_macro_use::twice"
+kind = "expands"
+certainty = "resolved"
+
+[[edge]]
+from = "x15_macro_use::doubled_increment"
+to = "x15_macro_use::twice"
+kind = "expands"
+certainty = "resolved"
+
+# A call written in a macro argument.
+[[edge]]
+from = "x15_macro_use::doubled_increment"
+to = "x15_macro_use::increment"
+kind = "calls"
+certainty = "resolved"
+
+# `vec!` is a macro of the standard library, so it has no symbol to point at.
+[[no_edge]]
+from = "x15_macro_use::counted"
+to = "x15_macro_use::twice"
+kind = "expands"
+
+[[no_edge]]
+from = "x15_macro_use::doubled"
+to = "x15_macro_use::four_times"
+kind = "expands"

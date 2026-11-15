@@ -1,0 +1,25 @@
+# A trait header change: users of the type and its implementation must adapt.
+crates = ["i05_generics"]
+exact_changes = true
+exact_impact = true
+
+[[change]]
+kind = "signature"
+symbol = "i05_generics::Counter"
+
+[[impact]]
+symbol = "i05_generics::total"
+class = "adaptation"
+confidence = "possible"
+reason = "declaration-changed"
+distance = 1
+
+[[impact]]
+symbol = "i05_generics::<impl Counter for Tally>"
+class = "adaptation"
+confidence = "possible"
+reason = "declaration-changed"
+distance = 1
+
+[[no_impact]]
+symbol = "i05_generics::describe"

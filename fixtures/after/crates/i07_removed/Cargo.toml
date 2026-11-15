@@ -1,0 +1,8 @@
+[package]
+name = "i07-removed"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "i07_removed"
+path = "src/lib.rs"

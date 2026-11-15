@@ -1,0 +1,8 @@
+[package]
+name = "i26-test-in-macro"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "i26_test_in_macro"
+path = "src/lib.rs"

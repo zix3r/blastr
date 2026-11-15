@@ -1,0 +1,38 @@
+# A new variant: the exhaustive match adapts, the wildcard match is behaviour.
+crates = ["i12_variant_added"]
+exact_changes = true
+exact_impact = true
+
+[[change]]
+kind = "variant"
+detail = "member-added"
+symbol = "i12_variant_added::Event::Pause"
+
+[[change]]
+kind = "body"
+symbol = "i12_variant_added::name"
+
+[[impact]]
+symbol = "i12_variant_added::name"
+class = "adaptation"
+confidence = "definite"
+reason = "exhaustive-match-misses-variant"
+distance = 1
+tags = ["changed"]
+
+[[impact]]
+symbol = "i12_variant_added::happened"
+class = "behaviour"
+confidence = "likely"
+reason = "wildcard-catches-new-variant"
+distance = 1
+
+[[impact]]
+symbol = "i12_variant_added::log"
+class = "behaviour"
+confidence = "likely"
+reason = "wildcard-catches-new-variant"
+distance = 2
+
+[[no_impact]]
+symbol = "i12_variant_added::stop"

@@ -1,0 +1,28 @@
+# A body change reached through functions passed as values.
+crates = ["i02_fn_value"]
+exact_changes = true
+exact_impact = true
+
+[[change]]
+kind = "body"
+symbol = "i02_fn_value::scale"
+
+[[impact]]
+symbol = "i02_fn_value::via_argument"
+class = "behaviour"
+confidence = "possible"
+reason = "takes-changed-as-value"
+distance = 1
+
+# The call through the local binding may also be recorded, so no confidence here.
+[[impact]]
+symbol = "i02_fn_value::via_binding"
+class = "behaviour"
+reason = "takes-changed-as-value"
+distance = 1
+
+[[no_impact]]
+symbol = "i02_fn_value::via_other"
+
+[[no_impact]]
+symbol = "i02_fn_value::apply"

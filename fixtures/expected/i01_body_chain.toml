@@ -1,0 +1,35 @@
+# A chain of calls over one changed body: behaviour flows three steps back.
+crates = ["i01_body_chain"]
+exact_changes = true
+exact_impact = true
+
+[[change]]
+kind = "body"
+symbol = "i01_body_chain::leaf"
+
+[[impact]]
+symbol = "i01_body_chain::mid"
+class = "behaviour"
+confidence = "likely"
+reason = "calls-changed"
+distance = 1
+
+[[impact]]
+symbol = "i01_body_chain::top"
+class = "behaviour"
+confidence = "likely"
+reason = "calls-changed"
+distance = 2
+
+[[impact]]
+symbol = "i01_body_chain::apex"
+class = "behaviour"
+confidence = "likely"
+reason = "calls-changed"
+distance = 3
+
+[[no_impact]]
+symbol = "i01_body_chain::bystander"
+
+[[no_impact]]
+symbol = "i01_body_chain::unchanged"

@@ -1,0 +1,12 @@
+[package]
+name = "i28-tests-integration"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "i28_tests_integration"
+path = "src/lib.rs"
+
+[[test]]
+name = "i28_smoke"
+path = "tests/i28_smoke.rs"

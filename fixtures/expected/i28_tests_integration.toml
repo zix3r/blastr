@@ -1,0 +1,24 @@
+# An integration test, named after its target crate, is reached from the library.
+crates = ["i28_tests_integration", "i28_smoke"]
+exact_changes = true
+exact_impact = true
+
+[[change]]
+kind = "body"
+symbol = "i28_tests_integration::inc"
+
+[[impact]]
+symbol = "i28_smoke::adds_one"
+class = "behaviour"
+confidence = "likely"
+reason = "calls-changed"
+distance = 1
+tags = ["test"]
+
+[[selected_test]]
+symbol = "i28_smoke::adds_one"
+reason = "reached"
+
+# Every test of the target is selected, so the command needs no filter.
+[[test_command]]
+line = "cargo test -p i28-tests-integration --test i28_smoke"

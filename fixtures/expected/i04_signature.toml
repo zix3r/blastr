@@ -1,0 +1,31 @@
+# A caller adapted to a new parameter, and its own caller one step further back.
+crates = ["i04_signature"]
+exact_changes = true
+exact_impact = true
+
+[[change]]
+kind = "signature"
+symbol = "i04_signature::format_total"
+
+[[change]]
+kind = "body"
+symbol = "i04_signature::report"
+
+[[impact]]
+symbol = "i04_signature::report"
+class = "adaptation"
+confidence = "definite"
+reason = "signature-changed"
+distance = 1
+tags = ["changed"]
+
+[[impact]]
+# The adapted caller's own body changed, which reaches this one directly.
+symbol = "i04_signature::announce"
+class = "behaviour"
+confidence = "likely"
+reason = "calls-changed"
+distance = 1
+
+[[no_impact]]
+symbol = "i04_signature::bystander"

@@ -1,0 +1,8 @@
+[package]
+name = "i15-trait-required"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "i15_trait_required"
+path = "src/lib.rs"

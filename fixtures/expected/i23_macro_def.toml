@@ -1,0 +1,26 @@
+# A changed macro: the function that invokes it and, one step back, that function's caller.
+crates = ["i23_macro_def"]
+exact_changes = true
+exact_impact = true
+
+[[change]]
+kind = "macro-def"
+symbol = "i23_macro_def::twice"
+
+[[impact]]
+symbol = "i23_macro_def::doubled"
+class = "behaviour"
+confidence = "possible"
+reason = "invokes-changed-macro"
+distance = 1
+
+# The expansion step is a candidate, so the second step is uncertain as well.
+[[impact]]
+symbol = "i23_macro_def::quadrupled"
+class = "behaviour"
+confidence = "possible"
+reason = "invokes-changed-macro"
+distance = 2
+
+[[no_impact]]
+symbol = "i23_macro_def::incremented"

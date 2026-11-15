@@ -1,0 +1,145 @@
+# Struct literals and patterns that leave fields out.
+crates = ["x16_rest"]
+exact_changes = true
+
+[[symbol]]
+path = "x16_rest::Point"
+kind = "struct"
+side = "both"
+
+[[symbol]]
+path = "x16_rest::Pair"
+kind = "struct"
+side = "both"
+
+[[symbol]]
+path = "x16_rest::State"
+kind = "enum"
+side = "both"
+
+[[symbol]]
+path = "x16_rest::State::Busy"
+kind = "variant"
+side = "both"
+
+[[symbol]]
+path = "x16_rest::full"
+kind = "function"
+side = "both"
+
+[[symbol]]
+path = "x16_rest::shifted"
+kind = "function"
+side = "both"
+
+[[symbol]]
+path = "x16_rest::partial"
+kind = "function"
+side = "both"
+
+[[symbol]]
+path = "x16_rest::exact"
+kind = "function"
+side = "both"
+
+[[symbol]]
+path = "x16_rest::is_busy"
+kind = "function"
+side = "both"
+
+[[symbol]]
+path = "x16_rest::first"
+kind = "function"
+side = "both"
+
+[[symbol]]
+path = "x16_rest::code"
+kind = "function"
+side = "both"
+
+# A literal that names every field.
+[[edge]]
+from = "x16_rest::full"
+to = "x16_rest::Point"
+kind = "constructs"
+certainty = "resolved"
+detail = "none"
+
+# A literal with a spread.
+[[edge]]
+from = "x16_rest::shifted"
+to = "x16_rest::Point"
+kind = "constructs"
+certainty = "resolved"
+detail = "with-rest"
+
+# A spread does not read the fields it names.
+[[edge]]
+from = "x16_rest::shifted"
+to = "x16_rest::Point::x"
+kind = "reads-field"
+certainty = "resolved"
+
+# A pattern that names every field.
+[[edge]]
+from = "x16_rest::exact"
+to = "x16_rest::Point"
+kind = "matches"
+certainty = "resolved"
+detail = "none"
+
+# A record pattern with a rest.
+[[edge]]
+from = "x16_rest::partial"
+to = "x16_rest::Point"
+kind = "matches"
+certainty = "resolved"
+detail = "with-rest"
+
+# A tuple-struct pattern with a rest.
+[[edge]]
+from = "x16_rest::first"
+to = "x16_rest::Pair"
+kind = "matches"
+certainty = "resolved"
+detail = "with-rest"
+
+# A variant pattern keeps the detail of the `match` it is in, also with a rest.
+[[edge]]
+from = "x16_rest::is_busy"
+to = "x16_rest::State"
+kind = "matches"
+certainty = "resolved"
+detail = "match-wildcard"
+
+[[edge]]
+from = "x16_rest::is_busy"
+to = "x16_rest::State::Busy"
+kind = "matches"
+certainty = "resolved"
+detail = "match-wildcard"
+
+# An exhaustive `match` over a variant.
+[[edge]]
+from = "x16_rest::code"
+to = "x16_rest::State"
+kind = "matches"
+certainty = "resolved"
+detail = "match-exhaustive"
+
+[[edge]]
+from = "x16_rest::code"
+to = "x16_rest::State::Busy"
+kind = "matches"
+certainty = "resolved"
+detail = "match-exhaustive"
+
+[[no_edge]]
+from = "x16_rest::full"
+to = "x16_rest::Point"
+kind = "matches"
+
+[[no_edge]]
+from = "x16_rest::partial"
+to = "x16_rest::Point"
+kind = "constructs"

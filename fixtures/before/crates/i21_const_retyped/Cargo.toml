@@ -1,0 +1,8 @@
+[package]
+name = "i21-const-retyped"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "i21_const_retyped"
+path = "src/lib.rs"

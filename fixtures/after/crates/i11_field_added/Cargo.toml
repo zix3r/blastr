@@ -1,0 +1,8 @@
+[package]
+name = "i11-field-added"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "i11_field_added"
+path = "src/lib.rs"

@@ -1,0 +1,8 @@
+[package]
+name = "i24-attribute"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "i24_attribute"
+path = "src/lib.rs"

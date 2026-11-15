@@ -1,0 +1,8 @@
+[package]
+name = "i16-trait-default"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "i16_trait_default"
+path = "src/lib.rs"

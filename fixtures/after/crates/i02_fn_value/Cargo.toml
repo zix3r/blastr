@@ -1,0 +1,8 @@
+[package]
+name = "i02-fn-value"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "i02_fn_value"
+path = "src/lib.rs"

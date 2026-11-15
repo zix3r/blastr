@@ -1,0 +1,8 @@
+[package]
+name = "i19-impl-removed"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "i19_impl_removed"
+path = "src/lib.rs"

@@ -1,0 +1,8 @@
+[package]
+name = "i20-const-value"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "i20_const_value"
+path = "src/lib.rs"

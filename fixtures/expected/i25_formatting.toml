@@ -1,0 +1,14 @@
+# A formatting-only change reaches nothing.
+crates = ["i25_formatting"]
+exact_changes = true
+exact_impact = true
+
+[[change]]
+kind = "non-semantic"
+symbol = "i25_formatting"
+
+[[no_impact]]
+symbol = "i25_formatting::inc"
+
+[[no_impact]]
+symbol = "i25_formatting::add_two"

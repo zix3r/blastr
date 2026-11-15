@@ -1,0 +1,18 @@
+# A changed alias target: the function that names the alias still compiles but must adapt.
+crates = ["i22_type_alias"]
+exact_changes = true
+exact_impact = true
+
+[[change]]
+kind = "type-alias"
+symbol = "i22_type_alias::Id"
+
+[[impact]]
+symbol = "i22_type_alias::show"
+class = "adaptation"
+confidence = "possible"
+reason = "uses-changed-alias"
+distance = 1
+
+[[no_impact]]
+symbol = "i22_type_alias::plain"

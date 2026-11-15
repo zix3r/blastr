@@ -1,0 +1,8 @@
+[package]
+name = "x15-macro-use"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "x15_macro_use"
+path = "src/lib.rs"

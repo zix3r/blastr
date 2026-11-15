@@ -1,0 +1,34 @@
+# A required trait method: every implementation of the trait adapts.
+crates = ["i15_trait_required"]
+exact_changes = true
+exact_impact = true
+
+[[change]]
+kind = "trait-item"
+detail = "member-added"
+symbol = "i15_trait_required::Recap::words"
+
+[[change]]
+kind = "added"
+symbol = "i15_trait_required::<impl Recap for Report>::words"
+
+[[change]]
+kind = "added"
+symbol = "i15_trait_required::<impl Recap for Summary>::words"
+
+[[impact]]
+symbol = "i15_trait_required::<impl Recap for Report>"
+class = "adaptation"
+confidence = "definite"
+reason = "must-implement-trait-item"
+distance = 1
+
+[[impact]]
+symbol = "i15_trait_required::<impl Recap for Summary>"
+class = "adaptation"
+confidence = "definite"
+reason = "must-implement-trait-item"
+distance = 1
+
+[[no_impact]]
+symbol = "i15_trait_required::<impl Tagged for Report>"

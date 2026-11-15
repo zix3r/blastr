@@ -1,0 +1,42 @@
+# A new field: constructors and patterns that name every field adapt, the rest do not.
+crates = ["i11_field_added"]
+exact_changes = true
+exact_impact = true
+
+[[change]]
+kind = "field"
+detail = "member-added"
+symbol = "i11_field_added::Config::timeout"
+
+[[change]]
+kind = "body"
+symbol = "i11_field_added::full"
+
+[[change]]
+kind = "body"
+symbol = "i11_field_added::pair"
+
+[[impact]]
+symbol = "i11_field_added::full"
+class = "adaptation"
+confidence = "definite"
+reason = "constructs-without-field"
+distance = 1
+tags = ["changed"]
+
+[[impact]]
+symbol = "i11_field_added::pair"
+class = "adaptation"
+confidence = "definite"
+reason = "pattern-misses-field"
+distance = 1
+tags = ["changed"]
+
+[[no_impact]]
+symbol = "i11_field_added::partial"
+
+[[no_impact]]
+symbol = "i11_field_added::host_of"
+
+[[no_impact]]
+symbol = "i11_field_added::port_of"

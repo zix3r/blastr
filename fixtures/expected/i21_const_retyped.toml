@@ -1,0 +1,24 @@
+# A retyped constant: its reader must adapt, and another constant's reader is untouched.
+crates = ["i21_const_retyped"]
+exact_changes = true
+exact_impact = true
+
+[[change]]
+kind = "const-value"
+detail = "retyped"
+symbol = "i21_const_retyped::PAGE"
+
+[[change]]
+kind = "body"
+symbol = "i21_const_retyped::pages"
+
+[[impact]]
+symbol = "i21_const_retyped::pages"
+class = "adaptation"
+confidence = "definite"
+reason = "uses-retyped-value"
+distance = 1
+tags = ["changed"]
+
+[[no_impact]]
+symbol = "i21_const_retyped::word"

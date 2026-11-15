@@ -1,0 +1,32 @@
+# A retyped field: its reader adapts, the reader's caller is behaviour at distance 2.
+crates = ["i10_field_retyped"]
+exact_changes = true
+exact_impact = true
+
+[[change]]
+kind = "field"
+detail = "member-modified"
+symbol = "i10_field_retyped::Measure::amount"
+
+[[change]]
+kind = "body"
+symbol = "i10_field_retyped::amount_of"
+
+[[impact]]
+symbol = "i10_field_retyped::amount_of"
+class = "adaptation"
+confidence = "definite"
+reason = "uses-changed-field"
+distance = 1
+tags = ["changed"]
+
+[[impact]]
+# The adapted reader's own body changed, which reaches this one directly.
+symbol = "i10_field_retyped::report"
+class = "behaviour"
+confidence = "likely"
+reason = "calls-changed"
+distance = 1
+
+[[no_impact]]
+symbol = "i10_field_retyped::unit_of"

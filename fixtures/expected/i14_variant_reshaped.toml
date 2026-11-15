@@ -1,0 +1,37 @@
+# A reshaped variant: its constructor and its pattern adapt, another variant's do not.
+crates = ["i14_variant_reshaped"]
+# The new tuple field belongs to the variant change, which covers its own fields.
+exact_changes = true
+exact_impact = true
+
+[[change]]
+kind = "variant"
+detail = "member-modified"
+symbol = "i14_variant_reshaped::Message::Notice"
+
+[[change]]
+kind = "body"
+symbol = "i14_variant_reshaped::notice"
+
+[[change]]
+kind = "body"
+symbol = "i14_variant_reshaped::describe"
+
+[[impact]]
+symbol = "i14_variant_reshaped::notice"
+class = "adaptation"
+confidence = "definite"
+reason = "uses-changed-variant"
+distance = 1
+tags = ["changed"]
+
+[[impact]]
+symbol = "i14_variant_reshaped::describe"
+class = "adaptation"
+confidence = "definite"
+reason = "uses-changed-variant"
+distance = 1
+tags = ["changed"]
+
+[[no_impact]]
+symbol = "i14_variant_reshaped::warning"

@@ -1,0 +1,36 @@
+# The reader of a removed field and a constructor, but not a reader of another field.
+crates = ["i09_field_removed"]
+exact_changes = true
+exact_impact = true
+
+[[change]]
+kind = "field"
+detail = "member-removed"
+symbol = "i09_field_removed::Point::y"
+
+[[change]]
+kind = "body"
+symbol = "i09_field_removed::vertical"
+
+[[change]]
+kind = "body"
+symbol = "i09_field_removed::origin"
+
+[[impact]]
+symbol = "i09_field_removed::vertical"
+class = "adaptation"
+confidence = "definite"
+reason = "uses-changed-field"
+distance = 1
+tags = ["changed"]
+
+[[impact]]
+symbol = "i09_field_removed::origin"
+class = "adaptation"
+confidence = "definite"
+reason = "uses-changed-field"
+distance = 1
+tags = ["changed"]
+
+[[no_impact]]
+symbol = "i09_field_removed::horizontal"

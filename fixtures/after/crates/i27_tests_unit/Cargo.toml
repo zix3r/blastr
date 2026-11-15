@@ -1,0 +1,8 @@
+[package]
+name = "i27-tests-unit"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "i27_tests_unit"
+path = "src/lib.rs"

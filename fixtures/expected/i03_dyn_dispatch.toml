@@ -1,0 +1,27 @@
+# A changed implementation reached only through dynamic dispatch.
+crates = ["i03_dyn_dispatch"]
+exact_changes = true
+
+[[change]]
+kind = "body"
+symbol = "i03_dyn_dispatch::<impl Sound for Drum>::volume"
+
+[[impact]]
+symbol = "i03_dyn_dispatch::through_object"
+class = "behaviour"
+confidence = "possible"
+reason = "dispatches-to-changed"
+distance = 1
+
+[[impact]]
+symbol = "i03_dyn_dispatch::through_generic"
+class = "behaviour"
+confidence = "possible"
+reason = "dispatches-to-changed"
+distance = 1
+
+[[no_impact]]
+symbol = "i03_dyn_dispatch::label_of"
+
+[[no_impact]]
+symbol = "i03_dyn_dispatch::<impl Sound for Bell>::volume"

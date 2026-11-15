@@ -1,0 +1,8 @@
+[package]
+name = "i06-visibility"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "i06_visibility"
+path = "src/lib.rs"

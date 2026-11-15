@@ -1,0 +1,19 @@
+# A new implementation: dynamic dispatch may now land in it.
+crates = ["i18_impl_added"]
+exact_changes = true
+exact_impact = true
+
+[[change]]
+kind = "impl"
+detail = "member-added"
+symbol = "i18_impl_added::<impl Valued for Note>"
+
+[[impact]]
+symbol = "i18_impl_added::total"
+class = "behaviour"
+confidence = "possible"
+reason = "impl-resolution-changed"
+distance = 1
+
+[[no_impact]]
+symbol = "i18_impl_added::coin_value"

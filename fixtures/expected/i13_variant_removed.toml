@@ -1,0 +1,36 @@
+# A removed variant: the match that named it and the constructor adapt.
+crates = ["i13_variant_removed"]
+exact_changes = true
+exact_impact = true
+
+[[change]]
+kind = "variant"
+detail = "member-removed"
+symbol = "i13_variant_removed::Outcome::Declined"
+
+[[change]]
+kind = "body"
+symbol = "i13_variant_removed::describe"
+
+[[change]]
+kind = "body"
+symbol = "i13_variant_removed::from_code"
+
+[[impact]]
+symbol = "i13_variant_removed::describe"
+class = "adaptation"
+confidence = "definite"
+reason = "uses-changed-variant"
+distance = 1
+tags = ["changed"]
+
+[[impact]]
+symbol = "i13_variant_removed::from_code"
+class = "adaptation"
+confidence = "definite"
+reason = "uses-changed-variant"
+distance = 1
+tags = ["changed"]
+
+[[no_impact]]
+symbol = "i13_variant_removed::is_pending"

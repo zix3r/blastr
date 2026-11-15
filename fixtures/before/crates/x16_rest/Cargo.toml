@@ -1,0 +1,8 @@
+[package]
+name = "x16-rest"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "x16_rest"
+path = "src/lib.rs"

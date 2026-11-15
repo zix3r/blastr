@@ -1,0 +1,8 @@
+[package]
+name = "i22-type-alias"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "i22_type_alias"
+path = "src/lib.rs"

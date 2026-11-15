@@ -1,0 +1,41 @@
+# Two of three unit tests are reached; the third keeps the filters from shrinking.
+crates = ["i27_tests_unit"]
+exact_changes = true
+exact_impact = true
+
+[[change]]
+kind = "body"
+symbol = "i27_tests_unit::inc"
+
+[[impact]]
+symbol = "i27_tests_unit::tests::a"
+class = "behaviour"
+confidence = "likely"
+reason = "calls-changed"
+distance = 1
+tags = ["test"]
+
+[[impact]]
+symbol = "i27_tests_unit::tests::b"
+class = "behaviour"
+confidence = "likely"
+reason = "calls-changed"
+distance = 1
+tags = ["test"]
+
+[[no_impact]]
+symbol = "i27_tests_unit::tests::c"
+
+[[selected_test]]
+symbol = "i27_tests_unit::tests::a"
+reason = "reached"
+
+[[selected_test]]
+symbol = "i27_tests_unit::tests::b"
+reason = "reached"
+
+[[no_selected_test]]
+symbol = "i27_tests_unit::tests::c"
+
+[[test_command]]
+line = "cargo test -p i27-tests-unit --lib -- tests::a tests::b"

@@ -1,0 +1,28 @@
+# An attribute change: callers are behaviour, not adaptation.
+crates = ["i24_attribute"]
+exact_changes = true
+exact_impact = true
+
+[[change]]
+kind = "attribute"
+symbol = "i24_attribute::inc"
+
+[[impact]]
+symbol = "i24_attribute::add_two"
+class = "behaviour"
+confidence = "possible"
+reason = "attribute-changed"
+distance = 1
+
+[[impact]]
+symbol = "i24_attribute::add_three"
+class = "behaviour"
+confidence = "possible"
+reason = "attribute-changed"
+distance = 1
+
+[[no_impact]]
+symbol = "i24_attribute::keep"
+
+[[no_impact]]
+symbol = "i24_attribute::unchanged"

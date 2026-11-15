@@ -1,0 +1,25 @@
+# A changed constant value: its reader and, one step further back, the reader's caller.
+crates = ["i20_const_value"]
+exact_changes = true
+exact_impact = true
+
+[[change]]
+kind = "const-value"
+symbol = "i20_const_value::MAX_RETRIES"
+
+[[impact]]
+symbol = "i20_const_value::retries"
+class = "behaviour"
+confidence = "likely"
+reason = "uses-changed-value"
+distance = 1
+
+[[impact]]
+symbol = "i20_const_value::describe"
+class = "behaviour"
+confidence = "likely"
+reason = "uses-changed-value"
+distance = 2
+
+[[no_impact]]
+symbol = "i20_const_value::delay"

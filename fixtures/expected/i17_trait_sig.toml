@@ -1,0 +1,27 @@
+# A changed trait method: its implementation and its callers adapt.
+crates = ["i17_trait_sig"]
+
+[[change]]
+kind = "trait-item"
+detail = "member-modified"
+symbol = "i17_trait_sig::Measured::width"
+
+# The implements edge that reaches this item comes from the implementation's own method.
+[[impact]]
+symbol = "i17_trait_sig::<impl Measured for Bin>::width"
+class = "adaptation"
+confidence = "definite"
+reason = "must-implement-trait-item"
+distance = 1
+tags = ["changed"]
+
+[[impact]]
+symbol = "i17_trait_sig::width_of"
+class = "adaptation"
+confidence = "definite"
+reason = "uses-changed-trait-item"
+distance = 1
+tags = ["changed"]
+
+[[no_impact]]
+symbol = "i17_trait_sig::raw"

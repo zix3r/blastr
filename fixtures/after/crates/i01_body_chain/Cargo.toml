@@ -1,0 +1,8 @@
+[package]
+name = "i01-body-chain"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "i01_body_chain"
+path = "src/lib.rs"

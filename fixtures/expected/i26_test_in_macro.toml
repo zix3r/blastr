@@ -1,0 +1,24 @@
+# A call inside assert_eq! reaches the test that writes it.
+crates = ["i26_test_in_macro"]
+exact_changes = true
+exact_impact = true
+
+[[change]]
+kind = "body"
+symbol = "i26_test_in_macro::discounted"
+
+[[impact]]
+symbol = "i26_test_in_macro::tests::halves_a_price"
+class = "behaviour"
+confidence = "likely"
+reason = "calls-changed"
+distance = 1
+tags = ["test"]
+
+[[selected_test]]
+symbol = "i26_test_in_macro::tests::halves_a_price"
+reason = "reached"
+
+# The only test of the target is selected, so the command needs no filter.
+[[test_command]]
+line = "cargo test -p i26-test-in-macro --lib"

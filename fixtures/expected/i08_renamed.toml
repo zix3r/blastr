@@ -1,0 +1,25 @@
+# A caller of a function that was renamed.
+crates = ["i08_renamed"]
+exact_changes = true
+exact_impact = true
+
+[[change]]
+kind = "renamed"
+detail = "renamed"
+symbol = "i08_renamed::ceil"
+from = "i08_renamed::round_up"
+
+[[change]]
+kind = "body"
+symbol = "i08_renamed::apply"
+
+[[impact]]
+symbol = "i08_renamed::apply"
+class = "adaptation"
+confidence = "definite"
+reason = "refers-to-renamed"
+distance = 1
+tags = ["changed"]
+
+[[no_impact]]
+symbol = "i08_renamed::plain"

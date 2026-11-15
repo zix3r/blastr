@@ -1,0 +1,30 @@
+# A changed default body: the implementation that inherits it, not the one that overrides it.
+crates = ["i16_trait_default"]
+exact_changes = true
+exact_impact = true
+
+[[change]]
+kind = "trait-item"
+detail = "default-body"
+symbol = "i16_trait_default::Greeter::greet"
+
+[[impact]]
+symbol = "i16_trait_default::<impl Greeter for Quiet>"
+class = "behaviour"
+confidence = "likely"
+reason = "inherits-changed-default"
+distance = 1
+
+# One implementation overrides the method, so a call through the trait is only a candidate.
+[[impact]]
+symbol = "i16_trait_default::greet"
+class = "behaviour"
+confidence = "possible"
+reason = "calls-changed"
+distance = 1
+
+[[no_impact]]
+symbol = "i16_trait_default::<impl Greeter for Loud>"
+
+[[no_impact]]
+symbol = "i16_trait_default::<impl Greeter for Loud>::greet"

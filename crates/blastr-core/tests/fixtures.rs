@@ -1,6 +1,12 @@
 //! Runs the engine over the fixture workspaces and checks the result against
 //! the expectations in `fixtures/expected/*.toml`.
 //!
+//! Every file names the crates its case owns; only symbols, edges, changes and
+//! impact items inside those crates are checked. A case may also state which
+//! items the impact analysis must list (`impact`, `no_impact`), which tests it
+//! must select (`selected_test`, `no_selected_test`) and which `cargo test`
+//! command lines it must produce (`test_command`).
+//!
 //! Deliberately one test: loading the two fixture workspaces is slow and the
 //! CI runner gives every test its own process, so a static would not share it.
 
@@ -9,9 +15,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use blastr_core::Engine;
+use blastr_core::config::IgnoreSet;
+use blastr_core::impact::{ImpactInput, ImpactOutput, analyze};
 use blastr_model::{
-    AnalysisOptions, CancelToken, Certainty, Change, ChangeDetail, ChangeKind, Delta, Edge,
-    EdgeDetail, EdgeKind, GraphIndex, NoProgress, RevisionGraph, SymbolId, SymbolKind, Visibility,
+    AnalysisOptions, AnalysisParams, CancelToken, Certainty, Change, ChangeDetail, ChangeKind,
+    Confidence, Delta, Edge, EdgeDetail, EdgeKind, GraphIndex, ImpactClass, ImpactItem, NoProgress,
+    Reason, RevisionGraph, SelectedTest, SymbolId, SymbolKind, TestReason, Visibility,
 };
 use serde::Deserialize;
 
@@ -55,6 +64,24 @@ struct Case {
     /// Changes that must not be reported.
     #[serde(default)]
     no_change: Vec<AbsentChange>,
+    /// Whether the `impact` entries must be all the items in the case's crates.
+    #[serde(default)]
+    exact_impact: bool,
+    /// Impact items that must be listed.
+    #[serde(default)]
+    impact: Vec<ExpectedImpact>,
+    /// Impact items that must not be listed.
+    #[serde(default)]
+    no_impact: Vec<AbsentImpact>,
+    /// Tests that must be selected.
+    #[serde(default)]
+    selected_test: Vec<ExpectedSelectedTest>,
+    /// Tests that must not be selected.
+    #[serde(default)]
+    no_selected_test: Vec<AbsentSelectedTest>,
+    /// Command lines that must be among the selected tests' commands.
+    #[serde(default)]
+    test_command: Vec<ExpectedTestCommand>,
 }
 
 /// A symbol that must exist.
@@ -139,6 +166,108 @@ struct AbsentChange {
     kind: Option<String>,
 }
 
+/// An impact item that must be listed.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExpectedImpact {
+    /// Canonical path text of the affected symbol.
+    symbol: String,
+    /// Required class, when given: `adaptation` or `behaviour`.
+    class: Option<String>,
+    /// Required confidence, when given: `definite`, `likely` or `possible`.
+    confidence: Option<String>,
+    /// A reason that any kept path of the item must give, in kebab case.
+    reason: Option<String>,
+    /// Required distance from the change, when given.
+    distance: Option<u32>,
+    /// Tags that must be set: `test`, `main`, `public-api` or `changed`.
+    #[serde(default)]
+    tags: Vec<String>,
+}
+
+impl ExpectedImpact {
+    /// Whether an item satisfies every constraint of this expectation.
+    fn matches(&self, item: &ImpactItem) -> bool {
+        let class = self.class.as_deref();
+        let confidence = self.confidence.as_deref();
+        let reason = self.reason.as_deref();
+        let class_ok = class.is_none_or(|name| item.class.as_str() == name);
+        let confidence_ok = confidence.is_none_or(|name| item.confidence.as_str() == name);
+        let distance_ok = self.distance.is_none_or(|value| item.distance == value);
+        let reason_ok = match reason {
+            Some(name) => item
+                .paths
+                .iter()
+                .any(|path| reason_name(path.reason) == name),
+            None => true,
+        };
+        let tags = item_tags(item);
+        let tags_ok = self.tags.iter().all(|tag| tags.contains(&tag.as_str()));
+        class_ok && confidence_ok && distance_ok && reason_ok && tags_ok
+    }
+
+    /// The constraints of this expectation, for a failure message.
+    fn filters(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(class) = &self.class {
+            parts.push(format!("class {class}"));
+        }
+        if let Some(confidence) = &self.confidence {
+            parts.push(format!("confidence {confidence}"));
+        }
+        if let Some(reason) = &self.reason {
+            parts.push(format!("reason {reason}"));
+        }
+        if let Some(distance) = self.distance {
+            parts.push(format!("distance {distance}"));
+        }
+        if !self.tags.is_empty() {
+            parts.push(format!("tags {}", self.tags.join(",")));
+        }
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", parts.join(", "))
+        }
+    }
+}
+
+/// An impact item that must not be listed.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AbsentImpact {
+    /// Canonical path text of the affected symbol.
+    symbol: String,
+    /// Class the item must not have; any class when omitted.
+    class: Option<String>,
+}
+
+/// A test that must be selected.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExpectedSelectedTest {
+    /// Canonical path text of the test function.
+    symbol: String,
+    /// Required reason, when given: `reached` or `changed`.
+    reason: Option<String>,
+}
+
+/// A test that must not be selected.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AbsentSelectedTest {
+    /// Canonical path text of the test function.
+    symbol: String,
+}
+
+/// A command line that must be among the selected tests' commands.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExpectedTestCommand {
+    /// The line, as `TestCommand::command_line` renders it.
+    line: String,
+}
+
 /// One graph and the index built over it.
 #[derive(Clone, Copy)]
 struct GraphSide<'a> {
@@ -150,7 +279,7 @@ struct GraphSide<'a> {
     index: &'a GraphIndex,
 }
 
-/// The two graphs and the changes found between them.
+/// The two graphs, the changes found between them and their impact.
 struct Context<'a> {
     /// The base side.
     before: GraphSide<'a>,
@@ -158,6 +287,8 @@ struct Context<'a> {
     after: GraphSide<'a>,
     /// Reported changes.
     changes: &'a [Change],
+    /// What the changes can affect.
+    impact: &'a ImpactOutput,
 }
 
 impl<'a> Context<'a> {
@@ -180,6 +311,12 @@ impl<'a> Context<'a> {
         self.check_changes(case_name, case, &mut failures);
         self.check_absent_changes(case_name, case, &mut failures);
         self.check_exact_changes(case_name, case, &mut failures);
+        self.check_impacts(case_name, case, &mut failures);
+        self.check_absent_impacts(case_name, case, &mut failures);
+        self.check_exact_impact(case_name, case, &mut failures);
+        self.check_selected_tests(case_name, case, &mut failures);
+        self.check_unselected_tests(case_name, case, &mut failures);
+        self.check_test_commands(case_name, case, &mut failures);
         failures
     }
 
@@ -489,6 +626,214 @@ impl<'a> Context<'a> {
         }
     }
 
+    /// Checks the `impact` entries.
+    fn check_impacts(&self, case_name: &str, case: &Case, failures: &mut Vec<String>) {
+        for expect in &case.impact {
+            let known = expect.class.as_deref().is_none_or(is_known_class)
+                && expect.confidence.as_deref().is_none_or(is_known_confidence)
+                && expect.reason.as_deref().is_none_or(is_known_reason)
+                && expect.tags.iter().all(|tag| is_known_tag(tag));
+            if !known {
+                failures.push(failure(
+                    case_name,
+                    &format!("known names for `{}`", expect.symbol),
+                    "an unknown class, confidence, reason or tag",
+                ));
+                continue;
+            }
+            let matched = self
+                .impact
+                .items
+                .iter()
+                .filter(|item| item.symbol.path == expect.symbol)
+                .any(|item| expect.matches(item));
+            if !matched {
+                failures.push(failure(
+                    case_name,
+                    &format!("an impact item `{}`{}", expect.symbol, expect.filters()),
+                    &self.items_of(case),
+                ));
+            }
+        }
+    }
+
+    /// Checks the `no_impact` entries.
+    fn check_absent_impacts(&self, case_name: &str, case: &Case, failures: &mut Vec<String>) {
+        for expect in &case.no_impact {
+            if let Some(name) = expect.class.as_deref()
+                && !is_known_class(name)
+            {
+                failures.push(failure(
+                    case_name,
+                    &format!("a known impact class for `{}`", expect.symbol),
+                    &format!("unknown class `{name}`"),
+                ));
+                continue;
+            }
+            let class = expect.class.as_deref();
+            let present: Vec<String> = self
+                .impact
+                .items
+                .iter()
+                .filter(|item| item.symbol.path == expect.symbol)
+                .filter(|item| class.is_none_or(|name| item.class.as_str() == name))
+                .map(format_item)
+                .collect();
+            if !present.is_empty() {
+                let expected = match class {
+                    Some(class) => format!("no `{class}` impact item `{}`", expect.symbol),
+                    None => format!("no impact item `{}`", expect.symbol),
+                };
+                failures.push(failure(case_name, &expected, &join(&present)));
+            }
+        }
+    }
+
+    /// Checks `exact_impact`.
+    fn check_exact_impact(&self, case_name: &str, case: &Case, failures: &mut Vec<String>) {
+        if !case.exact_impact {
+            return;
+        }
+        let unexpected: Vec<String> = self
+            .impact
+            .items
+            .iter()
+            .filter(|item| belongs(&case.crates, item.symbol.path.as_str()))
+            .filter(|item| !is_expected(case, &item.symbol.path))
+            .map(format_item)
+            .collect();
+        if !unexpected.is_empty() {
+            failures.push(failure(
+                case_name,
+                "only the listed impact items in the case's crates",
+                &join(&unexpected),
+            ));
+        }
+    }
+
+    /// Checks the `selected_test` entries.
+    fn check_selected_tests(&self, case_name: &str, case: &Case, failures: &mut Vec<String>) {
+        for expect in &case.selected_test {
+            if let Some(name) = expect.reason.as_deref()
+                && !is_known_test_reason(name)
+            {
+                failures.push(failure(
+                    case_name,
+                    &format!("a known test reason for `{}`", expect.symbol),
+                    &format!("unknown reason `{name}`"),
+                ));
+                continue;
+            }
+            let wanted = expect.reason.as_deref();
+            let matched = self
+                .impact
+                .tests
+                .selected
+                .iter()
+                .filter(|test| test.symbol.path == expect.symbol)
+                .any(|test| wanted.is_none_or(|name| test_reason_name(test.reason) == name));
+            if !matched {
+                let expected = match wanted {
+                    Some(reason) => {
+                        format!("a selected test `{}` with reason {reason}", expect.symbol)
+                    }
+                    None => format!("a selected test `{}`", expect.symbol),
+                };
+                failures.push(failure(case_name, &expected, &self.selected_tests_of(case)));
+            }
+        }
+    }
+
+    /// Checks the `no_selected_test` entries.
+    fn check_unselected_tests(&self, case_name: &str, case: &Case, failures: &mut Vec<String>) {
+        for expect in &case.no_selected_test {
+            let present: Vec<String> = self
+                .impact
+                .tests
+                .selected
+                .iter()
+                .filter(|test| test.symbol.path == expect.symbol)
+                .map(format_selected_test)
+                .collect();
+            if !present.is_empty() {
+                failures.push(failure(
+                    case_name,
+                    &format!("no selected test `{}`", expect.symbol),
+                    &join(&present),
+                ));
+            }
+        }
+    }
+
+    /// Checks the `test_command` entries.
+    fn check_test_commands(&self, case_name: &str, case: &Case, failures: &mut Vec<String>) {
+        for expect in &case.test_command {
+            let found = self
+                .impact
+                .tests
+                .commands
+                .iter()
+                .any(|command| command.command_line() == expect.line);
+            if !found {
+                failures.push(failure(
+                    case_name,
+                    &format!("the test command `{}`", expect.line),
+                    &self.commands_of(case),
+                ));
+            }
+        }
+    }
+
+    /// The impact items in the case's crates, formatted for a failure message.
+    fn items_of(&self, case: &Case) -> String {
+        let listed: Vec<String> = self
+            .impact
+            .items
+            .iter()
+            .filter(|item| belongs(&case.crates, item.symbol.path.as_str()))
+            .map(format_item)
+            .collect();
+        if listed.is_empty() {
+            "none".to_string()
+        } else {
+            join(&listed)
+        }
+    }
+
+    /// The selected tests in the case's crates, formatted for a failure message.
+    fn selected_tests_of(&self, case: &Case) -> String {
+        let listed: Vec<String> = self
+            .impact
+            .tests
+            .selected
+            .iter()
+            .filter(|test| belongs(&case.crates, test.symbol.path.as_str()))
+            .map(format_selected_test)
+            .collect();
+        if listed.is_empty() {
+            "none".to_string()
+        } else {
+            join(&listed)
+        }
+    }
+
+    /// The commands of the case's packages, formatted for a failure message.
+    fn commands_of(&self, case: &Case) -> String {
+        let listed: Vec<String> = self
+            .impact
+            .tests
+            .commands
+            .iter()
+            .filter(|command| belongs_package(&case.crates, &command.package))
+            .map(|command| command.command_line())
+            .collect();
+        if listed.is_empty() {
+            "none".to_string()
+        } else {
+            join(&listed)
+        }
+    }
+
     /// The changes reported in the case's crates, formatted for a failure message.
     fn reported(&self, case: &Case) -> String {
         let listed = self
@@ -534,6 +879,7 @@ fn parse_edge_detail(name: &str) -> Option<EdgeDetail> {
         "none" => Some(EdgeDetail::None),
         "match-exhaustive" => Some(EdgeDetail::MatchExhaustive),
         "match-wildcard" => Some(EdgeDetail::MatchWildcard),
+        "with-rest" => Some(EdgeDetail::WithRest),
         _ => None,
     }
 }
@@ -544,6 +890,7 @@ fn edge_detail_name(detail: EdgeDetail) -> &'static str {
         EdgeDetail::None => "none",
         EdgeDetail::MatchExhaustive => "match-exhaustive",
         EdgeDetail::MatchWildcard => "match-wildcard",
+        EdgeDetail::WithRest => "with-rest",
     }
 }
 
@@ -628,6 +975,7 @@ fn format_change(change: &Change) -> String {
             )
         }
         ChangeDetail::Manifest(text) => format!(" manifest {text}"),
+        ChangeDetail::Retyped => " retyped".to_string(),
     };
     format!("{} {}{}", change.kind.as_str(), change.symbol.path, detail)
 }
@@ -644,6 +992,123 @@ fn format_edge(side: &GraphSide<'_>, edge: &Edge) -> String {
         text.push_str(&format!(" ({})", edge_detail_name(edge.detail)));
     }
     text
+}
+
+/// Formats an impact item as `symbol (class, confidence, distance N, reasons: ...)`.
+fn format_item(item: &ImpactItem) -> String {
+    let mut reasons: Vec<String> = item
+        .paths
+        .iter()
+        .map(|path| reason_name(path.reason))
+        .collect();
+    reasons.sort();
+    reasons.dedup();
+    let mut text = format!(
+        "{} ({}, {}, distance {}",
+        item.symbol.path,
+        item.class.as_str(),
+        item.confidence.as_str(),
+        item.distance
+    );
+    if !reasons.is_empty() {
+        text.push_str(&format!(", reasons: {}", reasons.join(", ")));
+    }
+    let tags = item_tags(item);
+    if !tags.is_empty() {
+        text.push_str(&format!(", tags: {}", tags.join(",")));
+    }
+    text.push(')');
+    text
+}
+
+/// The tag names set on an impact item.
+fn item_tags(item: &ImpactItem) -> Vec<&'static str> {
+    let mut tags = Vec::new();
+    if item.tags.is_test {
+        tags.push("test");
+    }
+    if item.tags.is_main {
+        tags.push("main");
+    }
+    if item.tags.is_pub_api {
+        tags.push("public-api");
+    }
+    if item.tags.changed {
+        tags.push("changed");
+    }
+    tags
+}
+
+/// Whether a tag name in an expectation file is known.
+fn is_known_tag(tag: &str) -> bool {
+    matches!(tag, "test" | "main" | "public-api" | "changed")
+}
+
+/// Whether a name in an expectation file is a known impact class.
+fn is_known_class(name: &str) -> bool {
+    parse_enum(name, ImpactClass::ALL, |value| value.as_str()).is_some()
+}
+
+/// Whether a name in an expectation file is a known confidence.
+fn is_known_confidence(name: &str) -> bool {
+    parse_enum(name, Confidence::ALL, |value| value.as_str()).is_some()
+}
+
+/// Whether a name in an expectation file is a known reason.
+fn is_known_reason(name: &str) -> bool {
+    parse_kebab::<Reason>(name).is_some()
+}
+
+/// Whether a name in an expectation file is a known test reason.
+fn is_known_test_reason(name: &str) -> bool {
+    parse_kebab::<TestReason>(name).is_some()
+}
+
+/// Whether a case lists an impact item with this path text.
+fn is_expected(case: &Case, symbol: &str) -> bool {
+    case.impact.iter().any(|expect| expect.symbol == symbol)
+}
+
+/// Formats a selected test as `symbol (reason, filter `name`)`.
+fn format_selected_test(test: &SelectedTest) -> String {
+    format!(
+        "{} ({}, filter `{}`)",
+        test.symbol.path,
+        test_reason_name(test.reason),
+        test.filter
+    )
+}
+
+/// The kebab-case name serde gives a value.
+fn kebab_name<T: serde::Serialize>(value: T) -> String {
+    match serde_json::to_value(value) {
+        Ok(serde_json::Value::String(text)) => text,
+        Ok(other) => other.to_string(),
+        Err(_) => String::new(),
+    }
+}
+
+/// Parses a value from its kebab-case name, reporting `None` for unknown names.
+fn parse_kebab<T: serde::de::DeserializeOwned>(name: &str) -> Option<T> {
+    serde_json::from_value(serde_json::Value::String(name.to_owned())).ok()
+}
+
+/// The kebab-case name of a `Reason`.
+fn reason_name(reason: Reason) -> String {
+    kebab_name(reason)
+}
+
+/// The kebab-case name of a `TestReason`.
+fn test_reason_name(reason: TestReason) -> String {
+    kebab_name(reason)
+}
+
+/// Whether a Cargo package belongs to the case's crates.
+fn belongs_package(crates: &[String], package: &str) -> bool {
+    let underscored = package.replace('-', "_");
+    crates
+        .iter()
+        .any(|krate| krate == package || *krate == underscored)
 }
 
 /// Whether a path text's first segment names one of the case's crates.
@@ -666,6 +1131,7 @@ fn is_known_detail(detail: &str) -> bool {
             | "renamed"
             | "visibility"
             | "manifest"
+            | "retyped"
     )
 }
 
@@ -680,6 +1146,7 @@ fn detail_matches(expected: &str, from: Option<&str>, actual: &ChangeDetail) -> 
             if from.is_none_or(|wanted| previous.path.as_str() == wanted)),
         "visibility" => matches!(actual, ChangeDetail::Visibility { .. }),
         "manifest" => matches!(actual, ChangeDetail::Manifest(_)),
+        "retyped" => matches!(actual, ChangeDetail::Retyped),
         _ => false,
     }
 }
@@ -716,6 +1183,20 @@ fn fixtures() {
             panic!("diffing the fixture workspaces failed: {error}{hint}")
         });
 
+    let params = AnalysisParams::default();
+    let ignore = IgnoreSet::empty();
+    let impact = analyze(
+        &ImpactInput {
+            base: &output.base,
+            head: &output.head,
+            changes: &output.result.changes,
+            params: &params,
+            ignore: &ignore,
+        },
+        &CancelToken::new(),
+    )
+    .expect("the analysis is not cancelled");
+
     let before_index = GraphIndex::new(&output.base);
     let after_index = GraphIndex::new(&output.head);
     let context = Context {
@@ -730,6 +1211,7 @@ fn fixtures() {
             index: &after_index,
         },
         changes: &output.result.changes,
+        impact: &impact,
     };
 
     let mut files: Vec<PathBuf> = fs::read_dir(&expected_dir)
@@ -767,12 +1249,14 @@ fn fixtures() {
     }
 
     println!(
-        "fixtures: {} cases, {} symbols before / {} after, {} edges before / {} after, {} changes",
+        "fixtures: {} cases, {} symbols before / {} after, {} edges before / {} after, {} changes, {} impact items, {} selected tests",
         files.len(),
         output.base.symbols.len(),
         output.head.symbols.len(),
         output.base.edges.len(),
         output.head.edges.len(),
         output.result.changes.len(),
+        impact.items.len(),
+        impact.tests.selected.len(),
     );
 }

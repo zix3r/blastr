@@ -1,0 +1,20 @@
+# Narrowed visibility with every referrer still inside the new range.
+crates = ["i06_visibility"]
+exact_changes = true
+exact_impact = true
+
+[[change]]
+kind = "visibility"
+detail = "visibility"
+symbol = "i06_visibility::inner::helper"
+
+[[change]]
+kind = "visibility"
+detail = "visibility"
+symbol = "i06_visibility::shared"
+
+[[no_impact]]
+symbol = "i06_visibility::inner::local"
+
+[[no_impact]]
+symbol = "i06_visibility::wrapper"

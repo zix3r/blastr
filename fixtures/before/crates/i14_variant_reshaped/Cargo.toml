@@ -1,0 +1,8 @@
+[package]
+name = "i14-variant-reshaped"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "i14_variant_reshaped"
+path = "src/lib.rs"

@@ -1,0 +1,8 @@
+[package]
+name = "i17-trait-sig"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "i17_trait_sig"
+path = "src/lib.rs"

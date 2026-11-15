@@ -1,0 +1,8 @@
+[package]
+name = "i09-field-removed"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "i09_field_removed"
+path = "src/lib.rs"

@@ -1,0 +1,8 @@
+[package]
+name = "i10-field-retyped"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "i10_field_retyped"
+path = "src/lib.rs"

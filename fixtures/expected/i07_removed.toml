@@ -1,0 +1,23 @@
+# A caller of a removed function, found in the base graph.
+crates = ["i07_removed"]
+exact_changes = true
+exact_impact = true
+
+[[change]]
+kind = "removed"
+symbol = "i07_removed::legacy"
+
+[[change]]
+kind = "body"
+symbol = "i07_removed::total"
+
+[[impact]]
+symbol = "i07_removed::total"
+class = "adaptation"
+confidence = "definite"
+reason = "refers-to-removed"
+distance = 1
+tags = ["changed"]
+
+[[no_impact]]
+symbol = "i07_removed::other"
