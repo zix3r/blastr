@@ -11,4 +11,17 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+blastr-model.workspace = true
+ra_ap_hir.workspace = true
+ra_ap_ide.workspace = true
+ra_ap_ide_db.workspace = true
+ra_ap_load-cargo.workspace = true
+ra_ap_paths.workspace = true
+ra_ap_project_model.workspace = true
 ra_ap_syntax.workspace = true
+ra_ap_vfs.workspace = true
+thiserror.workspace = true
+unicode-properties.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
