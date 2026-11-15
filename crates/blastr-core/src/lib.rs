@@ -1,17 +1,18 @@
 //! Analysis pipeline for Blastr.
 //!
-//! This crate holds the pieces that every front end shares: the error type,
-//! the progress and cancellation types passed to long-running operations, and
-//! the [`Engine`] that owns the cache.
+//! This crate holds what every front end shares: the error type, the
+//! [`Engine`] that owns the cache and runs comparisons, and the structural
+//! comparison of two revision graphs in [`diff`].
 
 #![forbid(unsafe_code)]
 
-mod cancel;
+mod codec;
+pub mod diff;
 mod engine;
 mod error;
-mod progress;
+mod hunks;
 
-pub use cancel::CancelToken;
-pub use engine::Engine;
+pub use blastr_model::{CancelToken, NoProgress, Progress};
+pub use codec::{decode_graph, encode_graph};
+pub use engine::{CacheStatus, DiffOutput, Engine, IndexReport};
 pub use error::{Error, Result};
-pub use progress::{NoProgress, Progress};

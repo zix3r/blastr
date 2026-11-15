@@ -9,6 +9,15 @@ pub enum Error {
     /// A cache operation failed.
     #[error(transparent)]
     Store(#[from] blastr_store::Error),
+    /// Loading or analysing the project failed.
+    #[error(transparent)]
+    Ra(#[from] blastr_ra::Error),
+    /// A file could not be read or written.
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    /// A cached graph could not be encoded or decoded.
+    #[error("cache data error: {0}")]
+    Codec(String),
     /// The operation was cancelled through its `CancelToken`.
     #[error("cancelled")]
     Cancelled,
@@ -34,7 +43,28 @@ impl Error {
             | Error::Store(blastr_store::Error::Io(_)) => {
                 "if the cache is damaged, delete it with `blastr cache clear`"
             }
-            Error::Git(_) | Error::Store(_) | Error::Cancelled | Error::NotImplemented(_) => {
+            Error::Git(blastr_git::Error::UnknownRevision(_)) => {
+                "check the revision with `git log`; branches, tags and commit ids all work"
+            }
+            Error::Ra(blastr_ra::Error::NoManifest { .. }) => {
+                "run blastr in a Cargo project, or pass `--manifest-path <Cargo.toml>`"
+            }
+            Error::Ra(blastr_ra::Error::MissingRustSrc) => {
+                "install them with `rustup component add rust-src`"
+            }
+            Error::Ra(blastr_ra::Error::Cargo(_)) => {
+                "check that `cargo metadata` works in this project"
+            }
+            Error::Ra(blastr_ra::Error::Toolchain(_)) => {
+                "check that `cargo --version` works in this directory"
+            }
+            Error::Codec(_) => "clear the cache with `blastr cache clear`",
+            Error::Git(_)
+            | Error::Store(_)
+            | Error::Ra(_)
+            | Error::Io(_)
+            | Error::Cancelled
+            | Error::NotImplemented(_) => {
                 return None;
             }
         };
@@ -43,6 +73,12 @@ impl Error {
 }
 
 /// A convenient alias for results produced by this crate.
+impl From<blastr_model::Cancelled> for Error {
+    fn from(_: blastr_model::Cancelled) -> Self {
+        Error::Cancelled
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(test)]
