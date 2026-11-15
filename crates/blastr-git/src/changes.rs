@@ -108,13 +108,30 @@ fn same_content(repo: &gix::Repository, base: &FileEntry, head: &FileEntry) -> R
         (Content::Bytes(base), Content::Bytes(head)) => Ok(base == head),
         (Content::Object(base), Content::Bytes(head)) => {
             let bytes = blob_bytes(repo, *base)?;
-            Ok(bytes.as_slice() == head.as_slice())
+            Ok(same_text(&bytes, head))
         }
         (Content::Bytes(base), Content::Object(head)) => {
             let bytes = blob_bytes(repo, *head)?;
-            Ok(base.as_slice() == bytes.as_slice())
+            Ok(same_text(base, &bytes))
         }
     }
+}
+
+/// True when two files are equal once every CRLF line ending is read as LF.
+///
+/// Git checks files out with the platform's line endings when asked to, and
+/// does not count that as a modification; neither does this comparison.
+fn same_text(a: &[u8], b: &[u8]) -> bool {
+    a == b || unix_lines(a).eq(unix_lines(b))
+}
+
+/// The bytes of a file, without the carriage return of each CRLF pair.
+fn unix_lines(bytes: &[u8]) -> impl Iterator<Item = u8> + '_ {
+    bytes
+        .iter()
+        .enumerate()
+        .filter(|&(index, &byte)| byte != b'\r' || bytes.get(index + 1) != Some(&b'\n'))
+        .map(|(_, &byte)| byte)
 }
 
 /// The files of one side, by path.
@@ -241,10 +258,18 @@ fn collect_worktree(
                 continue;
             }
             let bytes = std::fs::read(&full)?;
-            let oid =
-                gix::objs::compute_hash(hash, gix::objs::Kind::Blob, &bytes).map_err(Error::git)?;
+            // A file with carriage returns may differ from the committed one
+            // in line endings alone, which only a look at the text can tell.
+            let content = if bytes.contains(&b'\r') {
+                Content::Bytes(bytes)
+            } else {
+                Content::Object(
+                    gix::objs::compute_hash(hash, gix::objs::Kind::Blob, &bytes)
+                        .map_err(Error::git)?,
+                )
+            };
             let file = FileEntry {
-                content: Content::Object(oid),
+                content,
                 kind: None,
             };
             out.insert(RelPath::new(path), file);
@@ -365,6 +390,7 @@ fn collect_dir(
 mod tests {
     use blastr_model::{ChangedFile, Comparison, FileStatus, RelPath, Source};
 
+    use super::same_text;
     use crate::changed_files_between_dirs;
     use crate::test_support::TestRepo;
 
@@ -484,6 +510,14 @@ mod tests {
             files,
             vec![modified("a.txt"), deleted("b.txt"), added("c.txt")]
         );
+    }
+
+    #[test]
+    fn line_endings_alone_are_not_a_difference() {
+        assert!(same_text(b"a\nb\n", b"a\r\nb\r\n"));
+        assert!(same_text(b"a\r\nb\n", b"a\nb\r\n"));
+        assert!(!same_text(b"a\nb\n", b"a\nc\n"));
+        assert!(!same_text(b"a\rb", b"ab"));
     }
 
     #[test]
