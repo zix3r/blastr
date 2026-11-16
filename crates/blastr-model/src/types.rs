@@ -167,7 +167,9 @@ pub enum TargetKind {
 pub struct CrateInfo {
     /// The crate name as it appears in paths (underscores, not dashes).
     pub name: String,
-    /// The Cargo package the target belongs to.
+    /// The Cargo package the target belongs to, as `cargo -p` accepts it:
+    /// the package name, or `name@version` when a dependency of the project
+    /// has the same name.
     pub package: String,
     /// The kind of target.
     pub target_kind: TargetKind,
@@ -274,7 +276,8 @@ pub struct AnalysisKey {
     pub toolchain: String,
     /// The rust-analyzer library version.
     pub rust_analyzer: String,
-    /// The Blastr version.
+    /// The Blastr build: its version and a fingerprint of the executable,
+    /// so that a rebuilt Blastr never reads what an older build computed.
     pub blastr: String,
     /// Whether build scripts and procedural macros ran.
     pub exec: ExecMode,

@@ -9,11 +9,14 @@ use blastr_model::{
     ImpactTags, Limit, Location,
 };
 
-use super::analysis::{path_summary, reason_text};
+use super::analysis::{COMMANDS_HINT, edited_summary, path_summary, reason_text, target_label};
 use super::{SCHEMA_VERSION, features_text, limit_text};
 
 /// How many rows a table shows before the whole table is folded away.
 const MAX_TABLE_ROWS: usize = 10;
+
+/// Widest command line a Markdown block repeats before leaving them to `blastr tests`.
+const MAX_COMMAND_WIDTH: usize = 120;
 
 /// What the tests section says when no test reaches the changes.
 const NO_TEST: &str = "No test reaches the changed code.";
@@ -60,7 +63,12 @@ pub fn analysis_markdown(analysis: &Analysis, options: &AnalysisOptions) -> Stri
     let editing: Vec<&ImpactItem> = analysis
         .items
         .iter()
-        .filter(|item| item.class == ImpactClass::Adaptation)
+        .filter(|item| item.class == ImpactClass::Adaptation && !item.tags.changed)
+        .collect();
+    let edited: Vec<&ImpactItem> = analysis
+        .items
+        .iter()
+        .filter(|item| item.class == ImpactClass::Adaptation && item.tags.changed)
         .collect();
     let behaving: Vec<&ImpactItem> = analysis
         .items
@@ -73,6 +81,11 @@ pub fn analysis_markdown(analysis: &Analysis, options: &AnalysisOptions) -> Stri
         "1 needs editing".to_owned()
     } else {
         format!("{editing_count} need editing")
+    };
+    let edited_text = if edited.is_empty() {
+        String::new()
+    } else {
+        format!(" · {} edited with the change", edited.len())
     };
     let behaving_count = behaving.len();
     let behaving_text = format!("{behaving_count} may behave differently");
@@ -88,7 +101,9 @@ pub fn analysis_markdown(analysis: &Analysis, options: &AnalysisOptions) -> Stri
     let mut blocks = vec![
         "## Blastr impact report".to_owned(),
         format!("Comparing `{base}` → `{head}` · features: {features}"),
-        format!("**{change_count} · {editing_text} · {behaving_text} · {tests_text}**"),
+        format!(
+            "**{change_count} · {editing_text}{edited_text} · {behaving_text} · {tests_text}**"
+        ),
     ];
 
     if !changes.is_empty() {
@@ -108,10 +123,14 @@ pub fn analysis_markdown(analysis: &Analysis, options: &AnalysisOptions) -> Stri
             .copied()
             .map(|item| editing_row(item, analysis))
             .collect::<Vec<Vec<String>>>();
-        blocks.push(section(
-            "Needs editing",
-            &table(&["Symbol", "Why", "Location", "Status"], rows),
-        ));
+        let mut body = table(&["Symbol", "Why", "Location"], rows);
+        if !edited.is_empty() {
+            body.push_str("\n\n");
+            body.push_str(&edited_summary(edited.len()));
+        }
+        blocks.push(section("Needs editing", &body));
+    } else if !edited.is_empty() {
+        blocks.push(edited_summary(edited.len()));
     }
     if !behaving.is_empty() {
         let rows = behaving
@@ -268,16 +287,10 @@ fn tags_suffix(tags: &ImpactTags) -> String {
 
 /// One row of the `Needs editing` table.
 fn editing_row(item: &ImpactItem, analysis: &Analysis) -> Vec<String> {
-    let status = if item.tags.changed {
-        "edited"
-    } else {
-        "not touched"
-    };
     vec![
         code(&item.symbol.path),
         escape(&editing_why(item, analysis)),
         escape(&site_text(item)),
-        status.to_owned(),
     ]
 }
 
@@ -294,19 +307,39 @@ fn behaving_row(item: &ImpactItem, analysis: &Analysis) -> Vec<String> {
     ]
 }
 
-/// The fenced block of commands that run the selected tests, or the sentence
-/// saying that none reach the changes.
+/// The table of targets behind the selected tests, followed by the commands
+/// that run them, or by the sentence saying that none reach the changes.
 fn tests_block(analysis: &Analysis) -> String {
-    let lines: Vec<String> = analysis
-        .tests
-        .commands
+    let commands = &analysis.tests.commands;
+    if commands.is_empty() {
+        return NO_TEST.to_owned();
+    }
+
+    let rows: Vec<Vec<String>> = commands
+        .iter()
+        .map(|command| {
+            vec![
+                escape(&command.package),
+                escape(&target_label(command)),
+                format!("{} of {}", command.tests, command.total),
+            ]
+        })
+        .collect();
+    let mut out = table(&["Package", "Target", "Selected"], rows);
+
+    let lines: Vec<String> = commands
         .iter()
         .map(|command| command.command_line())
         .collect();
-    if lines.is_empty() {
-        return NO_TEST.to_owned();
+    out.push_str("\n\n");
+    if lines
+        .iter()
+        .any(|line| line.chars().count() > MAX_COMMAND_WIDTH)
+    {
+        out.push_str(COMMANDS_HINT);
+        return out;
     }
-    let mut out = String::from("```sh\n");
+    out.push_str("```sh\n");
     for line in &lines {
         out.push_str(line);
         out.push('\n');
@@ -542,7 +575,32 @@ mod tests {
             target_name: name.to_owned(),
             filters: filters.iter().map(|filter| (*filter).to_owned()).collect(),
             tests,
+            total: tests,
         }
+    }
+
+    /// An adaptation item reached by a call to the first change of the analysis.
+    fn adaptation(name: &str, edited: bool) -> ImpactItem {
+        let mut item = item(
+            name,
+            ImpactClass::Adaptation,
+            Confidence::Definite,
+            vec![path(
+                0,
+                Reason::CallsChanged,
+                ImpactClass::Adaptation,
+                0.9,
+                vec![step(
+                    name,
+                    "billing::tax::vat_rate",
+                    EdgeKind::Calls,
+                    Certainty::Resolved,
+                    location("src/billing/invoice.rs", 12),
+                )],
+            )],
+        );
+        item.tags.changed = edited;
+        item
     }
 
     /// The analysis the mixed-markdown test renders: one adaptation, one
@@ -711,9 +769,9 @@ mod tests {
              \n\
              ### Needs editing\n\
              \n\
-             | Symbol | Why | Location | Status |\n\
-             | --- | --- | --- | --- |\n\
-             | `billing::invoice::total` | {adaptation_why} | src/billing/invoice.rs:12 | not touched |\n\
+             | Symbol | Why | Location |\n\
+             | --- | --- | --- |\n\
+             | `billing::invoice::total` | {adaptation_why} | src/billing/invoice.rs:12 |\n\
              \n\
              ### May behave differently\n\
              \n\
@@ -722,6 +780,10 @@ mod tests {
              | likely | `billing::report::print` | {behaviour_why} (public API) | src/billing/report.rs:30 |\n\
              \n\
              ### Tests to run\n\
+             \n\
+             | Package | Target | Selected |\n\
+             | --- | --- | --- |\n\
+             | billing | unit tests | 2 of 2 |\n\
              \n\
              ```sh\n\
              cargo test -p billing --lib -- tax::tests::brackets tax::tests::rounds\n\
@@ -842,22 +904,26 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("| src/a\\|b.rs:5 |"), "{text}");
-        // Every row must still have exactly the four columns of its header.
+        // Every row must still have exactly the three columns of its header.
         for line in text.lines().filter(|line| line.starts_with("| `billing::")) {
             assert_eq!(
                 line.matches(" | ").count(),
-                3,
+                2,
                 "the cell was not escaped: {line}"
             );
         }
     }
 
     #[test]
-    fn tests_markdown_shows_the_commands_or_says_there_are_none() {
+    fn tests_markdown_shows_the_targets_and_the_commands_or_says_there_are_none() {
         let analysis = mixed_analysis();
         assert_eq!(
             tests_markdown(&analysis),
             "## Tests to run (2 of 40)\n\
+             \n\
+             | Package | Target | Selected |\n\
+             | --- | --- | --- |\n\
+             | billing | unit tests | 2 of 2 |\n\
              \n\
              ```sh\n\
              cargo test -p billing --lib -- tax::tests::brackets tax::tests::rounds\n\
@@ -869,6 +935,101 @@ mod tests {
             tests_markdown(&empty),
             "## Tests to run (0 of 0)\n\nNo test reaches the changed code.\n"
         );
+    }
+
+    #[test]
+    fn a_command_line_that_is_too_long_is_left_to_the_cargo_format() {
+        let mut analysis = empty_analysis();
+        analysis.tests = TestSelection {
+            selected: vec![SelectedTest {
+                symbol: symbol_path("billing::tax::tests::rounds", SymbolKind::Function),
+                location: location("src/billing/tax.rs", 40),
+                reason: TestReason::Reached,
+                filter: "tax::tests::rounds".to_owned(),
+            }],
+            total: 40,
+            commands: vec![command(
+                "billing",
+                TargetKind::Lib,
+                "billing",
+                &[
+                    "tax::tests::brackets",
+                    "tax::tests::brackets_and_rates",
+                    "tax::tests::brackets_for_regions",
+                    "tax::tests::rounds",
+                    "tax::tests::rounds_for_regions",
+                ],
+                1,
+            )],
+        };
+
+        let expected = format!(
+            "| Package | Target | Selected |\n| --- | --- | --- |\n| billing | unit tests | 1 of 1 |\n\n{}",
+            COMMANDS_HINT
+        );
+        assert_eq!(tests_block(&analysis), expected);
+        assert!(
+            tests_markdown(&analysis).contains(COMMANDS_HINT),
+            "{}",
+            tests_markdown(&analysis)
+        );
+        assert!(
+            !tests_markdown(&analysis).contains("```sh"),
+            "the block is too wide"
+        );
+        assert!(tests_cargo(&analysis).starts_with("cargo test -p billing --lib -- tax::"));
+    }
+
+    #[test]
+    fn markdown_summarises_the_adaptations_the_change_already_made() {
+        let mut analysis = empty_analysis();
+        analysis.diff.changes = vec![change(
+            ChangeKind::Body,
+            "billing::tax::vat_rate",
+            SymbolKind::Function,
+            ChangeDetail::None,
+            None,
+            Some(location("src/billing/tax.rs", 10)),
+        )];
+        analysis.items = vec![
+            adaptation("billing::invoice::total", false),
+            adaptation("billing::invoice::refund", true),
+            adaptation("billing::invoice::void", true),
+        ];
+
+        let text = analysis_markdown(&analysis, &AnalysisOptions::default());
+        assert!(
+            text.contains("**1 change · 1 needs editing · 2 edited with the change · 0 may behave differently · 0 of 0 tests to run**"),
+            "{text}"
+        );
+        assert!(text.contains("| Symbol | Why | Location |\n"), "{text}");
+        assert!(text.contains("`billing::invoice::total`"), "{text}");
+        assert!(!text.contains("`billing::invoice::refund`"), "{text}");
+        assert!(
+            text.contains(
+                "\n\n2 dependants were edited together with the change (--all lists them).\n"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn markdown_keeps_the_edited_summary_without_a_table() {
+        let mut analysis = empty_analysis();
+        analysis.items = vec![adaptation("billing::invoice::refund", true)];
+
+        let text = analysis_markdown(&analysis, &AnalysisOptions::default());
+        assert!(
+            text.contains("**0 changes · 0 need editing · 1 edited with the change · 0 may behave differently · 0 of 0 tests to run**"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "\n\n1 dependant was edited together with the change (--all lists it).\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("### Needs editing"), "{text}");
     }
 
     #[test]

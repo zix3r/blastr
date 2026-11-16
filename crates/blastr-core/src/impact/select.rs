@@ -1,11 +1,13 @@
 //! Test selection: which tests a set of changes touches or reaches, and the
-//! `cargo test` commands that run exactly those tests.
+//! `cargo test` commands that run them.
 //!
 //! A test is a head-side symbol flagged as a test. It is selected when a
 //! change touches it, when an added or renamed item contains it, or when
 //! impact analysis reaches it. Selected tests are grouped by their Cargo
 //! target and narrowed to module filters, because running a whole target is
-//! wasteful once only a few of its tests are affected.
+//! wasteful once only a few of its tests are affected. A selection that would
+//! need many filters, or that covers most of a target, runs the whole target
+//! instead: it may run tests that are not selected, but it never skips one.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -13,6 +15,13 @@ use blastr_model::{
     Change, ChangeKind, ImpactItem, RevisionGraph, SelectedTest, Symbol, SymbolId, SymbolPath,
     TargetKind, TestCommand, TestReason, TestSelection,
 };
+
+/// The most filters a command carries before it runs its whole target instead.
+const MAX_FILTERS: usize = 8;
+
+/// The share of a target's tests, in per cent, from which a command runs the
+/// whole target rather than naming the tests it selected.
+const WHOLE_TARGET_SHARE: u64 = 60;
 
 /// Selects the tests the changes touch or reach, grouped into commands.
 pub(crate) fn select_tests(
@@ -93,17 +102,14 @@ pub(crate) fn select_tests(
         if count == 0 {
             continue;
         }
-        let filters = if count as usize == tests.len() {
-            Vec::new()
-        } else {
-            command_filters(&tests)
-        };
+        let filters = command_filters(&tests, count);
         commands.push(TestCommand {
             package,
             target_kind,
             target_name,
             filters,
             tests: count,
+            total: tests.len() as u32,
         });
     }
 
@@ -150,8 +156,36 @@ struct TargetTest {
     selected: bool,
 }
 
-/// The filters of a command whose target holds both selected and unselected tests.
-fn command_filters(tests: &[TargetTest]) -> Vec<String> {
+/// The filters of a command for a target holding `selected` of its tests.
+///
+/// The list is empty when the command runs the whole target: because every test
+/// of it is selected, because the selected tests are a large enough share of it
+/// that naming them saves little, or because naming them needs so many filters
+/// that the command line stops being readable and pasteable.
+fn command_filters(tests: &[TargetTest], selected: u32) -> Vec<String> {
+    let total = tests.len() as u32;
+    if selected >= total {
+        return Vec::new();
+    }
+    if covers_most_of_target(selected, total) {
+        return Vec::new();
+    }
+    let filters = shortened_filters(tests);
+    if filters.len() > MAX_FILTERS {
+        return Vec::new();
+    }
+    filters
+}
+
+/// Whether the selected tests are a large enough share of the target that
+/// naming them is not worth the length of the command line.
+fn covers_most_of_target(selected: u32, total: u32) -> bool {
+    u64::from(selected) * 100 >= u64::from(total) * WHOLE_TARGET_SHARE
+}
+
+/// The filters of a command whose target holds both selected and unselected
+/// tests, each module prefix shortened as far as it stays accurate.
+fn shortened_filters(tests: &[TargetTest]) -> Vec<String> {
     let unselected: Vec<&str> = tests
         .iter()
         .filter(|test| !test.selected)
@@ -337,6 +371,20 @@ mod tests {
         }
     }
 
+    /// A head graph of `billing` with `count` tests at the crate root, named
+    /// `t01`, `t02`, …, which no module prefix shortens, and an affected item
+    /// for each of the first `selected` of them.
+    fn root_tests(count: usize, selected: usize) -> (RevisionGraph, Vec<ImpactItem>) {
+        let mut names: Vec<String> = vec!["billing".to_owned()];
+        names.extend((1..=count).map(|index| format!("billing::t{index:02}!")));
+        let specs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let head = billing(&specs);
+        let items = (1..=selected)
+            .map(|index| item(&format!("billing::t{index:02}")))
+            .collect();
+        (head, items)
+    }
+
     /// The filter lists of the commands, in command order.
     fn filters(selection: &TestSelection) -> Vec<Vec<String>> {
         selection
@@ -387,6 +435,10 @@ mod tests {
         assert_eq!(selection.selected[0].filter, "tax::rounds");
         assert_eq!(selection.commands.len(), 1);
         assert_eq!(selection.commands[0].tests, 2);
+        assert_eq!(
+            selection.commands[0].total, 3,
+            "the target holds three tests"
+        );
     }
 
     #[test]
@@ -433,6 +485,71 @@ mod tests {
         assert_eq!(selection.selected.len(), 2);
         assert_eq!(filters(&selection), vec![Vec::<String>::new()]);
         assert_eq!(selection.commands[0].tests, 2);
+        assert_eq!(selection.commands[0].total, 2);
+    }
+
+    #[test]
+    fn more_filters_than_the_limit_run_the_whole_target() {
+        let (head, items) = root_tests(29, 9);
+        let selection = select_tests(&head, &[], &items);
+
+        assert_eq!(selection.commands.len(), 1);
+        let command = &selection.commands[0];
+        assert_eq!(command.tests, 9);
+        assert_eq!(command.total, 29);
+        assert!(command.filters.is_empty());
+        assert!(
+            command.filters.is_empty() && command.tests < command.total,
+            "a reader can tell the command runs more than was selected"
+        );
+    }
+
+    #[test]
+    fn the_limit_itself_still_names_every_selected_test() {
+        let (head, items) = root_tests(28, 8);
+        let selection = select_tests(&head, &[], &items);
+
+        let expected: Vec<String> = (1..=8).map(|index| format!("t{index:02}")).collect();
+        assert_eq!(filters(&selection), vec![expected]);
+        assert_eq!(selection.commands[0].tests, 8);
+        assert_eq!(selection.commands[0].total, 28);
+    }
+
+    #[test]
+    fn a_selection_covering_most_of_a_target_runs_the_whole_target() {
+        let (head, items) = root_tests(10, 6);
+        let selection = select_tests(&head, &[], &items);
+
+        assert_eq!(filters(&selection), vec![Vec::<String>::new()]);
+        assert_eq!(selection.commands[0].tests, 6);
+        assert_eq!(selection.commands[0].total, 10);
+    }
+
+    #[test]
+    fn a_selection_just_under_the_share_keeps_its_filters() {
+        let (head, items) = root_tests(10, 5);
+        let selection = select_tests(&head, &[], &items);
+
+        let expected: Vec<String> = (1..=5).map(|index| format!("t{index:02}")).collect();
+        assert_eq!(filters(&selection), vec![expected]);
+        assert_eq!(selection.commands[0].tests, 5);
+        assert_eq!(selection.commands[0].total, 10);
+    }
+
+    #[test]
+    fn a_versioned_package_name_reaches_the_command_line() {
+        let head = graph(
+            &[("billing", "billing@1.2.0", TargetKind::Lib, "billing")],
+            &["billing", "billing::tax::rounds!"],
+        );
+        let selection = select_tests(&head, &[], &[item("billing::tax::rounds")]);
+
+        assert_eq!(selection.commands.len(), 1);
+        assert_eq!(selection.commands[0].package, "billing@1.2.0");
+        assert_eq!(
+            selection.commands[0].command_line(),
+            "cargo test -p billing@1.2.0 --lib"
+        );
     }
 
     #[test]
@@ -494,6 +611,7 @@ mod tests {
                 "alpha",
                 "alpha::a_check!",
                 "alpha::b_check!",
+                "alpha::c_check!",
                 "alpha::zeta_other!",
                 "alpha_tests",
                 "alpha_tests::two!",
@@ -523,7 +641,7 @@ mod tests {
                 "zeta::api::one",
             ]
         );
-        let lines: Vec<(String, Vec<String>, u32)> = selection
+        let lines: Vec<(String, Vec<String>, u32, u32)> = selection
             .commands
             .iter()
             .map(|command| {
@@ -531,6 +649,7 @@ mod tests {
                     command.command_line(),
                     command.filters.clone(),
                     command.tests,
+                    command.total,
                 )
             })
             .collect();
@@ -541,13 +660,15 @@ mod tests {
                     "cargo test -p alpha --lib -- a_check b_check".to_owned(),
                     vec!["a_check".to_owned(), "b_check".to_owned()],
                     2,
+                    4,
                 ),
                 (
                     "cargo test -p alpha --test alpha_tests".to_owned(),
                     Vec::new(),
                     1,
+                    1,
                 ),
-                ("cargo test -p zeta --lib".to_owned(), Vec::new(), 1),
+                ("cargo test -p zeta --lib".to_owned(), Vec::new(), 1, 1),
             ]
         );
     }

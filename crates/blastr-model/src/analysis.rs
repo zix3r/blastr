@@ -169,10 +169,14 @@ pub struct TestCommand {
     pub target_kind: TargetKind,
     /// The target name.
     pub target_name: String,
-    /// Test name filters; empty when every test of the target is selected.
+    /// Test name filters. Empty when the command runs the whole target:
+    /// because every test of it is selected, or because so many are that
+    /// naming them would be longer than it is worth.
     pub filters: Vec<String>,
-    /// How many selected tests the command runs.
+    /// How many selected tests the target holds.
     pub tests: u32,
+    /// How many tests the target holds in all.
+    pub total: u32,
 }
 
 /// The tests affected by the changes.
@@ -382,6 +386,7 @@ mod tests {
             target_name: "smoke".to_owned(),
             filters: filters.iter().map(|filter| (*filter).to_owned()).collect(),
             tests: filters.len() as u32,
+            total: filters.len() as u32,
         }
     }
 
