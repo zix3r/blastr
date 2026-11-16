@@ -9,7 +9,7 @@
 use blastr_model::{
     Analysis, AnalysisOptions, Certainty, Change, ChangeDetail, ChangeKind, Confidence, Delta,
     EdgeKind, EvidencePath, EvidenceStep, ImpactClass, ImpactItem, ImpactTags, Limit, Location,
-    Reason, TestReason,
+    Reason, SelectedTest, TargetKind, TestCommand, TestReason, TestSelection,
 };
 
 /// How much a report shows and how it is decorated.
@@ -26,14 +26,30 @@ pub struct Style {
 /// Heading of the items that have to be edited.
 const ADAPTATION_HEADING: &str = "NEEDS EDITING";
 
+/// Heading of the adaptations the change already made itself.
+const EDITED_HEADING: &str = "EDITED WITH THE CHANGE";
+
 /// Heading of the items whose behaviour may differ.
 const BEHAVIOUR_HEADING: &str = "MAY BEHAVE DIFFERENTLY";
+
+/// Heading of the selected tests in the report of `blastr tests`.
+const TESTS_HEADING: &str = "Tests";
 
 /// Most items one section lists unless everything is asked for.
 const MAX_ITEMS: usize = 10;
 
+/// Most selected tests `blastr tests` lists unless everything is asked for.
+const MAX_TESTS: usize = 30;
+
 /// Narrowest the reason column may become when the line width forces a cut.
 const MIN_REASON_WIDTH: usize = 8;
+
+/// What the report points at when a reader wants tests or commands.
+const TESTS_HINT: &str = "Run `blastr tests` to see their names, or `blastr tests --format cargo` \
+                          for the commands.";
+
+/// What a report says where the command lines are a format away.
+pub const COMMANDS_HINT: &str = "Run `blastr tests --format cargo` for the commands.";
 
 /// What the analysis says when nothing besides the changes is affected.
 const NOTHING_ELSE: &str = "Nothing else is affected.";
@@ -98,21 +114,26 @@ pub fn render_analysis(analysis: &Analysis, options: &AnalysisOptions, style: &S
         blocks.push(format!("{hidden} formatting-only {noun} not shown"));
     }
 
-    // Untouched adaptations first, then the ones this diff adapted itself;
-    // a stable sort keeps the order within each group.
-    let mut adaptations: Vec<&ImpactItem> = analysis
+    // Adaptations the diff left alone are work still to do; the ones it edited
+    // itself are only counted, or listed when everything is asked for.
+    let adaptations: Vec<&ImpactItem> = analysis
         .items
         .iter()
-        .filter(|item| item.class == ImpactClass::Adaptation)
+        .filter(|item| item.class == ImpactClass::Adaptation && !item.tags.changed)
         .collect();
-    adaptations.sort_by_key(|item| item.tags.changed);
+    let edited: Vec<&ImpactItem> = analysis
+        .items
+        .iter()
+        .filter(|item| item.class == ImpactClass::Adaptation && item.tags.changed)
+        .collect();
     let behaviours: Vec<&ImpactItem> = analysis
         .items
         .iter()
         .filter(|item| item.class == ImpactClass::Behaviour && !item.tags.changed)
         .collect();
 
-    if adaptations.is_empty() && behaviours.is_empty() && !listed.is_empty() {
+    let nothing_listed = adaptations.is_empty() && edited.is_empty() && behaviours.is_empty();
+    if nothing_listed && !listed.is_empty() {
         blocks.push(NOTHING_ELSE.to_owned());
     }
 
@@ -128,6 +149,15 @@ pub fn render_analysis(analysis: &Analysis, options: &AnalysisOptions, style: &S
             adaptations.len(),
             style,
         ));
+    }
+    if !edited.is_empty() {
+        if style.list_all {
+            let rows = adaptation_rows(&edited, analysis, style);
+            listed_items += rows.len();
+            blocks.push(detail_section(EDITED_HEADING, rows, edited.len(), style));
+        } else {
+            blocks.push(edited_summary(edited.len()));
+        }
     }
     if !behaviours.is_empty() {
         let rows = behaviour_rows(&behaviours, analysis, style);
@@ -157,8 +187,7 @@ pub fn render_analysis(analysis: &Analysis, options: &AnalysisOptions, style: &S
     out
 }
 
-/// Renders the tests of an analysis: the commands to run, and with
-/// `style.list_all` every selected test behind them.
+/// Renders the tests of an analysis: the targets they are in, and their names.
 pub fn render_tests(analysis: &Analysis, style: &Style) -> String {
     let selection = &analysis.tests;
     let selected = selection.selected.len();
@@ -180,41 +209,45 @@ pub fn render_tests(analysis: &Analysis, style: &Style) -> String {
         return out;
     }
 
-    for command in &selection.commands {
-        out.push_str("\n  ");
-        out.push_str(&command.command_line());
+    for line in target_lines(selection) {
+        out.push('\n');
+        out.push_str(&line);
     }
 
-    if style.list_all {
-        let filter_width = selection
-            .selected
-            .iter()
-            .map(|test| test.filter.chars().count())
-            .max()
-            .unwrap_or(0);
-        let reason_width = selection
-            .selected
-            .iter()
-            .map(|test| test_reason_text(test.reason).chars().count())
-            .max()
-            .unwrap_or(0);
-        out.push_str("\n\n");
-        let rows: Vec<String> = selection
-            .selected
-            .iter()
-            .map(|test| {
-                let mut line = String::from("  ");
-                line.push_str(&pad(&test.filter, filter_width));
-                line.push_str("  ");
-                line.push_str(&pad(test_reason_text(test.reason), reason_width));
-                line.push_str("  ");
-                line.push_str(&site_text(&test.location));
-                line.trim_end().to_owned()
-            })
-            .collect();
-        out.push_str(&rows.join("\n"));
+    let shown = if style.list_all {
+        selected
+    } else {
+        selected.min(MAX_TESTS)
+    };
+    let listed: Vec<&SelectedTest> = selection.selected.iter().take(shown).collect();
+    let symbol_width = listed
+        .iter()
+        .map(|test| super::shorten(&test.symbol.path).chars().count())
+        .max()
+        .unwrap_or(0);
+    let reason_width = listed
+        .iter()
+        .map(|test| test_reason_text(test.reason).chars().count())
+        .max()
+        .unwrap_or(0);
+
+    out.push_str("\n\n");
+    out.push_str(TESTS_HEADING);
+    for test in listed {
+        let mut line = String::from("\n  ");
+        line.push_str(&pad(&super::shorten(&test.symbol.path), symbol_width));
+        line.push_str("  ");
+        line.push_str(&pad(test_reason_text(test.reason), reason_width));
+        line.push_str("  ");
+        line.push_str(&site_text(&test.location));
+        out.push_str(line.trim_end());
+    }
+    if shown < selected {
+        out.push_str(&format!("\n  … and {} more (use --all)", selected - shown));
     }
 
+    out.push('\n');
+    out.push_str(COMMANDS_HINT);
     out.push('\n');
     out
 }
@@ -358,15 +391,13 @@ fn adaptation_rows(items: &[&ImpactItem], analysis: &Analysis, style: &Style) ->
     items
         .iter()
         .take(shown)
-        .map(|item| {
-            let mut reason = path_summary(item, analysis);
-            if item.tags.changed {
-                reason.push_str(" (edited)");
-            }
-            Row {
-                cells: vec![super::shorten(&item.symbol.path), reason, item_site(item)],
-                colour: RED,
-            }
+        .map(|item| Row {
+            cells: vec![
+                super::shorten(&item.symbol.path),
+                path_summary(item, analysis),
+                item_site(item),
+            ],
+            colour: RED,
         })
         .collect()
 }
@@ -481,7 +512,7 @@ fn line_width(row: &Row, widths: &[usize]) -> usize {
     width
 }
 
-/// The tests section of the report.
+/// The tests section of the report: one aligned line per target, no commands.
 fn tests_section(analysis: &Analysis, style: &Style) -> Option<String> {
     let selection = &analysis.tests;
     let selected = selection.selected.len();
@@ -494,17 +525,73 @@ fn tests_section(analysis: &Analysis, style: &Style) -> Option<String> {
         return Some(format!("{heading}\n  {NO_REACHING_TEST}"));
     }
 
-    let mut out = paint(
+    let mut lines = vec![paint(
         &format!("TESTS TO RUN ({selected} of {total})"),
         BOLD,
         style,
-    );
-    for command in &selection.commands {
-        out.push('\n');
-        out.push_str("  ");
-        out.push_str(&command.command_line());
+    )];
+    lines.extend(target_lines(selection));
+    lines.push(TESTS_HINT.to_owned());
+    Some(lines.join("\n"))
+}
+
+/// How a target reads in a tests listing.
+///
+/// A library holds its unit tests; the other targets are named by the file or
+/// the binary the tests live in.
+pub fn target_label(command: &TestCommand) -> String {
+    let name = &command.target_name;
+    match command.target_kind {
+        TargetKind::Lib | TargetKind::ProcMacro => "unit tests".to_owned(),
+        TargetKind::Bin => format!("bin {name}"),
+        TargetKind::Test => format!("tests/{name}.rs"),
+        TargetKind::Example => format!("examples/{name}.rs"),
+        TargetKind::Bench => format!("benches/{name}.rs"),
+        TargetKind::BuildScript | TargetKind::Other => name.clone(),
     }
-    Some(out)
+}
+
+/// The target lines of a tests listing: the package and target, then how many
+/// of the target's tests are selected.
+fn target_lines(selection: &TestSelection) -> Vec<String> {
+    let rows: Vec<(String, u32, u32)> = selection
+        .commands
+        .iter()
+        .map(|command| {
+            let label = format!("{} · {}", command.package, target_label(command));
+            (label, command.tests, command.total)
+        })
+        .collect();
+    let label_width = rows
+        .iter()
+        .map(|(label, _, _)| label.chars().count())
+        .max()
+        .unwrap_or(0);
+    let count_width = rows
+        .iter()
+        .map(|(_, tests, _)| tests.to_string().chars().count())
+        .max()
+        .unwrap_or(0);
+
+    rows.iter()
+        .map(|(label, tests, total)| {
+            let mut line = String::from("  ");
+            line.push_str(&pad(label, label_width));
+            line.push_str("  ");
+            line.push_str(&right_aligned(&tests.to_string(), count_width));
+            line.push_str(&format!(" of {total}"));
+            line
+        })
+        .collect()
+}
+
+/// One sentence saying how many adaptations the change already made itself.
+pub fn edited_summary(count: usize) -> String {
+    if count == 1 {
+        "1 dependant was edited together with the change (--all lists it).".to_owned()
+    } else {
+        format!("{count} dependants were edited together with the change (--all lists them).")
+    }
 }
 
 /// The limits line of the report, if anything is worth saying.
@@ -873,6 +960,13 @@ fn pad(text: &str, width: usize) -> String {
     out
 }
 
+/// Puts text at the end of a field of `width` characters.
+fn right_aligned(text: &str, width: usize) -> String {
+    let mut out = spaces(width.saturating_sub(text.chars().count()));
+    out.push_str(text);
+    out
+}
+
 /// A run of `count` spaces.
 fn spaces(count: usize) -> String {
     std::iter::repeat_n(' ', count).collect()
@@ -1018,7 +1112,7 @@ mod tests {
 
     /// The analysis compared against the layout: three changes of which one is
     /// formatting only, three adaptations of which one was edited, two
-    /// behaviour items, two selected tests and two limits.
+    /// behaviour items, three selected tests and two limits.
     fn mixed_analysis() -> Analysis {
         let changes = vec![
             change(
@@ -1206,6 +1300,12 @@ mod tests {
                     reason: TestReason::Reached,
                     filter: "invoice::tests::totals".to_owned(),
                 },
+                SelectedTest {
+                    symbol: symbol("api::tests::checkout"),
+                    location: location("src/api/mod.rs", 40),
+                    reason: TestReason::Reached,
+                    filter: "tests::checkout".to_owned(),
+                },
             ],
             total: 212,
             commands: vec![
@@ -1219,6 +1319,7 @@ mod tests {
                         "report::".to_owned(),
                     ],
                     tests: 2,
+                    total: 98,
                 },
                 TestCommand {
                     package: "api".to_owned(),
@@ -1226,6 +1327,7 @@ mod tests {
                     target_name: "api".to_owned(),
                     filters: vec!["checkout::".to_owned()],
                     tests: 1,
+                    total: 1,
                 },
             ],
         };
@@ -1233,6 +1335,36 @@ mod tests {
         analysis.limits.unresolved_in_reach = 1;
         analysis.limits.candidate_steps = 1;
         analysis
+    }
+
+    /// One command that runs the tests of one target.
+    fn command(package: &str, kind: TargetKind, name: &str, tests: u32, total: u32) -> TestCommand {
+        TestCommand {
+            package: package.to_owned(),
+            target_kind: kind,
+            target_name: name.to_owned(),
+            filters: Vec::new(),
+            tests,
+            total,
+        }
+    }
+
+    /// A selection of `count` reached tests in a project of `total` tests, run
+    /// by the given commands.
+    fn selection(total: u32, commands: Vec<TestCommand>, count: usize) -> TestSelection {
+        let selected = (0..count)
+            .map(|index| SelectedTest {
+                symbol: symbol(&format!("crate::tests::case_{index}")),
+                location: location("src/lib.rs", index as u32 + 1),
+                reason: TestReason::Reached,
+                filter: format!("tests::case_{index}"),
+            })
+            .collect();
+        TestSelection {
+            selected,
+            total,
+            commands,
+        }
     }
 
     /// `count` adaptation items, to fill a section.
@@ -1299,18 +1431,20 @@ CHANGES (3)
 
 1 formatting-only change not shown
 
-NEEDS EDITING (3)
-  billing::total::calculate_total  calls apply_discount, whose signature changed           src/billing/total.rs:27
-  billing::payment::describe       match without a `_` arm misses Refunded                 src/billing/payment.rs:63
-  billing::total::recalculate      calls apply_discount, whose signature changed (edited)  src/billing/total.rs:88
+NEEDS EDITING (2)
+  billing::total::calculate_total  calls apply_discount, whose signature changed  src/billing/total.rs:27
+  billing::payment::describe       match without a `_` arm misses Refunded        src/billing/payment.rs:63
+
+1 dependant was edited together with the change (--all lists it).
 
 MAY BEHAVE DIFFERENTLY (2)
   likely    billing::invoice::generate  2 steps from vat_rate [test] [public API]  src/billing/invoice.rs:61
   possible  api::handlers::dispatch     may dispatch to Refunded                   src/api/handlers.rs:112
 
-TESTS TO RUN (2 of 212)
-  cargo test -p billing --lib -- tax:: invoice::tests::totals report::
-  cargo test -p api --lib -- checkout::
+TESTS TO RUN (3 of 212)
+  billing · unit tests  2 of 98
+  api · unit tests      1 of 1
+Run `blastr tests` to see their names, or `blastr tests --format cargo` for the commands.
 
 LIMITS  submodules are not analysed · 2 unresolved references (1 near the changes) · 1 candidate step
 
@@ -1433,11 +1567,13 @@ Run `blastr explain <symbol>` to see why an item is listed.
         assert!(!text.contains("billing::report::summarise"), "{text}");
     }
 
-    #[test]
-    fn edited_adaptations_are_listed_last_and_marked() {
-        let mut edited = item(
-            "crate::module::alpha",
-            location("src/lib.rs", 1),
+    /// One adaptation item of the module, edited in the same diff or not.
+    fn module_adaptation(index: u32, edited: bool) -> ImpactItem {
+        let path = format!("crate::module::item_{index}");
+        let line = index + 1;
+        let mut item = item(
+            &path,
+            location("src/lib.rs", line),
             ImpactClass::Adaptation,
             Confidence::Definite,
             vec![evidence(
@@ -1445,49 +1581,89 @@ Run `blastr explain <symbol>` to see why an item is listed.
                 Reason::CallsChanged,
                 ImpactClass::Adaptation,
                 vec![step(
-                    "crate::module::alpha",
+                    &path,
                     "crate::changed",
                     EdgeKind::Calls,
                     "src/lib.rs",
-                    1,
+                    line,
                 )],
                 0.9,
             )],
         );
-        edited.tags.changed = true;
-        let untouched = item(
-            "crate::module::beta",
-            location("src/lib.rs", 2),
-            ImpactClass::Adaptation,
-            Confidence::Definite,
-            vec![evidence(
-                0,
-                Reason::CallsChanged,
-                ImpactClass::Adaptation,
-                vec![step(
-                    "crate::module::beta",
-                    "crate::changed",
-                    EdgeKind::Calls,
-                    "src/lib.rs",
-                    2,
-                )],
-                0.8,
-            )],
-        );
+        item.tags.changed = edited;
+        item
+    }
+
+    #[test]
+    fn edited_adaptations_are_summarised_after_the_section() {
         let analysis = analysis_of(
             vec![change(ChangeKind::Body, "crate::changed", "src/lib.rs", 9)],
-            vec![edited, untouched],
+            vec![module_adaptation(0, true), module_adaptation(1, false)],
         );
 
         let text = render_analysis(&analysis, &AnalysisOptions::default(), &Style::default());
-        let beta = text.find("crate::module::beta").expect("beta is listed");
-        let alpha = text.find("crate::module::alpha").expect("alpha is listed");
-        assert!(beta < alpha, "the untouched item comes first:\n{text}");
+        assert!(text.contains("NEEDS EDITING (1)\n"), "{text}");
+        assert!(text.contains("crate::module::item_1"), "{text}");
+        assert!(!text.contains("crate::module::item_0"), "{text}");
         assert!(
-            text.contains("calls changed (edited)  src/lib.rs:1\n"),
+            text.contains("1 dependant was edited together with the change (--all lists it)."),
             "{text}"
         );
-        assert!(text.contains("NEEDS EDITING (2)\n"), "{text}");
+    }
+
+    #[test]
+    fn the_edited_summary_counts_in_the_plural() {
+        let analysis = analysis_of(
+            vec![change(ChangeKind::Body, "crate::changed", "src/lib.rs", 9)],
+            vec![
+                module_adaptation(0, true),
+                module_adaptation(1, true),
+                module_adaptation(2, false),
+            ],
+        );
+
+        let text = render_analysis(&analysis, &AnalysisOptions::default(), &Style::default());
+        assert!(text.contains("NEEDS EDITING (1)\n"), "{text}");
+        assert!(
+            text.contains("2 dependants were edited together with the change (--all lists them)."),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_edited_summary_takes_the_place_of_an_empty_section() {
+        let analysis = analysis_of(
+            vec![change(ChangeKind::Body, "crate::changed", "src/lib.rs", 9)],
+            vec![module_adaptation(0, true)],
+        );
+
+        let text = render_analysis(&analysis, &AnalysisOptions::default(), &Style::default());
+        assert!(!text.contains("NEEDS EDITING"), "{text}");
+        assert!(!text.contains("Nothing else is affected."), "{text}");
+        assert!(
+            text.contains("1 dependant was edited together with the change (--all lists it)."),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn asking_for_everything_lists_the_edited_adaptations() {
+        let analysis = analysis_of(
+            vec![change(ChangeKind::Body, "crate::changed", "src/lib.rs", 9)],
+            vec![module_adaptation(0, true), module_adaptation(1, true)],
+        );
+        let style = Style {
+            list_all: true,
+            ..Style::default()
+        };
+
+        let text = render_analysis(&analysis, &AnalysisOptions::default(), &style);
+        assert!(text.contains("EDITED WITH THE CHANGE (2)\n"), "{text}");
+        assert!(text.contains("crate::module::item_0"), "{text}");
+        assert!(text.contains("crate::module::item_1"), "{text}");
+        assert!(text.contains("calls changed"), "{text}");
+        assert!(!text.contains("dependant"), "{text}");
+        assert!(!text.contains("Nothing else is affected."), "{text}");
     }
 
     #[test]
@@ -1734,7 +1910,7 @@ Run `blastr explain <symbol>` to see why an item is listed.
         assert_eq!(without_colour(&coloured), plain);
         assert!(!plain.contains('\x1b'), "{plain}");
         assert!(
-            coloured.contains("\x1b[1mNEEDS EDITING (3)\x1b[0m"),
+            coloured.contains("\x1b[1mNEEDS EDITING (2)\x1b[0m"),
             "{coloured}"
         );
         assert!(
@@ -1744,7 +1920,7 @@ Run `blastr explain <symbol>` to see why an item is listed.
         assert!(coloured.contains("\x1b[33mlikely\x1b[0m"), "{coloured}");
         assert!(coloured.contains("\x1b[2mpossible\x1b[0m"), "{coloured}");
         assert!(
-            coloured.contains("\x1b[1mTESTS TO RUN (2 of 212)\x1b[0m"),
+            coloured.contains("\x1b[1mTESTS TO RUN (3 of 212)\x1b[0m"),
             "{coloured}"
         );
         assert!(coloured.contains("\x1b[1mLIMITS\x1b[0m  "), "{coloured}");
@@ -1752,7 +1928,7 @@ Run `blastr explain <symbol>` to see why an item is listed.
 
     #[test]
     fn long_symbols_are_shortened_in_the_sections() {
-        let long = format!("crate::{}::tail", "segment::".repeat(12));
+        let long = format!("crate::{}tail", "segment::".repeat(12));
         let analysis = analysis_of(
             vec![change(ChangeKind::Body, "crate::changed", "src/lib.rs", 1)],
             vec![item(
@@ -1781,11 +1957,12 @@ Run `blastr explain <symbol>` to see why an item is listed.
             !text.contains(&long),
             "the full path must not be printed:\n{text}"
         );
-        let shortened: String = long
-            .chars()
-            .skip(long.chars().count() - (super::super::SYMBOL_WIDTH - 1))
-            .collect();
-        assert!(text.contains(&format!("…{shortened}")), "{text}");
+        let shortened = super::super::shorten(&long);
+        assert!(text.contains(&shortened), "{text}");
+        assert!(
+            shortened.chars().count() <= super::super::SYMBOL_WIDTH,
+            "{shortened}"
+        );
     }
 
     #[test]
@@ -2054,32 +2231,115 @@ Run `blastr explain <symbol>` to see why an item is listed.
     }
 
     #[test]
-    fn the_tests_report_lists_the_commands() {
+    fn the_tests_report_lists_the_targets_and_the_tests() {
         let analysis = mixed_analysis();
 
-        let expected = r"TESTS TO RUN (2 of 212)
-  cargo test -p billing --lib -- tax:: invoice::tests::totals report::
-  cargo test -p api --lib -- checkout::
+        let expected = r"TESTS TO RUN (3 of 212)
+  billing · unit tests  2 of 98
+  api · unit tests      1 of 1
+
+Tests
+  billing::tax::tests::rounds      changed  src/billing/tax.rs:120
+  billing::invoice::tests::totals  reached  src/billing/invoice.rs:200
+  api::tests::checkout             reached  src/api/mod.rs:40
+Run `blastr tests --format cargo` for the commands.
 ";
         assert_eq!(render_tests(&analysis, &Style::default()), expected);
     }
 
     #[test]
-    fn the_tests_report_lists_every_test_when_asked() {
-        let analysis = mixed_analysis();
+    fn every_kind_of_target_has_a_label() {
+        let cases = [
+            (TargetKind::Lib, "unit tests"),
+            (TargetKind::ProcMacro, "unit tests"),
+            (TargetKind::Bin, "bin smoke"),
+            (TargetKind::Test, "tests/smoke.rs"),
+            (TargetKind::Example, "examples/smoke.rs"),
+            (TargetKind::Bench, "benches/smoke.rs"),
+            (TargetKind::BuildScript, "smoke"),
+            (TargetKind::Other, "smoke"),
+        ];
+
+        for (kind, label) in cases {
+            assert_eq!(
+                target_label(&command("billing", kind, "smoke", 1, 2)),
+                label,
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_tests_section_aligns_one_line_per_target() {
+        let mut analysis = analysis_of(
+            vec![change(ChangeKind::Body, "crate::changed", "src/lib.rs", 1)],
+            Vec::new(),
+        );
+        analysis.tests = selection(
+            144,
+            vec![
+                command("serde_json", TargetKind::Test, "test", 46, 98),
+                command("serde_json", TargetKind::Test, "stream", 12, 12),
+                command("serde_json", TargetKind::Test, "regression", 5, 9),
+                command("serde_json", TargetKind::Lib, "serde_json", 5, 25),
+            ],
+            68,
+        );
+
+        let text = render_analysis(&analysis, &AnalysisOptions::default(), &Style::default());
+        let expected = r"TESTS TO RUN (68 of 144)
+  serde_json · tests/test.rs        46 of 98
+  serde_json · tests/stream.rs      12 of 12
+  serde_json · tests/regression.rs   5 of 9
+  serde_json · unit tests            5 of 25
+Run `blastr tests` to see their names, or `blastr tests --format cargo` for the commands.
+";
+        assert!(text.contains(expected), "{text}");
+        assert!(!text.contains("cargo test"), "{text}");
+    }
+
+    #[test]
+    fn a_command_that_runs_its_whole_target_reports_the_selected_count() {
+        let mut analysis = analysis_of(Vec::new(), Vec::new());
+        analysis.tests = selection(
+            144,
+            vec![command("serde_json", TargetKind::Test, "stream", 5, 98)],
+            5,
+        );
+
+        let text = render_tests(&analysis, &Style::default());
+        assert!(
+            text.contains("  serde_json · tests/stream.rs  5 of 98\n"),
+            "{text}"
+        );
+        assert!(!text.contains("cargo test"), "{text}");
+    }
+
+    #[test]
+    fn the_tests_report_caps_the_list_and_points_at_all() {
+        let mut analysis = analysis_of(Vec::new(), Vec::new());
+        analysis.tests = selection(
+            144,
+            vec![command("serde_json", TargetKind::Test, "test", 35, 98)],
+            35,
+        );
+
+        let text = render_tests(&analysis, &Style::default());
+        assert!(text.starts_with("TESTS TO RUN (35 of 144)\n"), "{text}");
+        assert_eq!(text.matches("  crate::tests::case_").count(), MAX_TESTS);
+        assert!(text.contains("  … and 5 more (use --all)\n"), "{text}");
+        assert!(
+            text.ends_with("Run `blastr tests --format cargo` for the commands.\n"),
+            "{text}"
+        );
+
         let style = Style {
             list_all: true,
             ..Style::default()
         };
-
-        let expected = r"TESTS TO RUN (2 of 212)
-  cargo test -p billing --lib -- tax:: invoice::tests::totals report::
-  cargo test -p api --lib -- checkout::
-
-  tax::tests::rounds      changed  src/billing/tax.rs:120
-  invoice::tests::totals  reached  src/billing/invoice.rs:200
-";
-        assert_eq!(render_tests(&analysis, &style), expected);
+        let all = render_tests(&analysis, &style);
+        assert_eq!(all.matches("  crate::tests::case_").count(), 35);
+        assert!(!all.contains("--all"), "{all}");
     }
 
     #[test]

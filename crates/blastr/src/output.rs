@@ -104,16 +104,106 @@ fn changes_block(changes: &[&Change], list_all: bool) -> String {
     out
 }
 
-/// Shortens a symbol path to at most [`SYMBOL_WIDTH`] characters, keeping
-/// the end, which is the most specific part.
+/// Shortens a symbol path to at most [`SYMBOL_WIDTH`] characters.
+///
+/// The end of a path says the most, so the function first simplifies the
+/// `<impl …>` segments of a long path, then replaces leading module names with
+/// a `…::` marker, and only cuts characters as a last resort.
 fn shorten(symbol: &str) -> String {
-    let length = symbol.chars().count();
-    if length <= SYMBOL_WIDTH {
+    if symbol.chars().count() <= SYMBOL_WIDTH {
         return symbol.to_owned();
     }
-    let keep = SYMBOL_WIDTH - 1;
-    let tail: String = symbol.chars().skip(length - keep).collect();
+
+    let segments: Vec<String> = path_segments(symbol)
+        .into_iter()
+        .map(simplified_segment)
+        .collect();
+    let simplified = segments.join("::");
+    if simplified.chars().count() <= SYMBOL_WIDTH {
+        return simplified;
+    }
+
+    // Drop leading module names one at a time. The final item name stays, and
+    // so does the segment before it, which names the type the item belongs to.
+    let mut shortest = simplified;
+    if segments.len() > 2 {
+        for start in 1..=segments.len() - 2 {
+            let candidate = format!("…::{}", segments[start..].join("::"));
+            if candidate.chars().count() <= SYMBOL_WIDTH {
+                return candidate;
+            }
+            shortest = candidate;
+        }
+    }
+
+    // Nothing fits: cut characters from the left, keeping the end.
+    let body = shortest.strip_prefix('…').unwrap_or(&shortest);
+    let keep = SYMBOL_WIDTH.saturating_sub(1);
+    let length = body.chars().count();
+    let tail: String = body.chars().skip(length.saturating_sub(keep)).collect();
     format!("…{tail}")
+}
+
+/// Splits a path at the `::` separators that are not inside angle brackets.
+///
+/// An `<impl …>` segment holds separators of its own, which must stay inside
+/// that segment.
+fn path_segments(path: &str) -> Vec<&str> {
+    let mut segments = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let bytes = path.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'<' => depth += 1,
+            b'>' => depth = depth.saturating_sub(1),
+            b':' if depth == 0 && bytes.get(index + 1) == Some(&b':') => {
+                segments.push(&path[start..index]);
+                index += 2;
+                start = index;
+                continue;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    segments.push(&path[start..]);
+    segments
+}
+
+/// Simplifies one path segment.
+///
+/// An `<impl …>` segment keeps its brackets but loses the generic arguments
+/// and the module paths of the trait and the type it names.
+fn simplified_segment(segment: &str) -> String {
+    let Some(rest) = segment.strip_prefix("<impl ") else {
+        return segment.to_owned();
+    };
+    let Some(inner) = rest.strip_suffix('>') else {
+        return segment.to_owned();
+    };
+    let inner = strip_generics(inner);
+    let words: Vec<&str> = inner
+        .split_whitespace()
+        .map(|word| word.rsplit("::").next().unwrap_or(word))
+        .collect();
+    format!("<impl {}>", words.join(" "))
+}
+
+/// Removes generic argument lists from text, counting nested brackets.
+fn strip_generics(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut depth = 0usize;
+    for character in text.chars() {
+        match character {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => out.push(character),
+            _ => {}
+        }
+    }
+    out
 }
 
 /// One rendered line of the `CHANGES` section.
@@ -415,7 +505,7 @@ mod tests {
 
     #[test]
     fn long_symbols_are_shortened_from_the_left() {
-        let long = format!("crate::{}::tail", "segment::".repeat(12));
+        let long = format!("crate::{}tail", "segment::".repeat(12));
         let text = render_diff(
             &result_with(
                 vec![change(
@@ -431,11 +521,8 @@ mod tests {
             true,
         );
         assert!(!text.contains(&long), "the full path must not be printed");
-        let shortened: String = long
-            .chars()
-            .skip(long.chars().count() - (SYMBOL_WIDTH - 1))
-            .collect();
-        assert!(text.contains(&format!("…{shortened}")));
+        let expected = format!("…::{}::tail", ["segment"; 6].join("::"));
+        assert!(text.contains(&expected), "{text}");
         for line in text.lines().skip(2) {
             let symbol_column = line.split("  ").nth(2).unwrap_or_default();
             assert!(
@@ -443,6 +530,66 @@ mod tests {
                 "symbol column is {} wide: {line}",
                 symbol_column.chars().count()
             );
+        }
+    }
+
+    #[test]
+    fn a_path_that_fits_is_left_alone() {
+        assert_eq!(shorten("billing::tax::vat_rate"), "billing::tax::vat_rate");
+        assert_eq!(shorten(""), "");
+        assert_eq!(shorten("a::Vec<b::C>::d"), "a::Vec<b::C>::d");
+    }
+
+    #[test]
+    fn impl_segments_lose_their_generics_and_qualifiers() {
+        let serde = "serde_json::de::<impl de::Deserializer<'de> for &mut Deserializer<R>>::\
+                     deserialize_any";
+        assert_eq!(serde.chars().count(), 86);
+        assert_eq!(
+            shorten(serde),
+            "…::<impl Deserializer for &mut Deserializer>::deserialize_any"
+        );
+
+        let thiserror =
+            "blastr_core::error::<impl ::thiserror::__private21::Error for Error>::source";
+        assert_eq!(
+            shorten(thiserror),
+            "blastr_core::error::<impl Error for Error>::source"
+        );
+    }
+
+    #[test]
+    fn a_dropped_module_leaves_one_marker() {
+        let path = "crate::<impl de::Deserializer for &mut Deserializer>::deserialize_any";
+
+        assert_eq!(
+            shorten(path),
+            "…::<impl Deserializer for &mut Deserializer>::deserialize_any"
+        );
+    }
+
+    #[test]
+    fn shortening_is_idempotent_and_never_too_wide() {
+        let inputs: Vec<String> = vec![
+            "serde_json::de::<impl de::Deserializer<'de> for &mut Deserializer<R>>::deserialize_any"
+                .to_owned(),
+            "blastr_core::error::<impl ::thiserror::__private21::Error for Error>::source"
+                .to_owned(),
+            format!("crate::{}tail", "segment::".repeat(12)),
+            format!("crate::foo<{}tail", "segment::".repeat(8)),
+            format!("{}tail", "môdule::".repeat(12)),
+            format!("crate::module::item{}", "x".repeat(120)),
+            "x".repeat(200),
+            "short".to_owned(),
+        ];
+        for input in &inputs {
+            let once = shorten(input);
+            assert!(
+                once.chars().count() <= SYMBOL_WIDTH,
+                "{} characters wide: {once}",
+                once.chars().count()
+            );
+            assert_eq!(shorten(&once), once, "shortening twice changed {once}");
         }
     }
 
