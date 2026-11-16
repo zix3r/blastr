@@ -28,6 +28,35 @@ use crate::impact::ImpactInput;
 /// The toolchain recorded in an analysis key when `rustc --version` cannot be run.
 const UNKNOWN_TOOLCHAIN: &str = "unknown";
 
+/// The version of this build followed by a fingerprint of the executable.
+///
+/// Cached graphs and results are keyed by it. The version alone would let a
+/// rebuilt executable of the same version read what older logic computed.
+fn build_id() -> &'static str {
+    static BUILD_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    BUILD_ID.get_or_init(|| {
+        let version = env!("CARGO_PKG_VERSION");
+        let fingerprint = std::env::current_exe()
+            .and_then(std::fs::metadata)
+            .ok()
+            .map(|metadata| {
+                let modified = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |since| since.as_nanos());
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(&metadata.len().to_le_bytes());
+                hasher.update(&modified.to_le_bytes());
+                hasher.finalize().to_hex()[..8].to_owned()
+            });
+        match fingerprint {
+            Some(fingerprint) => format!("{version}+{fingerprint}"),
+            None => version.to_owned(),
+        }
+    })
+}
+
 /// The file name whose changes are reported as manifest changes.
 const MANIFEST_FILE: &str = "Cargo.toml";
 
@@ -45,17 +74,17 @@ const RESULT_KEY_DOMAIN: &[u8] = b"analysis-1";
 const ANALYSIS_COMPRESSION_LEVEL: i32 = 3;
 
 /// Everything one call to [`Engine::graph_for`] needs beyond the source.
-struct GraphRequest<'a> {
+pub(crate) struct GraphRequest<'a> {
     /// Configuration to analyse the project under.
-    options: &'a AnalysisOptions,
+    pub(crate) options: &'a AnalysisOptions,
     /// Which side this is, used in the progress phase names: `base` or `head`.
-    phase: &'a str,
+    pub(crate) phase: &'a str,
     /// Toolchain version to record in the analysis key; `None` when no key is built.
-    toolchain: Option<&'a str>,
+    pub(crate) toolchain: Option<&'a str>,
     /// Where progress is reported.
-    progress: &'a dyn Progress,
+    pub(crate) progress: &'a dyn Progress,
     /// Cancellation flag.
-    cancel: &'a CancelToken,
+    pub(crate) cancel: &'a CancelToken,
 }
 
 /// Both graphs of one comparison, and the cache keys they belong to.
@@ -628,7 +657,7 @@ impl Engine {
     ///
     /// `toolchain` is the toolchain version to record in the key; it is only
     /// read when a key is built.
-    fn graph_for(
+    pub(crate) fn graph_for(
         &self,
         repo: Option<&Repo>,
         source: &Source,
@@ -857,7 +886,7 @@ impl Engine {
     }
 
     /// The analysis key of one side, or `None` when the source has no content id.
-    fn key_for(
+    pub(crate) fn key_for(
         &self,
         repo: Option<&Repo>,
         source: &Source,
@@ -895,7 +924,7 @@ impl Engine {
     }
 
     /// How rust-analyzer is told to load a project.
-    fn load_options(&self, options: &AnalysisOptions) -> blastr_ra::LoadOptions {
+    pub(crate) fn load_options(&self, options: &AnalysisOptions) -> blastr_ra::LoadOptions {
         blastr_ra::LoadOptions {
             features: options.features.clone(),
             all_features: options.all_features,
@@ -1007,7 +1036,7 @@ impl Engine {
             cargo_lock,
             toolchain: toolchain.unwrap_or(UNKNOWN_TOOLCHAIN).to_owned(),
             rust_analyzer: blastr_ra::RUST_ANALYZER_VERSION.to_owned(),
-            blastr: env!("CARGO_PKG_VERSION").to_owned(),
+            blastr: build_id().to_owned(),
             exec: options.exec,
             manifest_dir: options.manifest_dir.clone(),
         })
@@ -1115,7 +1144,7 @@ fn decode_analysis(bytes: &[u8]) -> Option<Analysis> {
 ///
 /// Reading the version costs one process per engine call, which is why it is
 /// done once and passed down rather than per side.
-fn toolchain_version(dir: &Path) -> String {
+pub(crate) fn toolchain_version(dir: &Path) -> String {
     Command::new("rustc")
         .arg("--version")
         .current_dir(dir)
@@ -1156,7 +1185,7 @@ fn read_utf8(bytes: Option<Vec<u8>>) -> Option<String> {
 
 /// Feature and dependency changes of the `Cargo.toml` files that changed in a
 /// repository comparison.
-fn manifest_changes_of_repo(
+pub(crate) fn manifest_changes_of_repo(
     repo: &Repo,
     comparison: &Comparison,
     changed_files: &[ChangedFile],
