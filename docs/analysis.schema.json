@@ -8,7 +8,7 @@
           "type": "boolean"
         },
         "blastr": {
-          "description": "The Blastr version.",
+          "description": "The Blastr build: its version and a fingerprint of the executable,\nso that a rebuilt Blastr never reads what an older build computed.",
           "type": "string"
         },
         "cargo_lock": {
@@ -1378,7 +1378,7 @@
       "description": "One `cargo test` invocation covering selected tests of one target.",
       "properties": {
         "filters": {
-          "description": "Test name filters; empty when every test of the target is selected.",
+          "description": "Test name filters. Empty when the command runs the whole target:\nbecause every test of it is selected, or because so many are that\nnaming them would be longer than it is worth.",
           "items": {
             "type": "string"
           },
@@ -1397,7 +1397,13 @@
           "type": "string"
         },
         "tests": {
-          "description": "How many selected tests the command runs.",
+          "description": "How many selected tests the target holds.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "total": {
+          "description": "How many tests the target holds in all.",
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
@@ -1408,7 +1414,8 @@
         "package",
         "target_kind",
         "target_name",
-        "tests"
+        "tests",
+        "total"
       ],
       "type": "object"
     },

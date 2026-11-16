@@ -26,4 +26,22 @@ mod tests {
     fn c() {
         assert_eq!(2 + 2, 4);
     }
+
+    /// Touches nothing either.
+    #[test]
+    fn d() {
+        assert_eq!(3 + 3, 6);
+    }
+
+    /// Touches nothing either.
+    #[test]
+    fn e() {
+        assert_eq!(4 + 4, 8);
+    }
+
+    /// Touches nothing either.
+    #[test]
+    fn f() {
+        assert_eq!(5 + 5, 10);
+    }
 }

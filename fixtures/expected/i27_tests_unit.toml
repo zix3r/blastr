@@ -37,5 +37,14 @@ reason = "reached"
 [[no_selected_test]]
 symbol = "i27_tests_unit::tests::c"
 
+[[no_selected_test]]
+symbol = "i27_tests_unit::tests::d"
+
+[[no_selected_test]]
+symbol = "i27_tests_unit::tests::e"
+
+[[no_selected_test]]
+symbol = "i27_tests_unit::tests::f"
+
 [[test_command]]
 line = "cargo test -p i27-tests-unit --lib -- tests::a tests::b"
