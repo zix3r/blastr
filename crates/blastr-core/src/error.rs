@@ -30,6 +30,9 @@ pub enum Error {
     /// A what-if query does not fit the symbol it names.
     #[error(transparent)]
     WhatIf(#[from] crate::impact::whatif::WhatIfError),
+    /// A session was asked for on a comparison it cannot watch.
+    #[error("this comparison cannot be watched: {0}")]
+    SessionNotWatching(String),
     /// The feature exists in the interface but is not implemented yet.
     #[error("`{0}` is not implemented yet")]
     NotImplemented(&'static str),
@@ -46,6 +49,12 @@ impl Error {
             }
             Error::WhatIf(crate::impact::whatif::WhatIfError::WrongKind { .. }) => {
                 "run `blastr impact --help` for the kinds of change that can be assumed"
+            }
+            Error::SessionNotWatching(_) => {
+                "watch the working tree: leave out `--staged`, and let the base side be the revision"
+            }
+            Error::Cancelled | Error::NotImplemented(_) => {
+                return None;
             }
             Error::Git(blastr_git::Error::NotARepository { .. }) => {
                 "run blastr inside a Git repository, or pass its path"
@@ -76,12 +85,7 @@ impl Error {
                 "check that `cargo --version` works in this directory"
             }
             Error::Codec(_) => "clear the cache with `blastr cache clear`",
-            Error::Git(_)
-            | Error::Store(_)
-            | Error::Ra(_)
-            | Error::Io(_)
-            | Error::Cancelled
-            | Error::NotImplemented(_) => {
+            Error::Git(_) | Error::Store(_) | Error::Ra(_) | Error::Io(_) => {
                 return None;
             }
         };

@@ -13,8 +13,10 @@ mod engine;
 mod error;
 mod hunks;
 pub mod impact;
+mod session;
 
 pub use blastr_model::{CancelToken, NoProgress, Progress};
 pub use codec::{decode_graph, encode_graph};
 pub use engine::{CacheStatus, DiffOutput, Engine, IndexReport};
 pub use error::{Error, Result};
+pub use session::{Refresh, Session};
