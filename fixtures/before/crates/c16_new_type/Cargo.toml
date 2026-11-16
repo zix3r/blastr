@@ -1,0 +1,8 @@
+[package]
+name = "c16-new-type"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "c16_new_type"
+path = "src/lib.rs"

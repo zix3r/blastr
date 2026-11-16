@@ -316,6 +316,302 @@ fn reports_impls_without_their_items() {
 }
 
 #[test]
+fn an_added_struct_covers_the_impls_written_for_it() {
+    let mut base = GraphBuilder::new();
+    base.add("krate::total", SymbolKind::Function, "src/lib.rs", 0, 20)
+        .hashes(11, 21);
+    let mut head = GraphBuilder::new();
+    head.add("krate::total", SymbolKind::Function, "src/lib.rs", 0, 20)
+        .hashes(11, 21);
+    let settings = head
+        .add("krate::Settings", SymbolKind::Struct, "src/lib.rs", 30, 60)
+        .sig(7)
+        .id();
+    head.add(
+        "krate::Settings::depth",
+        SymbolKind::Field,
+        "src/lib.rs",
+        45,
+        55,
+    )
+    .sig(8)
+    .parent(settings);
+    let debug = head
+        .add(
+            "krate::<impl Debug for Settings>",
+            SymbolKind::Impl,
+            "src/lib.rs",
+            28,
+            28,
+        )
+        .sig(9)
+        .impl_of(Some("core::fmt::Debug"), Some("krate::Settings"))
+        .macro_generated()
+        .id();
+    head.add(
+        "krate::<impl Debug for Settings>::fmt",
+        SymbolKind::Method,
+        "src/lib.rs",
+        28,
+        28,
+    )
+    .hashes(10, 11)
+    .parent(debug);
+    head.add(
+        "krate::<impl Clone for Settings>",
+        SymbolKind::Impl,
+        "src/lib.rs",
+        22,
+        22,
+    )
+    .sig(12)
+    .impl_of(Some("core::clone::Clone"), Some("krate::Settings"))
+    .macro_generated();
+    let inherent = head
+        .add(
+            "krate::<impl Settings>",
+            SymbolKind::Impl,
+            "src/lib.rs",
+            62,
+            100,
+        )
+        .sig(13)
+        .impl_of(None, Some("krate::Settings"))
+        .id();
+    head.add(
+        "krate::Settings::deeper",
+        SymbolKind::Method,
+        "src/lib.rs",
+        70,
+        95,
+    )
+    .hashes(14, 15)
+    .parent(inherent);
+    let changes = classify_in(base.finish(), head.finish(), &[modified("src/lib.rs")]);
+    assert_eq!(summary(&changes), ["added krate::Settings"]);
+}
+
+#[test]
+fn a_removed_enum_covers_the_impls_written_for_it() {
+    let mut base = GraphBuilder::new();
+    base.add("krate::total", SymbolKind::Function, "src/lib.rs", 0, 20)
+        .hashes(11, 21);
+    let level = base
+        .add("krate::Level", SymbolKind::Enum, "src/lib.rs", 30, 80)
+        .sig(5)
+        .id();
+    base.add(
+        "krate::Level::High",
+        SymbolKind::Variant,
+        "src/lib.rs",
+        50,
+        55,
+    )
+    .sig(6)
+    .parent(level);
+    let debug = base
+        .add(
+            "krate::<impl Debug for Level>",
+            SymbolKind::Impl,
+            "src/lib.rs",
+            28,
+            28,
+        )
+        .sig(7)
+        .impl_of(Some("core::fmt::Debug"), Some("krate::Level"))
+        .macro_generated()
+        .id();
+    base.add(
+        "krate::<impl Debug for Level>::fmt",
+        SymbolKind::Method,
+        "src/lib.rs",
+        28,
+        28,
+    )
+    .hashes(8, 9)
+    .parent(debug);
+    let inherent = base
+        .add(
+            "krate::<impl Level>",
+            SymbolKind::Impl,
+            "src/lib.rs",
+            82,
+            110,
+        )
+        .sig(10)
+        .impl_of(None, Some("krate::Level"))
+        .id();
+    base.add(
+        "krate::Level::step",
+        SymbolKind::Method,
+        "src/lib.rs",
+        90,
+        105,
+    )
+    .hashes(11, 12)
+    .parent(inherent);
+    let mut head = GraphBuilder::new();
+    head.add("krate::total", SymbolKind::Function, "src/lib.rs", 0, 20)
+        .hashes(11, 21);
+    let changes = classify_in(base.finish(), head.finish(), &[modified("src/lib.rs")]);
+    assert_eq!(summary(&changes), ["removed krate::Level"]);
+}
+
+#[test]
+fn a_derive_added_to_an_existing_struct_is_one_impl_change() {
+    let mut base = GraphBuilder::new();
+    base.add("krate::Label", SymbolKind::Struct, "src/lib.rs", 0, 40)
+        .sig(5);
+    base.add(
+        "krate::<impl Debug for Label>",
+        SymbolKind::Impl,
+        "src/lib.rs",
+        0,
+        0,
+    )
+    .sig(6)
+    .impl_of(Some("core::fmt::Debug"), Some("krate::Label"))
+    .macro_generated();
+    let mut head = GraphBuilder::new();
+    head.add("krate::Label", SymbolKind::Struct, "src/lib.rs", 0, 60)
+        .sig(5);
+    head.add(
+        "krate::<impl Debug for Label>",
+        SymbolKind::Impl,
+        "src/lib.rs",
+        0,
+        0,
+    )
+    .sig(6)
+    .impl_of(Some("core::fmt::Debug"), Some("krate::Label"))
+    .macro_generated();
+    head.add(
+        "krate::<impl Clone for Label>",
+        SymbolKind::Impl,
+        "src/lib.rs",
+        0,
+        0,
+    )
+    .sig(7)
+    .impl_of(Some("core::clone::Clone"), Some("krate::Label"))
+    .macro_generated();
+    let changes = classify_in(base.finish(), head.finish(), &[modified("src/lib.rs")]);
+    assert_eq!(
+        summary(&changes),
+        ["impl krate::<impl Clone for Label> added"]
+    );
+}
+
+#[test]
+fn a_new_trait_covers_the_impls_written_for_it() {
+    let mut base = GraphBuilder::new();
+    base.add("krate::Point", SymbolKind::Struct, "src/lib.rs", 0, 20)
+        .sig(5);
+    let mut head = GraphBuilder::new();
+    head.add("krate::Point", SymbolKind::Struct, "src/lib.rs", 0, 20)
+        .sig(5);
+    let shape = head
+        .add("krate::Shape", SymbolKind::Trait, "src/lib.rs", 30, 50)
+        .sig(6)
+        .id();
+    head.add(
+        "krate::Shape::area",
+        SymbolKind::Method,
+        "src/lib.rs",
+        40,
+        48,
+    )
+    .hashes(7, 0)
+    .in_trait()
+    .parent(shape);
+    let imp = head
+        .add(
+            "krate::<impl Shape for Point>",
+            SymbolKind::Impl,
+            "src/lib.rs",
+            52,
+            90,
+        )
+        .sig(8)
+        .impl_of(Some("krate::Shape"), Some("krate::Point"))
+        .id();
+    head.add(
+        "krate::<impl Shape for Point>::area",
+        SymbolKind::Method,
+        "src/lib.rs",
+        60,
+        80,
+    )
+    .hashes(7, 9)
+    .parent(imp);
+    let changes = classify_in(base.finish(), head.finish(), &[modified("src/lib.rs")]);
+    assert_eq!(summary(&changes), ["added krate::Shape"]);
+}
+
+#[test]
+fn an_impl_of_an_existing_trait_for_an_existing_type_is_reported() {
+    let mut base = GraphBuilder::new();
+    base.add("krate::Point", SymbolKind::Struct, "src/lib.rs", 0, 20)
+        .sig(5);
+    let shape = base
+        .add("krate::Shape", SymbolKind::Trait, "src/lib.rs", 30, 40)
+        .sig(6)
+        .id();
+    base.add(
+        "krate::Shape::area",
+        SymbolKind::Method,
+        "src/lib.rs",
+        35,
+        39,
+    )
+    .hashes(7, 0)
+    .in_trait()
+    .parent(shape);
+    let mut head = GraphBuilder::new();
+    head.add("krate::Point", SymbolKind::Struct, "src/lib.rs", 0, 20)
+        .sig(5);
+    let shape = head
+        .add("krate::Shape", SymbolKind::Trait, "src/lib.rs", 30, 40)
+        .sig(6)
+        .id();
+    head.add(
+        "krate::Shape::area",
+        SymbolKind::Method,
+        "src/lib.rs",
+        35,
+        39,
+    )
+    .hashes(7, 0)
+    .in_trait()
+    .parent(shape);
+    let imp = head
+        .add(
+            "krate::<impl Shape for Point>",
+            SymbolKind::Impl,
+            "src/lib.rs",
+            42,
+            80,
+        )
+        .sig(8)
+        .impl_of(Some("krate::Shape"), Some("krate::Point"))
+        .id();
+    head.add(
+        "krate::<impl Shape for Point>::area",
+        SymbolKind::Method,
+        "src/lib.rs",
+        50,
+        70,
+    )
+    .hashes(7, 9)
+    .parent(imp);
+    let changes = classify_in(base.finish(), head.finish(), &[modified("src/lib.rs")]);
+    assert_eq!(
+        summary(&changes),
+        ["impl krate::<impl Shape for Point> added"]
+    );
+}
+
+#[test]
 fn an_added_or_removed_struct_covers_its_fields() {
     let mut head = GraphBuilder::new();
     let new = head

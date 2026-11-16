@@ -124,6 +124,88 @@ pub(crate) fn covered_by_ancestor(
     false
 }
 
+/// The canonical paths of the types and traits on one side that have no
+/// counterpart on the other side, so they were added or removed.
+///
+/// An impl block written for one of them is part of that same change: the impl
+/// exists only because the type or trait does.
+#[derive(Debug, Default)]
+pub(crate) struct Unpaired {
+    /// Paths of the structs, enums and unions without a counterpart.
+    types: HashSet<String>,
+    /// Paths of the traits without a counterpart.
+    traits: HashSet<String>,
+}
+
+impl Unpaired {
+    /// True when the impl block exists only because its self type or its trait
+    /// is among these names, so the type or trait already says what happened.
+    pub(crate) fn covers(&self, symbol: &Symbol) -> bool {
+        let Some(info) = &symbol.impl_info else {
+            return false;
+        };
+        let self_type = info
+            .self_path
+            .as_ref()
+            .is_some_and(|path| self.types.contains(path));
+        let implemented = info
+            .trait_path
+            .as_ref()
+            .is_some_and(|path| self.traits.contains(path));
+        self_type || implemented
+    }
+}
+
+/// Collects the types and traits of one side that have no counterpart on the
+/// other side.
+///
+/// `matched` is the side's own pairing table, so a symbol missing from it was
+/// added when this is the head side and removed when it is the base side. A
+/// type or trait paired as a rename or as a move keeps its counterpart and is
+/// not collected.
+pub(crate) fn unpaired(
+    graph: &RevisionGraph,
+    side: &[SymbolId],
+    matched: &HashMap<SymbolId, SymbolId>,
+) -> Unpaired {
+    let mut found = Unpaired::default();
+    for &id in side {
+        if matched.contains_key(&id) {
+            continue;
+        }
+        let path = &graph.symbols[id.0 as usize].path;
+        match path.kind {
+            SymbolKind::Struct | SymbolKind::Enum | SymbolKind::Union => {
+                found.types.insert(path.path.clone());
+            }
+            SymbolKind::Trait => {
+                found.traits.insert(path.path.clone());
+            }
+            _ => {}
+        }
+    }
+    found
+}
+
+/// True when the symbol is an impl block, or an item of one, that exists only
+/// because a type or trait of the same side was added or removed.
+///
+/// Reporting those impl blocks and their items as well would describe one
+/// change several times.
+pub(crate) fn covered_by_unpaired_impl(
+    graph: &RevisionGraph,
+    id: SymbolId,
+    unpaired: &Unpaired,
+) -> bool {
+    let symbol = &graph.symbols[id.0 as usize];
+    if unpaired.covers(symbol) {
+        return true;
+    }
+    symbol
+        .parent
+        .is_some_and(|parent| unpaired.covers(&graph.symbols[parent.0 as usize]))
+}
+
 /// Pairs the symbols of both graphs: first by identity, then by rename.
 pub(crate) fn match_symbols(
     base: &RevisionGraph,

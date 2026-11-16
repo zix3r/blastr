@@ -43,6 +43,10 @@ impl Default for MatchParams {
 /// `changed` limits the detailed comparison to symbols located in those files,
 /// on either side. The result is sorted by (file of the symbol, start offset,
 /// kind, path text) and never depends on hash map iteration order.
+///
+/// A type or a trait that appears or disappears is one change on its own: the
+/// impl blocks written for it, and the items of those impl blocks, are not
+/// reported next to it.
 pub fn classify(
     base: &RevisionGraph,
     head: &RevisionGraph,
@@ -102,6 +106,7 @@ pub fn classify(
         &scope.base,
         &matches.base_to_head,
         &reshaped_base,
+        &matching::unpaired(base, &scope.base, &matches.base_to_head),
         Delta::Removed,
         &mut changes,
     );
@@ -110,6 +115,7 @@ pub fn classify(
         &scope.head,
         &matches.head_to_base,
         &reshaped_head,
+        &matching::unpaired(head, &scope.head, &matches.head_to_base),
         Delta::Added,
         &mut changes,
     );
@@ -213,12 +219,15 @@ fn compare(old: &Symbol, new: &Symbol, out: &mut Vec<Change>) {
 /// Reports the symbols of one side that have no counterpart on the other.
 ///
 /// `reshaped` holds the matched variants of this side that are reported as
-/// modified; their fields are covered by that change.
+/// modified; their fields are covered by that change. `unpaired` holds the
+/// types and traits of this side that have no counterpart, which cover the impl
+/// blocks written for them.
 fn report_unmatched(
     graph: &RevisionGraph,
     scope: &[SymbolId],
     matched: &HashMap<SymbolId, SymbolId>,
     reshaped: &HashSet<SymbolId>,
+    unpaired: &matching::Unpaired,
     delta: Delta,
     out: &mut Vec<Change>,
 ) {
@@ -231,7 +240,9 @@ fn report_unmatched(
             continue;
         }
         let symbol = &graph.symbols[id.0 as usize];
-        if matching::covered_by_ancestor(graph, id, matched) {
+        if matching::covered_by_ancestor(graph, id, matched)
+            || matching::covered_by_unpaired_impl(graph, id, unpaired)
+        {
             continue;
         }
         if symbol

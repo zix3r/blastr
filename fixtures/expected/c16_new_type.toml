@@ -1,0 +1,23 @@
+crates = ["c16_new_type"]
+exact_changes = true
+
+[[change]]
+kind = "added"
+symbol = "c16_new_type::Settings"
+
+[[change]]
+kind = "added"
+symbol = "c16_new_type::defaults"
+
+[[no_change]]
+symbol = "c16_new_type::<impl Debug for Settings>"
+
+[[no_change]]
+symbol = "c16_new_type::<impl Settings>"
+
+[[no_change]]
+symbol = "c16_new_type::Settings::deeper"
+
+[[no_change]]
+symbol = "c16_new_type::total"
+kind = "body"

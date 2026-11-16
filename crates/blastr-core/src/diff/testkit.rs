@@ -1,8 +1,8 @@
 //! A builder for the revision graphs the diff tests compare.
 
 use blastr_model::{
-    ChangedFile, CrateId, CrateInfo, FileStatus, Location, RelPath, RevisionGraph, Span, Symbol,
-    SymbolFlags, SymbolId, SymbolKind, SymbolPath, TargetKind, Visibility,
+    ChangedFile, CrateId, CrateInfo, FileStatus, ImplInfo, Location, RelPath, RevisionGraph, Span,
+    Symbol, SymbolFlags, SymbolId, SymbolKind, SymbolPath, TargetKind, Visibility,
 };
 
 /// Builds a [`RevisionGraph`] one symbol at a time.
@@ -134,6 +134,16 @@ impl<'a> Sym<'a> {
     /// Marks the symbol as declared inside a trait.
     pub(crate) fn in_trait(mut self) -> Self {
         self.symbol().flags.in_trait = true;
+        self
+    }
+
+    /// What an impl block implements: the canonical path of its trait and of
+    /// its self type. Call it on a symbol of kind `Impl` only.
+    pub(crate) fn impl_of(mut self, trait_path: Option<&str>, self_path: Option<&str>) -> Self {
+        self.symbol().impl_info = Some(ImplInfo {
+            trait_path: trait_path.map(str::to_owned),
+            self_path: self_path.map(str::to_owned),
+        });
         self
     }
 
