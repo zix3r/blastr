@@ -11,8 +11,9 @@
 //! Symbol ids are assigned after the whole walk, in a deterministic order, so
 //! the same project always produces the same ids.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::time::{Duration, Instant};
 
 use blastr_model::{
     CancelToken, Certainty, CrateId, Edge, EdgeDetail, EdgeKind, ImplInfo, Location, Progress,
@@ -20,9 +21,9 @@ use blastr_model::{
     Visibility as ModelVisibility,
 };
 use ra_ap_hir::{
-    Adt, AnyDiagnostic, AssocItem, Crate, EnumVariant, Field, FieldSource, Function, HasSource,
-    HasVisibility, HirFileId, Impl, InFile, Module, ModuleDef, Semantics, Trait,
-    Visibility as HirVisibility, attach_db, db::HirDatabase,
+    Adt, AssocItem, Crate, EnumVariant, Field, FieldSource, Function, HasSource, HasVisibility,
+    HirFileId, Impl, InFile, Module, ModuleDef, Semantics, Trait, Visibility as HirVisibility,
+    attach_db, db::HirDatabase,
 };
 use ra_ap_ide_db::base_db::SourceDatabase;
 use ra_ap_syntax::ast;
@@ -32,9 +33,13 @@ use ra_ap_vfs::FileId;
 use crate::edges::{self, Container, Input as EdgeInput, ResolvedCrate};
 use crate::hashing;
 use crate::load::MemberCrate;
+use ra_ap_ide_db::base_db::Crate as BaseCrate;
+
 use crate::locate::Locator;
+use crate::pipeline::{self, Crates, Threads};
+use crate::stats::{ExtractReport, Kind, Profile};
 use crate::symbols::{self, DefKey, Hashes, Raw, SymbolTable};
-use crate::{Error, Workspace, check_cancel, paths};
+use crate::{Error, ExtractOptions, Workspace, check_cancel, paths};
 
 impl Workspace {
     /// Extracts the graph of the project as currently loaded.
@@ -43,15 +48,100 @@ impl Workspace {
         progress: &dyn Progress,
         cancel: &CancelToken,
     ) -> Result<RevisionGraph, Error> {
+        let (graph, _report) = self.extract_with(&ExtractOptions::default(), progress, cancel)?;
+        Ok(graph)
+    }
+
+    /// Extracts the graph, and reports how long the extraction took.
+    ///
+    /// The report is empty unless [`ExtractOptions::measure`] is set; the graph
+    /// is the same either way.
+    pub fn extract_with(
+        &self,
+        options: &ExtractOptions,
+        progress: &dyn Progress,
+        cancel: &CancelToken,
+    ) -> Result<(RevisionGraph, ExtractReport), Error> {
         let database = self.host.raw_database();
         let db: &dyn HirDatabase = database;
         let source_db: &dyn SourceDatabase = database;
         let locator = Locator::new(source_db, &self.vfs, &self.root);
+        let threads = Threads::new(database, options.threads);
         attach_db(db, || {
-            let mut extractor = Extractor::new(db, &locator, cancel, progress, self);
-            extractor.run()?;
-            Ok(extractor.finish())
+            let members = self.members(db);
+            let phases = Crates::new(
+                db,
+                &members
+                    .iter()
+                    .enumerate()
+                    .map(|(index, member)| (member.resolved.krate, index))
+                    .collect::<Vec<_>>(),
+                members.len(),
+            );
+            let mut walked: Vec<Option<Extractor<'_>>> = (0..members.len()).map(|_| None).collect();
+            let started = Instant::now();
+            let inactive = pipeline::run(
+                pipeline::Input {
+                    db,
+                    crates: &phases,
+                    threads: &threads,
+                    paths: locator.paths(),
+                    cancel,
+                    progress,
+                },
+                &mut walked,
+                |index| {
+                    let extractor = Extractor::new(
+                        db,
+                        &locator,
+                        cancel,
+                        self,
+                        &members[index],
+                        options.measure,
+                    );
+                    let extractor = extractor.run()?;
+                    let modules = extractor.modules.clone();
+                    Ok((extractor, modules))
+                },
+            )?;
+            let pass = started.elapsed();
+            let mut walks = Vec::with_capacity(walked.len());
+            for walk in walked {
+                walks.push(
+                    walk.ok_or_else(|| {
+                        Error::Internal("a member crate was not walked".to_owned())
+                    })?,
+                );
+            }
+            let workspace_crates = members
+                .iter()
+                .map(|member| member.resolved.krate.base())
+                .collect();
+            let assembler =
+                Assembler::merge(walks, db, &locator, self, workspace_crates, options.measure);
+            Ok(assembler.finish(inactive, pass))
         })
+    }
+
+    /// The member crates of the project, with the crates of the database they
+    /// were found as.
+    fn members(&self, db: &dyn HirDatabase) -> Vec<Member> {
+        let candidates = candidates_by_root(db, &self.crates);
+        let mut members = Vec::with_capacity(self.crates.len());
+        for (index, member) in self.crates.iter().enumerate() {
+            let Some(krate) = find_crate(&candidates, member, db) else {
+                continue;
+            };
+            members.push(Member {
+                resolved: ResolvedCrate {
+                    index,
+                    krate,
+                    is_bin: member.info.target_kind == TargetKind::Bin,
+                },
+                name: member.info.name.clone(),
+            });
+        }
+        members
     }
 }
 
@@ -101,6 +191,20 @@ struct PendingContainer {
     node: SyntaxNode,
 }
 
+/// A workspace-member crate of the graph, resolved in the database.
+#[derive(Debug, Clone)]
+struct Member {
+    /// The crate as the graph reports it.
+    resolved: ResolvedCrate,
+    /// The crate name as it appears in paths.
+    name: String,
+}
+
+/// The walk of one member crate.
+///
+/// A walk builds the symbols of one crate and the regions the dependency pass
+/// walks, with indices that count from zero; [`Assembler::merge`] joins the
+/// walks of all crates into one graph.
 struct Extractor<'a> {
     /// The database, attached to the current thread.
     db: &'a dyn HirDatabase,
@@ -110,22 +214,22 @@ struct Extractor<'a> {
     locator: &'a Locator<'a>,
     /// Asks the caller to stop.
     cancel: &'a CancelToken,
-    /// Tells the caller how far the extraction is.
-    progress: &'a dyn Progress,
     /// The workspace, for its member crates and its execution mode.
     workspace: &'a Workspace,
-    /// The crates of the graph that were found in the database.
-    crates: Vec<ResolvedCrate>,
+    /// The crate of the graph that is walked.
+    member: Member,
+    /// Index into `Workspace::crates` of the crate that is walked.
+    krate: usize,
     /// The symbols, before ids are assigned.
     raws: Vec<Raw>,
     /// Where each definition's symbol is in [`Extractor::raws`].
     defs: HashMap<DefKey, usize>,
-    /// Inactive `cfg` ranges, in no particular order.
-    inactive: Vec<Location>,
+    /// The modules whose inactive `cfg` ranges are needed.
+    modules: Vec<Module>,
     /// The regions the dependency pass walks.
     containers: Vec<PendingContainer>,
-    /// Index into `Workspace::crates` of the crate being walked.
-    krate: usize,
+    /// Records the time spent in each kind of work.
+    profile: Profile,
 }
 
 impl<'a> Extractor<'a> {
@@ -133,53 +237,48 @@ impl<'a> Extractor<'a> {
         db: &'a dyn HirDatabase,
         locator: &'a Locator<'a>,
         cancel: &'a CancelToken,
-        progress: &'a dyn Progress,
         workspace: &'a Workspace,
+        member: &Member,
+        measure: bool,
     ) -> Extractor<'a> {
         Extractor {
             db,
             sema: Semantics::new_dyn(db),
             locator,
             cancel,
-            progress,
             workspace,
-            crates: Vec::new(),
+            member: Member {
+                resolved: member.resolved,
+                name: member.name.clone(),
+            },
+            krate: member.resolved.index,
             raws: Vec::new(),
             defs: HashMap::new(),
-            inactive: Vec::new(),
+            modules: Vec::new(),
             containers: Vec::new(),
-            krate: 0,
+            profile: Profile::new(measure),
         }
     }
 
-    /// Walks every workspace-member crate.
-    fn run(&mut self) -> Result<(), Error> {
-        let workspace: &'a Workspace = self.workspace;
-        let members = &workspace.crates;
-        let candidates = candidates_by_root(self.db, members);
-        let total = members.len() as u64;
-        for (index, member) in members.iter().enumerate() {
-            check_cancel(self.cancel)?;
-            self.progress.report("extract", index as u64, Some(total));
-            let Some(krate) = find_crate(&candidates, member, self.db) else {
-                continue;
-            };
-            let resolved = ResolvedCrate {
-                index,
-                krate,
-                is_bin: member.info.target_kind == TargetKind::Bin,
-            };
-            self.crates.push(resolved);
-            self.krate = resolved.index;
-            let name = member.info.name.clone();
-            self.walk_crate(resolved.krate, &name)?;
-        }
-        self.progress.report("extract", total, Some(total));
-        Ok(())
+    /// Times one rust-analyzer query.
+    fn timed<T>(&self, kind: Kind, query: impl FnOnce() -> Option<T>) -> Option<T> {
+        let start = self.profile.start();
+        let result = self.guarded(query);
+        self.profile.finish(kind, start);
+        result
+    }
+
+    /// Walks the crate of this worker.
+    fn run(mut self) -> Result<Extractor<'a>, Error> {
+        let name = self.member.name.clone();
+        let krate = self.member.resolved.krate;
+        self.walk_crate(krate, &name)?;
+        Ok(self)
     }
 
     /// Adds the crate root module and everything below it.
     fn walk_crate(&mut self, krate: Crate, crate_name: &str) -> Result<(), Error> {
+        let start = self.profile.start();
         let root = krate.root_module(self.db);
         let Some(location) = self.root_location(krate) else {
             return Ok(());
@@ -194,7 +293,9 @@ impl<'a> Extractor<'a> {
             None,
         );
         let index = self.push(raw, Some(DefKey::Module(root)));
-        self.walk_module(root, crate_name, Some(index), Scope::default())
+        let walked = self.walk_module(root, crate_name, Some(index), Scope::default());
+        self.profile.finish(Kind::CrateRoot, start);
+        walked
     }
 
     /// Adds the items of one module, and of its impl blocks.
@@ -205,28 +306,53 @@ impl<'a> Extractor<'a> {
         parent: Option<usize>,
         scope: Scope,
     ) -> Result<(), Error> {
+        let start = self.profile.start();
         check_cancel(self.cancel)?;
-        self.collect_inactive(module);
-        for def in module.declarations(self.db) {
+        self.note_module(module);
+        let declarations = self
+            .timed(Kind::Declarations, || Some(module.declarations(self.db)))
+            .unwrap_or_default();
+        for def in declarations {
             self.add_def(def, path, parent, scope)?;
         }
         // A `macro_rules!` macro without `#[macro_export]` is textually scoped
         // and not among the declarations. The legacy scope also holds the
         // macros inherited from enclosing modules and from `#[macro_use]`
         // crates, so only the ones defined in this module are taken.
-        for item in module.legacy_macros(self.db) {
+        let macros = self
+            .timed(Kind::Declarations, || Some(module.legacy_macros(self.db)))
+            .unwrap_or_default();
+        for item in macros {
             if item.module(self.db) == module {
                 self.add_macro(item, path, parent, scope)?;
             }
         }
-        for block in module.impl_defs(self.db) {
+        let impls = self
+            .timed(Kind::Declarations, || Some(module.impl_defs(self.db)))
+            .unwrap_or_default();
+        for block in impls {
             self.add_impl(block, path, parent)?;
         }
+        self.profile.finish(Kind::Module, start);
         Ok(())
     }
 
     /// Adds one definition that can appear in a module's declarations.
     fn add_def(
+        &mut self,
+        def: ModuleDef,
+        path: &str,
+        parent: Option<usize>,
+        scope: Scope,
+    ) -> Result<(), Error> {
+        let start = self.profile.start();
+        let result = self.add_def_inner(def, path, parent, scope);
+        self.profile.finish(Kind::Symbol, start);
+        result
+    }
+
+    /// Adds one definition that can appear in a module's declarations.
+    fn add_def_inner(
         &mut self,
         def: ModuleDef,
         path: &str,
@@ -309,7 +435,7 @@ impl<'a> Extractor<'a> {
             return Ok(());
         }
         let Some(source) = self
-            .guarded(|| function.source_with_range(self.db))
+            .timed(Kind::Source, || function.source_with_range(self.db))
             .and_then(|source| self.resolve_source(source))
         else {
             return Ok(());
@@ -318,33 +444,45 @@ impl<'a> Extractor<'a> {
         if name.is_missing() {
             return Ok(());
         }
-        let kind = if function.has_self_param(self.db) {
+        let start = self.profile.start();
+        let has_self = function.has_self_param(self.db);
+        self.profile.finish(Kind::ItemQuery, start);
+        let kind = if has_self {
             SymbolKind::Method
         } else {
             SymbolKind::Function
         };
         let hashes = source
             .ast()
-            .map(symbols::function_hashes)
+            .map(|node| {
+                let start = self.profile.start();
+                let hashes = symbols::function_hashes(node);
+                self.profile.finish(Kind::Hashes, start);
+                hashes
+            })
             .unwrap_or_else(Hashes::none);
         let is_test = hashes.is_test;
         let has_body = hashes.has_body;
         let path = paths::child(path, name.as_str());
+        let start = self.profile.start();
         let visibility = function.visibility(self.db);
         let module = function.module(self.db);
+        let visibility = self.model_visibility(visibility, module);
+        let pub_api = self.is_pub_api(function.visibility(self.db), module);
+        self.profile.finish(Kind::ItemQuery, start);
         let mut raw = Raw::new(
             kind,
             path.clone(),
             self.krate,
             source.location.clone(),
-            self.model_visibility(visibility, module),
+            visibility,
             hashes,
             parent,
         );
         raw.flags = SymbolFlags {
             is_test,
             is_main: self.is_main(name.as_str(), kind, parent),
-            is_pub_api: self.is_pub_api(visibility, module),
+            is_pub_api: pub_api,
             has_body,
             in_trait: scope.in_trait,
             in_trait_impl: scope.in_trait_impl,
@@ -393,7 +531,7 @@ impl<'a> Extractor<'a> {
             return Ok(());
         }
         let Some(source) = self
-            .guarded(|| adt.source(self.db))
+            .timed(Kind::Source, || adt.source(self.db))
             .map(with_range)
             .and_then(|source| self.resolve_source(source))
         else {
@@ -401,7 +539,12 @@ impl<'a> Extractor<'a> {
         };
         let hashes = source
             .syntax()
-            .map(|node| symbols::adt_hashes(kind, node))
+            .map(|node| {
+                let start = self.profile.start();
+                let hashes = symbols::adt_hashes(kind, node);
+                self.profile.finish(Kind::Hashes, start);
+                hashes
+            })
             .unwrap_or_else(Hashes::none);
         let path = paths::child(path, name.as_str());
         let mut raw = Raw::new(
@@ -424,17 +567,26 @@ impl<'a> Extractor<'a> {
         self.region(index, Some(key), source.file, source.syntax());
         match adt {
             Adt::Struct(it) => {
-                for field in it.fields(self.db) {
+                let fields = self
+                    .timed(Kind::Declarations, || Some(it.fields(self.db)))
+                    .unwrap_or_default();
+                for field in fields {
                     self.add_field(field, module, &path, Some(index), scope)?;
                 }
             }
             Adt::Union(it) => {
-                for field in it.fields(self.db) {
+                let fields = self
+                    .timed(Kind::Declarations, || Some(it.fields(self.db)))
+                    .unwrap_or_default();
+                for field in fields {
                     self.add_field(field, module, &path, Some(index), scope)?;
                 }
             }
             Adt::Enum(it) => {
-                for variant in it.variants(self.db) {
+                let variants = self
+                    .timed(Kind::Declarations, || Some(it.variants(self.db)))
+                    .unwrap_or_default();
+                for variant in variants {
                     self.add_variant(variant, &path, Some(index), scope)?;
                 }
             }
@@ -460,7 +612,7 @@ impl<'a> Extractor<'a> {
         let module = variant.module(self.db);
         let visibility = variant.visibility(self.db);
         let Some(source) = self
-            .guarded(|| variant.source(self.db))
+            .timed(Kind::Source, || variant.source(self.db))
             .map(with_range)
             .and_then(|source| self.resolve_source(source))
         else {
@@ -468,7 +620,12 @@ impl<'a> Extractor<'a> {
         };
         let hashes = source
             .ast()
-            .map(symbols::variant_hashes)
+            .map(|node| {
+                let start = self.profile.start();
+                let hashes = symbols::variant_hashes(node);
+                self.profile.finish(Kind::Hashes, start);
+                hashes
+            })
             .unwrap_or_else(Hashes::none);
         let path = paths::child(path, name.as_str());
         let mut raw = Raw::new(
@@ -488,7 +645,10 @@ impl<'a> Extractor<'a> {
             ..SymbolFlags::default()
         };
         let index = self.push(raw, Some(key));
-        for field in variant.fields(self.db) {
+        let fields = self
+            .timed(Kind::Declarations, || Some(variant.fields(self.db)))
+            .unwrap_or_default();
+        for field in fields {
             self.add_field(field, module, &path, Some(index), scope)?;
         }
         Ok(())
@@ -507,7 +667,7 @@ impl<'a> Extractor<'a> {
             return Ok(());
         }
         let Some(source) = self
-            .guarded(|| field.source(self.db))
+            .timed(Kind::Source, || field.source(self.db))
             .map(with_range)
             .and_then(|source| self.resolve_source(source))
         else {
@@ -564,7 +724,7 @@ impl<'a> Extractor<'a> {
         let module = item.module(self.db);
         let visibility = item.visibility(self.db);
         let Some(source) = self
-            .guarded(|| item.source(self.db))
+            .timed(Kind::Source, || item.source(self.db))
             .map(with_range)
             .and_then(|source| self.resolve_source(source))
         else {
@@ -572,7 +732,12 @@ impl<'a> Extractor<'a> {
         };
         let hashes = source
             .ast()
-            .map(symbols::const_hashes)
+            .map(|node| {
+                let start = self.profile.start();
+                let hashes = symbols::const_hashes(node);
+                self.profile.finish(Kind::Hashes, start);
+                hashes
+            })
             .unwrap_or_else(Hashes::none);
         let has_body = hashes.has_body;
         let path = paths::child(path, name.as_str());
@@ -616,7 +781,7 @@ impl<'a> Extractor<'a> {
         let module = item.module(self.db);
         let visibility = item.visibility(self.db);
         let Some(source) = self
-            .guarded(|| item.source(self.db))
+            .timed(Kind::Source, || item.source(self.db))
             .map(with_range)
             .and_then(|source| self.resolve_source(source))
         else {
@@ -624,7 +789,12 @@ impl<'a> Extractor<'a> {
         };
         let hashes = source
             .ast()
-            .map(symbols::static_hashes)
+            .map(|node| {
+                let start = self.profile.start();
+                let hashes = symbols::static_hashes(node);
+                self.profile.finish(Kind::Hashes, start);
+                hashes
+            })
             .unwrap_or_else(Hashes::none);
         let has_body = hashes.has_body;
         let path = paths::child(path, name.as_str());
@@ -668,7 +838,7 @@ impl<'a> Extractor<'a> {
         let module = item.module(self.db);
         let visibility = item.visibility(self.db);
         let Some(source) = self
-            .guarded(|| item.source(self.db))
+            .timed(Kind::Source, || item.source(self.db))
             .map(with_range)
             .and_then(|source| self.resolve_source(source))
         else {
@@ -676,7 +846,12 @@ impl<'a> Extractor<'a> {
         };
         let hashes = source
             .ast()
-            .map(symbols::type_alias_hashes)
+            .map(|node| {
+                let start = self.profile.start();
+                let hashes = symbols::type_alias_hashes(node);
+                self.profile.finish(Kind::Hashes, start);
+                hashes
+            })
             .unwrap_or_else(Hashes::none);
         let path = paths::child(path, name.as_str());
         let mut raw = Raw::new(
@@ -718,7 +893,7 @@ impl<'a> Extractor<'a> {
         let module = item.module(self.db);
         let visibility = item.visibility(self.db);
         let Some(source) = self
-            .guarded(|| item.source(self.db))
+            .timed(Kind::Source, || item.source(self.db))
             .map(with_range)
             .and_then(|source| self.resolve_source(source))
         else {
@@ -726,7 +901,12 @@ impl<'a> Extractor<'a> {
         };
         let hashes = source
             .ast()
-            .map(symbols::trait_hashes)
+            .map(|node| {
+                let start = self.profile.start();
+                let hashes = symbols::trait_hashes(node);
+                self.profile.finish(Kind::Hashes, start);
+                hashes
+            })
             .unwrap_or_else(Hashes::none);
         let path = paths::child(path, name.as_str());
         let mut raw = Raw::new(
@@ -751,7 +931,10 @@ impl<'a> Extractor<'a> {
             in_trait: true,
             in_trait_impl: scope.in_trait_impl,
         };
-        for item in item.items(self.db) {
+        let items = self
+            .timed(Kind::Declarations, || Some(item.items(self.db)))
+            .unwrap_or_default();
+        for item in items {
             self.add_assoc_item(item, &path, Some(index), inner)?;
         }
         Ok(())
@@ -775,13 +958,13 @@ impl<'a> Extractor<'a> {
         let module = item.module(self.db);
         let visibility = item.visibility(self.db);
         let Some(source) = self
-            .guarded(|| item.source(self.db))
+            .timed(Kind::Source, || item.source(self.db))
             .map(with_range)
             .and_then(|source| self.resolve_source(source))
         else {
             return Ok(());
         };
-        let hashes = macro_source_hashes(&source);
+        let hashes = macro_source_hashes(&source, &self.profile);
         let path = paths::child(path, name.as_str());
         let mut raw = Raw::new(
             SymbolKind::Macro,
@@ -811,7 +994,7 @@ impl<'a> Extractor<'a> {
             return Ok(());
         }
         let Some(source) = self
-            .guarded(|| block.source_with_range(self.db))
+            .timed(Kind::Source, || block.source_with_range(self.db))
             .and_then(|source| self.resolve_source(source))
         else {
             return Ok(());
@@ -840,7 +1023,12 @@ impl<'a> Extractor<'a> {
         };
         let hashes = source
             .ast()
-            .map(symbols::impl_hashes)
+            .map(|node| {
+                let start = self.profile.start();
+                let hashes = symbols::impl_hashes(node);
+                self.profile.finish(Kind::Hashes, start);
+                hashes
+            })
             .unwrap_or_else(Hashes::none);
         let mut raw = Raw::new(
             SymbolKind::Impl,
@@ -868,7 +1056,10 @@ impl<'a> Extractor<'a> {
             in_trait: false,
             in_trait_impl: trait_def.is_some(),
         };
-        for item in block.items(self.db) {
+        let items = self
+            .timed(Kind::Declarations, || Some(block.items(self.db)))
+            .unwrap_or_default();
+        for item in items {
             self.add_assoc_item(item, &item_path, Some(index), inner)?;
         }
         Ok(())
@@ -887,15 +1078,19 @@ impl<'a> Extractor<'a> {
         parent: usize,
         scope: Scope,
     ) -> Result<(), Error> {
+        let start = self.profile.start();
         let mut nodes = Vec::new();
         item_nodes(body, &mut nodes);
+        self.profile.finish(Kind::Nested, start);
         for node in nodes {
             check_cancel(self.cancel)?;
             let Some(item) = ast::Item::cast(node) else {
                 continue;
             };
             let block = match &item {
-                ast::Item::Impl(it) => self.guarded(|| self.sema.to_def2(InFile::new(file, it))),
+                ast::Item::Impl(it) => self.timed(Kind::ResolveDef, || {
+                    self.sema.to_def2(InFile::new(file, it))
+                }),
                 _ => None,
             };
             if let Some(block) = block {
@@ -911,7 +1106,8 @@ impl<'a> Extractor<'a> {
 
     /// Resolves the syntax of an item in a block to its definition.
     fn nested_def(&self, file: HirFileId, item: &ast::Item) -> Option<ModuleDef> {
-        match item {
+        let start = self.profile.start();
+        let def = match item {
             ast::Item::Fn(it) => self
                 .guarded(|| self.sema.to_def2(InFile::new(file, it)))
                 .map(ModuleDef::Function),
@@ -950,7 +1146,9 @@ impl<'a> Extractor<'a> {
                     .map(ModuleDef::Macro)
             }
             _ => None,
-        }
+        };
+        self.profile.finish(Kind::ResolveDef, start);
+        def
     }
 
     /// The canonical path of a trait, in a member crate or outside the project.
@@ -1025,7 +1223,7 @@ impl<'a> Extractor<'a> {
 
     /// The crate of the graph whose `CrateInfo` is at `index`.
     fn resolved(&self, index: usize) -> Option<&ResolvedCrate> {
-        self.crates.iter().find(|crate_| crate_.index == index)
+        (self.member.resolved.index == index).then_some(&self.member.resolved)
     }
 
     /// Whether the item is public API of a library target: `pub`, in a library,
@@ -1090,23 +1288,12 @@ impl<'a> Extractor<'a> {
 
     /// Records the ranges of the code of `module` that is inactive under the
     /// analysed configuration.
-    fn collect_inactive(&mut self, module: Module) {
-        let mut diagnostics = Vec::new();
-        let done = catch_unwind(AssertUnwindSafe(|| {
-            module.diagnostics(self.db, &mut diagnostics, false);
-        }));
-        if done.is_err() {
-            return;
-        }
-        for diagnostic in diagnostics {
-            let AnyDiagnostic::InactiveCode(code) = diagnostic else {
-                continue;
-            };
-            let range = code.node.map(|pointer| pointer.text_range());
-            if let Some(location) = self.locate(range.file_id, range.value) {
-                self.inactive.push(location);
-            }
-        }
+    ///
+    /// The ranges are read after the whole walk, because their query infers the
+    /// types of every body of the module and is best run next to the other
+    /// crates.
+    fn note_module(&mut self, module: Module) {
+        self.modules.push(module);
     }
 
     /// Maps a range that may live in a macro expansion back to the real file.
@@ -1126,6 +1313,17 @@ impl<'a> Extractor<'a> {
 
     /// Turns the syntax of a definition into its source, with a location.
     fn resolve_source<A: AstNode>(
+        &self,
+        source: InFile<(TextRange, Option<A>)>,
+    ) -> Option<Source<A>> {
+        let start = self.profile.start();
+        let result = self.resolve_source_inner(source);
+        self.profile.finish(Kind::Site, start);
+        result
+    }
+
+    /// Turns the syntax of a definition into its source, with a location.
+    fn resolve_source_inner<A: AstNode>(
         &self,
         source: InFile<(TextRange, Option<A>)>,
     ) -> Option<Source<A>> {
@@ -1171,10 +1369,72 @@ impl<'a> Extractor<'a> {
             node: node.clone(),
         });
     }
+}
+
+/// The walks of all member crates, joined into one graph.
+struct Assembler<'a> {
+    /// The database, attached to the current thread.
+    db: &'a dyn HirDatabase,
+    /// The crates of the workspace members, as the database names them.
+    workspace_crates: HashSet<BaseCrate>,
+    /// Maps file ids and ranges to locations.
+    locator: &'a Locator<'a>,
+    /// The workspace, for its member crates and its execution mode.
+    workspace: &'a Workspace,
+    /// The symbols of every crate, before ids are assigned.
+    raws: Vec<Raw>,
+    /// Where each definition's symbol is in [`Assembler::raws`].
+    defs: HashMap<DefKey, usize>,
+    /// The regions the dependency pass walks.
+    containers: Vec<PendingContainer>,
+    /// Records the time spent in each kind of work.
+    profile: Profile,
+}
+
+impl<'a> Assembler<'a> {
+    /// Joins the walks of the member crates, in the order of the crates.
+    fn merge(
+        walks: Vec<Extractor<'a>>,
+        db: &'a dyn HirDatabase,
+        locator: &'a Locator<'a>,
+        workspace: &'a Workspace,
+        workspace_crates: HashSet<BaseCrate>,
+        measure: bool,
+    ) -> Assembler<'a> {
+        let mut assembler = Assembler {
+            db,
+            workspace_crates,
+            locator,
+            workspace,
+            raws: Vec::new(),
+            defs: HashMap::new(),
+            containers: Vec::new(),
+            profile: Profile::new(measure),
+        };
+        for walk in walks {
+            let offset = assembler.raws.len();
+            assembler.profile.merge(&walk.profile);
+            for mut raw in walk.raws {
+                if let Some(parent) = raw.parent {
+                    raw.parent = Some(parent + offset);
+                }
+                assembler.raws.push(raw);
+            }
+            for (key, index) in walk.defs {
+                assembler.defs.insert(key, index + offset);
+            }
+            for mut pending in walk.containers {
+                pending.raw += offset;
+                assembler.containers.push(pending);
+            }
+        }
+        assembler
+    }
 
     /// Assigns the ids, builds the symbols and the `Contains` edges, and hands
     /// the result to the dependency-edge pass.
-    fn finish(mut self) -> RevisionGraph {
+    fn finish(self, mut inactive: Vec<Location>, pass: Duration) -> (RevisionGraph, ExtractReport) {
+        sort_locations(&mut inactive);
         let mut order: Vec<usize> = (0..self.raws.len()).collect();
         order.sort_by(|&left, &right| raw_key(&self.raws[left]).cmp(&raw_key(&self.raws[right])));
 
@@ -1240,9 +1500,6 @@ impl<'a> Extractor<'a> {
             })
             .collect();
 
-        let mut inactive = std::mem::take(&mut self.inactive);
-        sort_locations(&mut inactive);
-
         let mut graph = RevisionGraph {
             crates: self
                 .workspace
@@ -1257,20 +1514,37 @@ impl<'a> Extractor<'a> {
             restricted: self.workspace.restricted,
         };
 
-        let output = edges::collect(EdgeInput {
-            db: self.db,
-            sema: &self.sema,
-            symbols: &table,
-            locate: self.locator,
-            graph: &graph,
-            containers: &containers,
-            inactive: &graph.inactive,
-        });
+        let sema = Semantics::new_dyn(self.db);
+        let edge_started = Instant::now();
+        let (output, stats) = edges::collect(
+            EdgeInput {
+                db: self.db,
+                sema: &sema,
+                symbols: &table,
+                locate: self.locator,
+                graph: &graph,
+                workspace_crates: &self.workspace_crates,
+                containers: &containers,
+                inactive: &graph.inactive,
+            },
+            self.profile.enabled(),
+        );
+        let edge_pass = edge_started.elapsed();
+        let merge_started = Instant::now();
         graph.edges = edges;
         graph.edges.extend(output.edges);
         edges::sort_edges(&mut graph.edges);
         graph.unresolved = output.unresolved;
-        graph
+        let merge = merge_started.elapsed();
+        self.profile.merge(&stats.profile);
+        let report = ExtractReport {
+            pipeline_pass: pass.as_secs_f64(),
+            edge_pass: edge_pass.as_secs_f64(),
+            merge: merge.as_secs_f64(),
+            files: stats.files,
+            phases: self.profile.phases(),
+        };
+        (graph, report)
     }
 }
 
@@ -1334,17 +1608,20 @@ fn field_type(source: &FieldSource) -> Option<SyntaxNode> {
 
 /// The hashes of a macro definition, which is either the macro itself or, for a
 /// procedural macro, the function that implements it.
-fn macro_source_hashes<A: AstNode>(source: &Source<A>) -> Hashes {
+fn macro_source_hashes<A: AstNode>(source: &Source<A>, profile: &Profile) -> Hashes {
     let Some(node) = source.syntax() else {
         return Hashes::none();
     };
-    if let Some(item) = ast::Macro::cast(node.clone()) {
-        return symbols::macro_hashes(&item);
-    }
-    if let Some(item) = ast::Fn::cast(node.clone()) {
-        return symbols::function_hashes(&item);
-    }
-    Hashes::none()
+    let start = profile.start();
+    let hashes = if let Some(item) = ast::Macro::cast(node.clone()) {
+        symbols::macro_hashes(&item)
+    } else if let Some(item) = ast::Fn::cast(node.clone()) {
+        symbols::function_hashes(&item)
+    } else {
+        Hashes::none()
+    };
+    profile.finish(Kind::Hashes, start);
+    hashes
 }
 
 /// Collects the items declared directly in `node`, without descending into the

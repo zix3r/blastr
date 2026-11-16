@@ -4,10 +4,9 @@
 //! inside them; the graph wants a [`Location`] with a path relative to the
 //! repository root and 1-based line numbers.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use blastr_model::{Location, RelPath, Span};
 use ra_ap_hir::{HirFileId, InFile};
@@ -47,14 +46,22 @@ impl LineMap {
 /// Files outside the repository root (the standard library, dependencies in the
 /// Cargo registry) have no relative path and therefore no location: nothing in
 /// the graph ever points at them.
+///
+/// One locator serves every worker of an extraction, so the line maps it builds
+/// are shared behind a lock: a worker looks up the map of a file once and keeps
+/// its own reference to it.
 pub(crate) struct Locator<'a> {
     /// Where the file texts come from.
     db: &'a dyn SourceDatabase,
-    /// The repository-relative path of every file in the virtual file system.
-    paths: HashMap<FileId, Option<RelPath>>,
+    /// The repository-relative path of every file in the virtual file system,
+    /// shared with the locators of the workers.
+    paths: Arc<Paths>,
     /// The line maps of the files that were asked about, built on first use.
-    lines: RefCell<HashMap<FileId, Rc<LineMap>>>,
+    lines: Mutex<HashMap<FileId, Arc<LineMap>>>,
 }
+
+/// The repository-relative path of every file of the virtual file system.
+pub(crate) type Paths = HashMap<FileId, Option<RelPath>>;
 
 impl<'a> Locator<'a> {
     /// Records the relative path of every file of `vfs`.
@@ -81,8 +88,22 @@ impl<'a> Locator<'a> {
         }
         Locator {
             db,
+            paths: Arc::new(paths),
+            lines: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The paths of every file, for building the locator of a worker thread.
+    pub(crate) fn paths(&self) -> Arc<Paths> {
+        Arc::clone(&self.paths)
+    }
+
+    /// A locator for `db` over `paths`, which it shares with other locators.
+    pub(crate) fn with_paths(db: &'a dyn SourceDatabase, paths: Arc<Paths>) -> Locator<'a> {
+        Locator {
+            db,
             paths,
-            lines: RefCell::new(HashMap::new()),
+            lines: Mutex::new(HashMap::new()),
         }
     }
 
@@ -94,6 +115,13 @@ impl<'a> Locator<'a> {
         let rooted = InFile::new(file, range).original_node_file_range_rooted(self.db);
         let rooted = rooted.into_file_id(self.db);
         self.location_in_file(rooted.file_id, rooted.range)
+    }
+
+    /// The relative path of `file`, or `None` when it lies outside the root or
+    /// is a macro expansion.
+    pub(crate) fn file_path(&self, file: HirFileId) -> Option<RelPath> {
+        let file = file.file_id()?.file_id(self.db);
+        self.paths.get(&file)?.clone()
     }
 
     /// The location of `range`, which is already known to be in the real file
@@ -120,14 +148,15 @@ impl<'a> Locator<'a> {
         })
     }
 
-    fn line_map(&self, file: FileId) -> Rc<LineMap> {
-        if let Some(lines) = self.lines.borrow().get(&file) {
-            return Rc::clone(lines);
+    fn line_map(&self, file: FileId) -> Arc<LineMap> {
+        let mut lines = self.lines.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(lines) = lines.get(&file) {
+            return Arc::clone(lines);
         }
         let text = self.db.file_text(file);
-        let lines = Rc::new(LineMap::new(text.text(self.db)));
-        self.lines.borrow_mut().insert(file, Rc::clone(&lines));
-        lines
+        let map = Arc::new(LineMap::new(text.text(self.db)));
+        lines.insert(file, Arc::clone(&map));
+        map
     }
 }
 

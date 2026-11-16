@@ -6,6 +6,7 @@
 //! virtual file system. The build scripts and the procedural-macro server are
 //! only used when the caller allows execution.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::process::Command;
 
@@ -14,8 +15,8 @@ use ra_ap_ide::AnalysisHost;
 use ra_ap_load_cargo::{LoadCargoConfig, ProcMacroServerChoice, ProjectFolders, load_workspace};
 use ra_ap_paths::{AbsPathBuf, Utf8PathBuf};
 use ra_ap_project_model::{
-    CargoConfig, CargoFeatures, ProjectManifest, ProjectWorkspace, ProjectWorkspaceKind,
-    RustLibSource, TargetKind as CargoTargetKind,
+    CargoConfig, CargoFeatures, CargoWorkspace, ProjectManifest, ProjectWorkspace,
+    ProjectWorkspaceKind, RustLibSource, TargetKind as CargoTargetKind,
 };
 use ra_ap_vfs::{FileId, VfsPath};
 
@@ -120,7 +121,7 @@ impl Workspace {
             },
             prefill_caches: false,
             num_worker_threads: 1,
-            proc_macro_processes: 1,
+            proc_macro_processes: PROC_MACRO_PROCESSES,
         };
 
         progress.report("database", 0, None);
@@ -153,6 +154,13 @@ impl Workspace {
         })
     }
 }
+
+/// The number of procedural-macro server processes to run.
+///
+/// Expanding a macro needs the server, and a single server expands one call at
+/// a time, so several of them let the workers of an extraction expand derives
+/// without waiting for each other.
+const PROC_MACRO_PROCESSES: usize = 4;
 
 /// The Cargo features to enable.
 fn features(options: &LoadOptions) -> CargoFeatures {
@@ -212,24 +220,57 @@ fn member_targets(workspace: &ProjectWorkspace) -> Vec<Target> {
     let ProjectWorkspaceKind::Cargo { cargo, .. } = &workspace.kind else {
         return Vec::new();
     };
+    let duplicated = duplicated_package_names(cargo);
     let mut targets = Vec::new();
     for package in cargo.packages() {
         if !cargo[package].is_member {
             continue;
         }
-        for &target in &cargo[package].targets {
-            let data = &cargo[target];
+        let data = &cargo[package];
+        let name = package_selector(
+            &data.name,
+            &data.version.to_string(),
+            duplicated.contains(&data.name),
+        );
+        for &target in &data.targets {
+            let target_data = &cargo[target];
             targets.push(Target {
-                package: cargo[package].name.clone(),
-                target_kind: target_kind(data.kind),
-                target_name: data.name.clone(),
-                name: crate_name(&data.name),
-                root: data.root.clone(),
+                package: name.clone(),
+                target_kind: target_kind(target_data.kind),
+                target_name: target_data.name.clone(),
+                name: crate_name(&target_data.name),
+                root: target_data.root.clone(),
             });
         }
     }
     targets.sort_by(|left, right| target_key(left).cmp(&target_key(right)));
     targets
+}
+
+/// The names of the packages that more than one package of the project has.
+///
+/// A dependency and a member may share a name, and a package may appear twice at
+/// two versions; Cargo then needs the version to tell them apart.
+fn duplicated_package_names(cargo: &CargoWorkspace) -> HashSet<String> {
+    let mut seen = HashSet::new();
+    let mut duplicated = HashSet::new();
+    for package in cargo.packages() {
+        let name = &cargo[package].name;
+        if !seen.insert(name.clone()) {
+            duplicated.insert(name.clone());
+        }
+    }
+    duplicated
+}
+
+/// How Cargo is asked for a package: its name, or `name@version` when more than
+/// one package of the project has that name.
+fn package_selector(name: &str, version: &str, duplicated: bool) -> String {
+    if duplicated {
+        format!("{name}@{version}")
+    } else {
+        name.to_owned()
+    }
 }
 
 type TargetKey<'a> = (&'a str, u8, &'a str, &'a str, &'a str);
@@ -332,13 +373,24 @@ fn path_text(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{crate_name, kind_rank};
+    use super::{crate_name, kind_rank, package_selector};
     use blastr_model::TargetKind;
 
     #[test]
     fn crate_names_use_underscores() {
         assert_eq!(crate_name("x01_direct_call"), "x01_direct_call");
         assert_eq!(crate_name("my-crate"), "my_crate");
+    }
+
+    #[test]
+    fn a_unique_package_name_needs_no_version() {
+        assert_eq!(package_selector("serde", "1.0.0", false), "serde");
+    }
+
+    #[test]
+    fn a_duplicated_package_name_carries_its_version() {
+        assert_eq!(package_selector("gix", "0.90.0", true), "gix@0.90.0");
+        assert_eq!(package_selector("gix", "1.0.0", true), "gix@1.0.0");
     }
 
     #[test]

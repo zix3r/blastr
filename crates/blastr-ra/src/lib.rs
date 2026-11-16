@@ -13,6 +13,8 @@
 //! - `load` discovers and loads the Cargo project,
 //! - `apply` brings edits of the source files into the loaded project,
 //! - `extract` walks the loaded crates and assembles the graph,
+//! - `pipeline` runs the phases of an extraction on several threads,
+//! - `stats` times the phases of an extraction when a caller asks for it,
 //! - `symbols` turns one rust-analyzer definition into one symbol,
 //! - `paths` builds the canonical paths,
 //! - `hashing` hashes syntax tokens,
@@ -28,6 +30,8 @@ mod hashing;
 mod load;
 mod locate;
 mod paths;
+mod pipeline;
+mod stats;
 mod symbols;
 
 use std::path::PathBuf;
@@ -42,6 +46,8 @@ use ra_ap_vfs::Vfs;
 use unicode_properties as _;
 
 use crate::load::MemberCrate;
+
+pub use crate::stats::{ExtractReport, FileTiming, PhaseTiming};
 
 /// The version of the rust-analyzer libraries this build uses.
 pub const RUST_ANALYZER_VERSION: &str = "0.0.358";
@@ -59,6 +65,19 @@ pub struct LoadOptions {
     pub exec: ExecMode,
     /// Value for `CARGO_TARGET_DIR` while loading; `None` leaves Cargo's default.
     pub target_dir: Option<PathBuf>,
+}
+
+/// How an extraction runs.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ExtractOptions {
+    /// The number of worker threads that walk the files; `None` uses the number
+    /// of cores the machine has.
+    pub threads: Option<usize>,
+    /// Whether to record an [`ExtractReport`] of the run.
+    ///
+    /// Recording costs a clock reading per query, so it is meant for timing a
+    /// project rather than for production runs.
+    pub measure: bool,
 }
 
 /// Everything that can go wrong while loading or extracting a project.

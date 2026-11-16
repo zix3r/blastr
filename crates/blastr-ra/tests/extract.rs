@@ -785,6 +785,39 @@ pub fn is_busy(state: &State) -> bool {
         _ => false,
     }
 }
+
+/// Matches on its argument from a macro of this crate.
+macro_rules! pick {
+    ($state:expr) => {
+        match $state {
+            State::Idle => 0,
+            _ => 1,
+        }
+    };
+}
+
+/// Matches inside the expansion of a macro of this crate.
+pub fn picked(state: State) -> u8 {
+    pick!(state)
+}
+
+/// Matches from the standard library
+/// `matches!` macro.
+pub fn idle(state: State) -> bool {
+    matches!(state, State::Idle)
+}
+
+/// Matches inside an assertion of the standard library.
+pub fn checked(state: State) -> u8 {
+    debug_assert!(matches!(state, State::Idle));
+    0
+}
+
+/// Matches in the argument of a macro of the standard library.
+pub fn counted_state(state: State) -> u8 {
+    assert_eq!(match state { State::Idle => 0, _ => 1 }, 0);
+    0
+}
 "#;
 
 #[test]
@@ -822,6 +855,7 @@ fn macro_invocations_and_rest_patterns_carry_their_details() {
         [
             ("impact::doubled", "impact::twice"),
             ("impact::doubled_increment", "impact::twice"),
+            ("impact::picked", "impact::pick"),
             ("impact::quadrupled", "impact::four_times"),
             ("impact::quadrupled", "impact::twice"),
         ],
@@ -985,6 +1019,51 @@ fn macro_invocations_and_rest_patterns_carry_their_details() {
         &graph,
         "impact::is_busy",
         "impact::State::Busy",
+        EdgeKind::Matches,
+        EdgeDetail::MatchWildcard,
+    );
+
+    // A `match` a macro of this crate writes is still a choice of this crate.
+    edge(
+        &graph,
+        "impact::picked",
+        "impact::State",
+        EdgeKind::Matches,
+        EdgeDetail::MatchWildcard,
+    );
+    edge(
+        &graph,
+        "impact::picked",
+        "impact::State::Idle",
+        EdgeKind::Matches,
+        EdgeDetail::MatchWildcard,
+    );
+
+    // A `match` that a macro of another crate writes has no catch-all detail:
+    // its arms are the macro's, not the user's.
+    for function in ["impact::idle", "impact::checked"] {
+        edge(
+            &graph,
+            function,
+            "impact::State::Idle",
+            EdgeKind::Matches,
+            EdgeDetail::None,
+        );
+    }
+
+    // A `match` the user wrote in the argument of another crate's macro keeps
+    // the detail of the `match` it is.
+    edge(
+        &graph,
+        "impact::counted_state",
+        "impact::State",
+        EdgeKind::Matches,
+        EdgeDetail::MatchWildcard,
+    );
+    edge(
+        &graph,
+        "impact::counted_state",
+        "impact::State::Idle",
         EdgeKind::Matches,
         EdgeDetail::MatchWildcard,
     );
