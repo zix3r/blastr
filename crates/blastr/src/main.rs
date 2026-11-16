@@ -84,6 +84,11 @@ fn run(cli: Cli) -> Result<Exit, blastr_core::Error> {
             commands::impact::run(&globals, &symbol, assume)
         }
         Some(Command::Explain { symbol, revs }) => commands::explain::run(&globals, &symbol, &revs),
+        Some(Command::Watch {
+            rev,
+            interval,
+            clear,
+        }) => commands::watch::run(&globals, rev.as_deref(), interval, clear),
     }
 }
 

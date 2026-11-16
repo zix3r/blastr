@@ -13,6 +13,7 @@ pub mod explain;
 pub mod impact;
 pub mod index;
 pub mod tests;
+pub mod watch;
 
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};

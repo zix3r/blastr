@@ -125,6 +125,18 @@ pub enum Command {
         #[command(subcommand)]
         command: CacheCommand,
     },
+    /// Keep the analysis of the working tree up to date as files are saved
+    Watch {
+        /// Revision to compare the working tree with
+        #[arg(value_name = "REV")]
+        rev: Option<String>,
+        /// Milliseconds to wait between checks for a saved file
+        #[arg(long, value_name = "MS", default_value_t = 300)]
+        interval: u64,
+        /// Clear the screen before each report; on by default when the output is a terminal
+        #[arg(long)]
+        clear: bool,
+    },
     /// Open the GUI on a repository
     Gui {
         /// Directory of the repository

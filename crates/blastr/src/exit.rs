@@ -1,4 +1,4 @@
-//! Process exit codes.
+//! Process exit codes for the command line.
 
 /// The codes blastr exits with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

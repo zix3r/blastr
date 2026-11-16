@@ -58,6 +58,7 @@ fn help_lists_every_command() {
         "impact",
         "explain",
         "index",
+        "watch",
         "cache",
         "gui",
         "completions",
@@ -94,7 +95,7 @@ fn help_lists_global_options() {
 
 #[test]
 fn every_analysis_command_has_help() {
-    for command in ["analyze", "tests", "impact", "explain"] {
+    for command in ["analyze", "tests", "impact", "explain", "watch"] {
         blastr()
             .args([command, "--help"])
             .assert()
@@ -111,6 +112,7 @@ fn the_analysis_commands_fail_outside_a_repository() {
         &["tests"][..],
         &["impact", "crate::foo"][..],
         &["explain", "crate::foo"][..],
+        &["watch"][..],
     ] {
         let temp = tempfile::tempdir().expect("create a temporary directory");
         blastr()
