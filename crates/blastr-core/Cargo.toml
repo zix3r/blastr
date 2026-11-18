@@ -1,6 +1,6 @@
 [package]
 name = "blastr-core"
-description = "Analysis pipeline for Blastr"
+description = "Internal crate of Blastr (the analysis pipeline); not a stable API"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -20,6 +20,7 @@ postcard.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 similar.workspace = true
+tracing.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 zstd.workspace = true

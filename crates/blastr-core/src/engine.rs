@@ -32,7 +32,9 @@ const UNKNOWN_TOOLCHAIN: &str = "unknown";
 ///
 /// Cached graphs and results are keyed by it. The version alone would let a
 /// rebuilt executable of the same version read what older logic computed.
-fn build_id() -> &'static str {
+/// The window also reads it from the engine's handshake, so that two programs
+/// from different builds are refused instead of misunderstood.
+pub fn build_id() -> &'static str {
     static BUILD_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     BUILD_ID.get_or_init(|| {
         let version = env!("CARGO_PKG_VERSION");
@@ -97,6 +99,23 @@ struct Sides {
     head: Arc<RevisionGraph>,
     /// The cache key of the head graph; `None` when the source has no content id.
     head_key: Option<AnalysisKey>,
+    /// The procedural-macro crates the graphs may be missing, sorted and
+    /// without duplicates; empty when every macro the extracted code calls
+    /// loaded.
+    missing_macros: Vec<String>,
+}
+
+/// One graph as [`Engine::graph_for`] produced it.
+pub(crate) struct FetchedGraph {
+    /// The graph.
+    pub(crate) graph: Arc<RevisionGraph>,
+    /// The cache key it belongs to; `None` when the source has no content id.
+    pub(crate) key: Option<AnalysisKey>,
+    /// Whether the graph came from the cache.
+    pub(crate) from_cache: bool,
+    /// The procedural-macro crates the graph may be missing knowledge of,
+    /// sorted and without duplicates.
+    pub(crate) missing_macros: Vec<String>,
 }
 
 /// Everything one attempt at building both graphs from a single project load
@@ -225,6 +244,33 @@ impl Engine {
         progress: &dyn Progress,
         cancel: &CancelToken,
     ) -> Result<Analysis> {
+        self.analyze_with(
+            repo_root,
+            spec,
+            options,
+            params,
+            progress,
+            cancel,
+            &mut |_| {},
+        )
+    }
+
+    /// The same as [`Engine::analyze`], handing over the classified changes as
+    /// soon as they are known and before the impact is traced.
+    ///
+    /// `on_changes` is not called when the whole analysis comes from the
+    /// result cache, because then nothing arrives in steps.
+    #[allow(clippy::too_many_arguments)]
+    pub fn analyze_with(
+        &self,
+        repo_root: &Path,
+        spec: &RevSpec,
+        options: &AnalysisOptions,
+        params: &AnalysisParams,
+        progress: &dyn Progress,
+        cancel: &CancelToken,
+        on_changes: &mut dyn FnMut(&DiffResult),
+    ) -> Result<Analysis> {
         cancel.check()?;
         let root = blastr_git::discover(repo_root)?;
         let repo = Repo::open(&root)?;
@@ -266,6 +312,7 @@ impl Engine {
             progress,
             cancel,
         })?;
+        on_changes(&compared.diff);
 
         progress.report("impact", 0, None);
         let ignore = IgnoreSet::new(&params.ignore)?;
@@ -288,7 +335,11 @@ impl Engine {
             limits: output.limits,
             params: params.clone(),
         };
-        if let Some(key_hash) = &key_hash {
+        if let Some(key_hash) = &key_hash
+            // An incomplete analysis may not be the answer of a later run, so
+            // it is not stored: the next run tries the project again.
+            && !missing_macros(&analysis.diff.limits)
+        {
             self.store
                 .put_result(key_hash, &encode_analysis(&analysis)?)?;
         }
@@ -356,7 +407,7 @@ impl Engine {
         let repo = Repo::open(&root)?;
         let toolchain = toolchain_version(repo.root());
 
-        let (graph, key, _) = self.graph_for(
+        let fetched = self.graph_for(
             Some(&repo),
             &Source::Worktree,
             GraphRequest {
@@ -368,11 +419,20 @@ impl Engine {
             },
         )?;
         cancel.check()?;
+        let graph = fetched.graph;
+        let key = fetched.key;
         let change = crate::impact::whatif::assumed_change(&graph, symbol, assume)?;
         // The working tree is compared with itself, so none of its lines
         // changed and only the limits that come from the repository itself and
         // from unresolved references apply.
-        let limits = collect_limits(Some(&repo), &graph, &[], &BTreeMap::new(), options)?;
+        let limits = collect_limits(
+            Some(&repo),
+            &graph,
+            &[],
+            &BTreeMap::new(),
+            options,
+            &fetched.missing_macros,
+        )?;
 
         progress.report("impact", 0, None);
         let ignore = IgnoreSet::new(&params.ignore)?;
@@ -438,7 +498,7 @@ impl Engine {
             None => {
                 // The two sides are different projects, or one of them is
                 // cached, so each side is loaded on its own.
-                let (base, base_key, _) = self.graph_for(
+                let base = self.graph_for(
                     Some(repo),
                     &comparison.base,
                     GraphRequest {
@@ -450,7 +510,7 @@ impl Engine {
                     },
                 )?;
                 cancel.check()?;
-                let (head, head_key, _) = self.graph_for(
+                let head = self.graph_for(
                     Some(repo),
                     &comparison.head,
                     GraphRequest {
@@ -462,11 +522,13 @@ impl Engine {
                     },
                 )?;
                 cancel.check()?;
+                let missing_macros = union_of(&base.missing_macros, &head.missing_macros);
                 Sides {
-                    base,
-                    base_key,
-                    head,
-                    head_key,
+                    base: base.graph,
+                    base_key: base.key,
+                    head: head.graph,
+                    head_key: head.key,
+                    missing_macros,
                 }
             }
         };
@@ -486,6 +548,7 @@ impl Engine {
             &changed_files,
             &changed_lines,
             options,
+            &sides.missing_macros,
         )?;
 
         Ok(Compared {
@@ -518,29 +581,35 @@ impl Engine {
             head: Source::Dir(head.to_path_buf()),
         };
 
-        let (base_graph, _, _) = self.graph_for(
-            None,
-            &comparison.base,
-            GraphRequest {
-                options,
-                phase: "base",
-                toolchain: None,
-                progress,
-                cancel,
-            },
-        )?;
+        let (base_graph, missing_base) = {
+            let fetched = self.graph_for(
+                None,
+                &comparison.base,
+                GraphRequest {
+                    options,
+                    phase: "base",
+                    toolchain: None,
+                    progress,
+                    cancel,
+                },
+            )?;
+            (fetched.graph, fetched.missing_macros)
+        };
         cancel.check()?;
-        let (head_graph, _, _) = self.graph_for(
-            None,
-            &comparison.head,
-            GraphRequest {
-                options,
-                phase: "head",
-                toolchain: None,
-                progress,
-                cancel,
-            },
-        )?;
+        let (head_graph, missing_head) = {
+            let fetched = self.graph_for(
+                None,
+                &comparison.head,
+                GraphRequest {
+                    options,
+                    phase: "head",
+                    toolchain: None,
+                    progress,
+                    cancel,
+                },
+            )?;
+            (fetched.graph, fetched.missing_macros)
+        };
         cancel.check()?;
 
         progress.report("classify", 0, None);
@@ -552,7 +621,15 @@ impl Engine {
         );
         changes.extend(manifest_changes_of_dirs(base, head, &changed_files)?);
         let changed_lines = self.changed_lines_of(None, &comparison, &changed_files)?;
-        let limits = collect_limits(None, &head_graph, &changed_files, &changed_lines, options)?;
+        let missing_macros = union_of(&missing_base, &missing_head);
+        let limits = collect_limits(
+            None,
+            &head_graph,
+            &changed_files,
+            &changed_lines,
+            options,
+            &missing_macros,
+        )?;
 
         Ok(DiffOutput {
             result: DiffResult {
@@ -590,7 +667,7 @@ impl Engine {
         let comparison = repo.resolve(&spec)?;
         let toolchain = toolchain_version(repo.root());
 
-        let (graph, key, from_cache) = self.graph_for(
+        let fetched = self.graph_for(
             Some(&repo),
             &comparison.head,
             GraphRequest {
@@ -601,21 +678,53 @@ impl Engine {
                 cancel,
             },
         )?;
-        let Some(key) = key else {
+        let Some(key) = fetched.key else {
             // Every source `Repo::resolve` produces has a content id, so the
             // graph of a revision always has a key.
             return Err(Error::Ra(blastr_ra::Error::Internal(
                 "the indexed revision has no content identifier".to_owned(),
             )));
         };
+        let graph = fetched.graph;
 
         Ok(IndexReport {
             key,
-            from_cache,
+            from_cache: fetched.from_cache,
             symbols: graph.symbols.len(),
             edges: graph.edges.len(),
             unresolved: graph.unresolved.len(),
         })
+    }
+
+    /// The graph of one side of a comparison, from the cache when the same
+    /// content was analysed before.
+    ///
+    /// This is what a front end searches for symbols in; after an analysis of
+    /// the same side it only costs reading the cached graph.
+    pub fn graph(
+        &self,
+        repo_root: &Path,
+        source: &Source,
+        options: &AnalysisOptions,
+        progress: &dyn Progress,
+        cancel: &CancelToken,
+    ) -> Result<Arc<RevisionGraph>> {
+        cancel.check()?;
+        let root = blastr_git::discover(repo_root)?;
+        let repo = Repo::open(&root)?;
+        let toolchain = toolchain_version(repo.root());
+        let fetched = self.graph_for(
+            Some(&repo),
+            source,
+            GraphRequest {
+                options,
+                phase: "head",
+                toolchain: Some(toolchain.as_str()),
+                progress,
+                cancel,
+            },
+        )?;
+        Ok(fetched.graph)
     }
 
     /// Summarises what the cache holds and where it lives.
@@ -650,10 +759,14 @@ impl Engine {
     /// Loads the graph of one side of a comparison, from the cache when the
     /// same content was analysed before.
     ///
-    /// Returns the graph, the analysis key it was stored under (`None` when
-    /// the source has no content id, which is the case for a plain directory
-    /// and for a working tree without a repository) and whether it came from
-    /// the cache.
+    /// The returned graph, its analysis key (`None` when the source has no
+    /// content id, which is the case for a plain directory and for a working
+    /// tree without a repository), whether it came from the cache and the
+    /// procedural-macro crates it may be missing.
+    ///
+    /// A graph made from a project whose macros did not all load is not stored:
+    /// an incomplete graph may not be the answer of a later run, which has a
+    /// chance of building the macros or of the server starting properly.
     ///
     /// `toolchain` is the toolchain version to record in the key; it is only
     /// read when a key is built.
@@ -662,7 +775,7 @@ impl Engine {
         repo: Option<&Repo>,
         source: &Source,
         request: GraphRequest<'_>,
-    ) -> Result<(Arc<RevisionGraph>, Option<AnalysisKey>, bool)> {
+    ) -> Result<FetchedGraph> {
         let GraphRequest {
             options,
             phase,
@@ -677,7 +790,14 @@ impl Engine {
             && let Some(bytes) = self.store.get_graph(&key.hash())?
             && let Ok(graph) = decode_graph(&bytes)
         {
-            return Ok((Arc::new(graph), Some(key.clone()), true));
+            return Ok(FetchedGraph {
+                graph: Arc::new(graph),
+                key: Some(key.clone()),
+                from_cache: true,
+                // An incomplete graph is never stored, so what came back is
+                // complete whatever the machine that produced it could build.
+                missing_macros: Vec::new(),
+            });
         }
 
         progress.report("snapshot", 0, None);
@@ -690,7 +810,7 @@ impl Engine {
         progress.report(&format!("load {phase}"), 0, None);
         // The workspace lives in this block so that it is dropped before the
         // next side is loaded: only one project is in memory at a time.
-        let graph = {
+        let (graph, missing_macros) = {
             let workspace = blastr_ra::Workspace::load(
                 &root_dir,
                 &manifest_dir,
@@ -699,12 +819,20 @@ impl Engine {
                 cancel,
             )?;
             cancel.check()?;
+            let missing_macros = workspace.missing_proc_macros().to_vec();
             progress.report(&format!("extract {phase}"), 0, None);
-            workspace.extract(progress, cancel)?
+            (workspace.extract(progress, cancel)?, missing_macros)
         };
 
-        self.store_graph(&key, &graph)?;
-        Ok((Arc::new(graph), key, false))
+        if missing_macros.is_empty() {
+            self.store_graph(&key, &graph)?;
+        }
+        Ok(FetchedGraph {
+            graph: Arc::new(graph),
+            key,
+            from_cache: false,
+            missing_macros,
+        })
     }
 
     /// The two graphs of one comparison, with the head reached by applying the
@@ -758,7 +886,7 @@ impl Engine {
 
         // One project load, two extractions; the workspace is dropped before
         // the graphs are stored so that it does not stay in memory.
-        let (base, head) = {
+        let (base, head, missing_macros) = {
             progress.report("load base", 0, None);
             let mut workspace = blastr_ra::Workspace::load(
                 &root_dir,
@@ -768,6 +896,7 @@ impl Engine {
                 cancel,
             )?;
             cancel.check()?;
+            let missing_macros = workspace.missing_proc_macros().to_vec();
             progress.report("extract base", 0, None);
             let base = workspace.extract(progress, cancel)?;
             cancel.check()?;
@@ -778,16 +907,21 @@ impl Engine {
             progress.report("extract head", 0, None);
             let head = workspace.extract(progress, cancel)?;
             cancel.check()?;
-            (base, head)
+            (base, head, missing_macros)
         };
 
-        self.store_graph(&base_key, &base)?;
-        self.store_graph(&head_key, &head)?;
+        // One project made both graphs, so what its macros could not expand is
+        // missing from both; neither may be cached in that case.
+        if missing_macros.is_empty() {
+            self.store_graph(&base_key, &base)?;
+            self.store_graph(&head_key, &head)?;
+        }
         Ok(Some(Sides {
             base: Arc::new(base),
             base_key,
             head: Arc::new(head),
             head_key,
+            missing_macros,
         }))
     }
 
@@ -1071,7 +1205,7 @@ pub struct IndexReport {
 
 /// What the cache holds and where it lives: revision graphs, the analyses
 /// computed from them, materialised snapshots and the database itself.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CacheStatus {
     /// Number of cached graphs.
     pub graphs: u64,
@@ -1248,11 +1382,13 @@ fn collect_limits(
     _changed_files: &[ChangedFile],
     changed_lines: &BTreeMap<RelPath, Vec<RangeInclusive<u32>>>,
     options: &AnalysisOptions,
+    missing_macros: &[String],
 ) -> Result<Vec<Limit>> {
     let mut limits = Vec::new();
     if options.exec == ExecMode::Restricted {
         limits.push(Limit::Restricted);
     }
+    limits.extend(macros_limit(missing_macros));
     if let Some(repo) = repo
         && repo.has_submodules()?
     {
@@ -1282,6 +1418,37 @@ fn collect_limits(
             .map(Limit::ChangedButInactive),
     );
     Ok(limits)
+}
+
+/// The limit for procedural-macro crates whose macros the extracted code calls
+/// but did not get, if there are any.
+pub(crate) fn macros_limit(missing: &[String]) -> Option<Limit> {
+    if missing.is_empty() {
+        return None;
+    }
+    let mut crates = missing.to_vec();
+    crates.sort();
+    crates.dedup();
+    Some(Limit::MacrosNotExpanded { crates })
+}
+
+/// Whether a result is incomplete because procedural macros did not expand.
+///
+/// Such a result may never be cached: it is not an answer, it is what could be
+/// made of a project whose macros the environment could not build.
+fn missing_macros(limits: &[Limit]) -> bool {
+    limits
+        .iter()
+        .any(|limit| matches!(limit, Limit::MacrosNotExpanded { .. }))
+}
+
+/// The union of two lists of crates that did not bring their macros, sorted and
+/// without duplicates.
+pub(crate) fn union_of(left: &[String], right: &[String]) -> Vec<String> {
+    let mut union: Vec<String> = left.iter().chain(right).cloned().collect();
+    union.sort();
+    union.dedup();
+    union
 }
 
 /// Number and total size of the subdirectories of `dir`.
@@ -1329,12 +1496,82 @@ fn directory_size(dir: &Path) -> Result<u64> {
 }
 
 /// Removes a directory tree; a directory that does not exist is not an error.
+///
+/// A cache holds what other tools left there: `CARGO_TARGET_DIR` is written by
+/// Cargo, and a checkout can mark files read-only. Windows refuses to delete a
+/// read-only file, and `remove_dir_all` then fails with `Access is denied` for
+/// the whole tree, so the attribute is cleared entry by entry before the
+/// removal is tried again. When an entry still cannot be removed, the error
+/// names it, because "Access is denied" alone does not say what held the file.
 fn remove_dir_if_present(dir: &Path) -> Result<()> {
     match std::fs::remove_dir_all(dir) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(Error::Io(error)),
+        Err(_) => match remove_dir_forcibly(dir) {
+            Ok(()) => Ok(()),
+            Err((_path, error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err((path, error)) => Err(Error::RemoveDir {
+                path,
+                message: error.to_string(),
+            }),
+        },
     }
+}
+
+/// Removes a directory tree, clearing read-only attributes on the way.
+///
+/// The tree is walked first and deleted afterwards, deepest directory last, so
+/// that a directory is only removed once it is empty. `Err` holds the path that
+/// failed together with the error the system reported for it.
+fn remove_dir_forcibly(dir: &Path) -> std::result::Result<(), (PathBuf, std::io::Error)> {
+    let mut directories = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let entries = std::fs::read_dir(&directory).map_err(|error| (directory.clone(), error))?;
+        directories.push(directory.clone());
+        for entry in entries {
+            let entry = entry.map_err(|error| (directory.clone(), error))?;
+            let path = entry.path();
+            let file_type = entry.file_type().map_err(|error| (path.clone(), error))?;
+            if file_type.is_dir() {
+                pending.push(path);
+            } else {
+                remove_file_forcibly(&path)?;
+            }
+        }
+    }
+    for directory in directories.iter().rev() {
+        std::fs::remove_dir(directory).map_err(|error| (directory.clone(), error))?;
+    }
+    Ok(())
+}
+
+/// Removes one file, clearing a read-only attribute that would stop it.
+fn remove_file_forcibly(path: &Path) -> std::result::Result<(), (PathBuf, std::io::Error)> {
+    let failed = |error| (path.to_path_buf(), error);
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            clear_read_only(path).map_err(failed)?;
+            std::fs::remove_file(path).map_err(failed)
+        }
+    }
+}
+
+/// Clears the read-only attribute of `path`, if it has one.
+///
+/// This is the one place `set_readonly(false)` is meant: the lint that warns
+/// about it guards against clearing the *write* permission a Unix mode needs,
+/// which is not what the call is for here. Windows has no other standard way to
+/// clear the file attribute that stops a deletion.
+#[allow(clippy::permissions_set_readonly_false)]
+fn clear_read_only(path: &Path) -> std::io::Result<()> {
+    let mut permissions = std::fs::metadata(path)?.permissions();
+    if permissions.readonly() {
+        permissions.set_readonly(false);
+        std::fs::set_permissions(path, permissions)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1405,6 +1642,40 @@ mod tests {
         assert_eq!(engine.cache_status().unwrap().graphs, 0);
         assert_eq!(engine.cache_status().unwrap().results, 0);
         assert_eq!(engine.cache_status().unwrap().snapshots, 0);
+    }
+
+    #[test]
+    fn clear_removes_a_tree_of_read_only_files() {
+        // Cargo and a Git checkout both leave read-only entries behind, and
+        // Windows refuses to delete those until the attribute is cleared.
+        let dir = tempfile::tempdir().unwrap();
+        let store = blastr_store::Store::open_in_memory().unwrap();
+        let paths = paths_under(dir.path());
+        let snapshot = paths.snapshots_dir().join("4f2a91c").join(".git");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        let pack = snapshot.join("pack.idx");
+        std::fs::write(&pack, b"pack").unwrap();
+        let mut permissions = std::fs::metadata(&pack).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&pack, permissions).unwrap();
+
+        let engine = Engine::with_store_and_paths(store, paths.clone());
+        engine.cache_clear().unwrap();
+
+        assert!(!paths.snapshots_dir().exists());
+    }
+
+    #[test]
+    fn a_failed_removal_names_the_file() {
+        let error = Error::RemoveDir {
+            path: PathBuf::from("C:/cache/target/debug/locked.rlib"),
+            message: "Access is denied. (os error 5)".to_owned(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "cannot remove `C:/cache/target/debug/locked.rlib`: Access is denied. (os error 5)"
+        );
+        assert!(error.hint().is_some());
     }
 
     /// An analysis key with the fields fixed so that only `source` varies.

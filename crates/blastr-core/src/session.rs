@@ -1,6 +1,6 @@
 //! A long-lived analysis of one working tree, refreshed as files change.
 //!
-//! A fresh `blastr analyze` has to load the project, prime rust-analyzer's
+//! A fresh analysis has to load the project, prime rust-analyzer's
 //! queries and extract every file before it can say anything. That is fine for
 //! a single run and far too slow for the edit-save loop, in which a developer
 //! changes a line and wants the impact back. A [`Session`] pays those costs
@@ -17,7 +17,9 @@ use blastr_model::{
 };
 
 use crate::config::IgnoreSet;
-use crate::engine::{Engine, GraphRequest, manifest_changes_of_repo, toolchain_version};
+use crate::engine::{
+    Engine, GraphRequest, macros_limit, manifest_changes_of_repo, toolchain_version, union_of,
+};
 use crate::error::{Error, Result};
 use crate::impact::ImpactInput;
 
@@ -29,6 +31,19 @@ pub struct Refresh {
     /// Files that differ from the base side, whether or not they changed since
     /// the previous refresh.
     pub changed_files: usize,
+}
+
+/// What a session is opened on.
+#[derive(Debug, Clone, Copy)]
+pub struct SessionRequest<'a> {
+    /// Any directory inside the repository.
+    pub repo_root: &'a Path,
+    /// The comparison to watch; its newer side must be the working tree.
+    pub spec: &'a RevSpec,
+    /// Configuration to analyse the project under.
+    pub options: &'a AnalysisOptions,
+    /// The parameters of the impact analysis.
+    pub params: &'a AnalysisParams,
 }
 
 /// One working tree kept loaded for repeated analysis.
@@ -47,6 +62,10 @@ pub struct Session {
     head: Arc<RevisionGraph>,
     head_key: Option<AnalysisKey>,
     workspace: blastr_ra::Workspace,
+    /// The procedural-macro crates the loaded project could not use, sorted and
+    /// without duplicates. They do not change while the session lives, because
+    /// the project is not loaded again.
+    missing_macros: Vec<String>,
     analysis: Analysis,
     seen: String,
 }
@@ -60,6 +79,16 @@ impl Session {
     /// The two sides being compared.
     pub fn comparison(&self) -> &Comparison {
         &self.comparison
+    }
+
+    /// The graph of the base side.
+    pub fn base_graph(&self) -> &Arc<RevisionGraph> {
+        &self.base
+    }
+
+    /// The graph of the working tree as it was last refreshed.
+    pub fn head_graph(&self) -> &Arc<RevisionGraph> {
+        &self.head
     }
 
     /// Whether the base side moved since the session was opened.
@@ -91,6 +120,20 @@ impl Session {
     /// Files that no longer differ from the base side get their base text back,
     /// so reverting an edit is handled like any other edit.
     pub fn refresh(&mut self, progress: &dyn Progress, cancel: &CancelToken) -> Result<Refresh> {
+        self.refresh_with(progress, cancel, &mut |_| {})
+    }
+
+    /// The same as [`Session::refresh`], handing over the classified changes
+    /// as soon as they are known and before the impact is traced.
+    ///
+    /// A front end that shows results as they arrive lists the changes from
+    /// `on_changes` while the rest is still being computed.
+    pub fn refresh_with(
+        &mut self,
+        progress: &dyn Progress,
+        cancel: &CancelToken,
+        on_changes: &mut dyn FnMut(&DiffResult),
+    ) -> Result<Refresh> {
         cancel.check()?;
         let repo = Repo::open(&self.root)?;
         let changed_files = repo.changed_files(&self.comparison)?;
@@ -123,8 +166,9 @@ impl Session {
             head_key: self.head_key.clone(),
             changed_files,
             changes,
-            limits: Vec::new(),
+            limits: macros_limit(&self.missing_macros).into_iter().collect(),
         };
+        on_changes(&diff);
 
         progress.report("impact", 0, None);
         let output = crate::impact::analyze(
@@ -209,6 +253,34 @@ impl Engine {
         progress: &dyn Progress,
         cancel: &CancelToken,
     ) -> Result<Session> {
+        self.session_with(
+            SessionRequest {
+                repo_root,
+                spec,
+                options,
+                params,
+            },
+            progress,
+            cancel,
+            &mut |_| {},
+        )
+    }
+
+    /// The same as [`Engine::session`], handing over the classified changes
+    /// as soon as they are known and before the impact is traced.
+    pub fn session_with(
+        &self,
+        request: SessionRequest<'_>,
+        progress: &dyn Progress,
+        cancel: &CancelToken,
+        on_changes: &mut dyn FnMut(&DiffResult),
+    ) -> Result<Session> {
+        let SessionRequest {
+            repo_root,
+            spec,
+            options,
+            params,
+        } = request;
         cancel.check()?;
         let root = blastr_git::discover(repo_root)?;
         let repo = Repo::open(&root)?;
@@ -224,7 +296,7 @@ impl Engine {
         let changed_files = repo.changed_files(&comparison)?;
 
         progress.report("load base", 0, None);
-        let (base, base_key, _) = self.graph_for(
+        let fetched = self.graph_for(
             Some(&repo),
             &comparison.base,
             GraphRequest {
@@ -236,6 +308,9 @@ impl Engine {
             },
         )?;
         cancel.check()?;
+        let base = fetched.graph;
+        let base_key = fetched.key;
+        let base_missing = fetched.missing_macros;
 
         let manifest_dir = match &options.manifest_dir {
             Some(dir) => dir.to_path(root.path()),
@@ -252,6 +327,7 @@ impl Engine {
         cancel.check()?;
 
         progress.report("extract head", 0, None);
+        let missing_macros = union_of(&base_missing, workspace.missing_proc_macros());
         let head = Arc::new(workspace.extract(progress, cancel)?);
         cancel.check()?;
 
@@ -273,8 +349,9 @@ impl Engine {
             head_key: head_key.clone(),
             changed_files,
             changes,
-            limits: Vec::new(),
+            limits: macros_limit(&missing_macros).into_iter().collect(),
         };
+        on_changes(&diff);
 
         progress.report("impact", 0, None);
         let ignore = IgnoreSet::new(&params.ignore)?;
@@ -309,6 +386,7 @@ impl Engine {
             head,
             head_key,
             workspace,
+            missing_macros,
             analysis,
             seen,
         })

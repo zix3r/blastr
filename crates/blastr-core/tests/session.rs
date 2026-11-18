@@ -1,8 +1,9 @@
 //! A session keeps a working tree loaded and reports what a save affects.
 //!
-//! The session is what `blastr watch` runs on: the project is loaded once, and
-//! every later refresh re-extracts the saved files only. This test uses a real
-//! Git repository with one small crate, so it costs one project load.
+//! The session is what the window's refresh on save runs on: the project is
+//! loaded once, and every later refresh re-extracts the saved files only. This
+//! test uses a real Git repository with one small crate, so it costs one
+//! project load.
 
 use std::fs;
 use std::path::Path;

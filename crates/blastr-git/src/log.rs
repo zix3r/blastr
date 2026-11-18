@@ -7,6 +7,27 @@ use crate::repo::short_id;
 use crate::{Error, Repo};
 
 impl Repo {
+    /// The name of the branch `HEAD` is on, without `refs/heads/`.
+    ///
+    /// `None` when `HEAD` is detached.
+    pub fn branch(&self) -> Result<Option<String>, Error> {
+        let repo = self.repo()?;
+        let name = repo.head_name().map_err(Error::git)?;
+        Ok(name.map(|name| name.shorten().to_string()))
+    }
+
+    /// The abbreviated id of the commit `HEAD` points to, if there is one.
+    pub fn head_commit(&self) -> Result<Option<String>, Error> {
+        let repo = self.repo()?;
+        let head = repo.head().map_err(Error::git)?;
+        Ok(head.id().map(|id| short_id(id.detach())))
+    }
+
+    /// Whether something tracked is modified or staged.
+    pub fn is_dirty(&self) -> Result<bool, Error> {
+        self.repo()?.is_dirty().map_err(Error::git)
+    }
+
     /// Commits reachable from `HEAD`, newest first.
     ///
     /// The first `skip` commits are left out and at most `limit` are returned;
@@ -105,6 +126,37 @@ mod tests {
         assert_eq!(older.len(), 1);
         assert_eq!(older[0].id, first);
         assert_eq!(unlimited.len(), 3);
+    }
+
+    #[test]
+    fn the_branch_and_the_head_commit_are_reported() {
+        let mut test = TestRepo::new();
+        let repo = test.open();
+        assert_eq!(repo.head_commit().expect("the head"), None);
+
+        let first = test.commit(&[("a.txt", "one")], "first");
+
+        let branch = repo.branch().expect("the branch");
+        assert!(
+            matches!(branch.as_deref(), Some("main" | "master")),
+            "{branch:?}"
+        );
+        assert_eq!(
+            repo.head_commit().expect("the head").as_deref(),
+            Some(&first[..7])
+        );
+    }
+
+    #[test]
+    fn a_modified_tracked_file_makes_the_tree_dirty() {
+        let mut test = TestRepo::new();
+        test.commit(&[("a.txt", "one")], "first");
+        let repo = test.open();
+        assert!(!repo.is_dirty().expect("the state"));
+
+        test.write("a.txt", "two");
+
+        assert!(repo.is_dirty().expect("the state"));
     }
 
     #[test]

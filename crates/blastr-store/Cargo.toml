@@ -1,6 +1,6 @@
 [package]
 name = "blastr-store"
-description = "SQLite cache for Blastr"
+description = "Internal crate of Blastr (the SQLite cache); not a stable API"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

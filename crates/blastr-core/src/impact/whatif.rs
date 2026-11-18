@@ -44,6 +44,51 @@ pub enum WhatIfError {
     },
 }
 
+/// The changes that can be assumed for a symbol of `kind`, most useful first.
+///
+/// Every entry is accepted by [`assumed_change`] for such a symbol, so a front
+/// end can offer exactly this list.
+pub fn assumable(kind: SymbolKind) -> &'static [Assume] {
+    match kind {
+        SymbolKind::Function | SymbolKind::Method => &[
+            Assume::Body,
+            Assume::Signature,
+            Assume::Removed,
+            Assume::Visibility,
+        ],
+        SymbolKind::Const | SymbolKind::Static => &[
+            Assume::Body,
+            Assume::Signature,
+            Assume::Removed,
+            Assume::Visibility,
+        ],
+        SymbolKind::Macro => &[Assume::Body, Assume::Removed],
+        SymbolKind::Struct => &[
+            Assume::FieldAdded,
+            Assume::Signature,
+            Assume::Removed,
+            Assume::Visibility,
+        ],
+        SymbolKind::Enum => &[
+            Assume::VariantAdded,
+            Assume::Signature,
+            Assume::Removed,
+            Assume::Visibility,
+        ],
+        SymbolKind::Union | SymbolKind::Trait | SymbolKind::TypeAlias => {
+            &[Assume::Signature, Assume::Removed, Assume::Visibility]
+        }
+        SymbolKind::Impl => &[Assume::Signature, Assume::Removed],
+        SymbolKind::Field => &[
+            Assume::FieldRetyped,
+            Assume::FieldRemoved,
+            Assume::Visibility,
+        ],
+        SymbolKind::Variant => &[Assume::VariantRemoved, Assume::FieldAdded],
+        SymbolKind::Module => &[Assume::Removed, Assume::Visibility],
+    }
+}
+
 /// The change to propagate for a what-if query on `graph`.
 pub fn assumed_change(
     graph: &RevisionGraph,
@@ -211,6 +256,22 @@ mod tests {
         let graph = graph_with(path, kind, false);
         let error = assumed_change(&graph, path, assume).expect_err("the assumption is rejected");
         error.to_string()
+    }
+
+    #[test]
+    fn every_offered_assumption_is_accepted() {
+        for &kind in SymbolKind::ALL {
+            let offered = assumable(kind);
+            assert!(!offered.is_empty(), "{kind} offers nothing");
+            for &assume in offered {
+                let graph = graph_with("krate::item", kind, false);
+                assert!(
+                    assumed_change(&graph, "krate::item", assume).is_ok(),
+                    "{kind} does not accept {}",
+                    assume.as_str()
+                );
+            }
+        }
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "blastr-git"
-description = "Git access for Blastr"
+description = "Internal crate of Blastr (Git access); not a stable API"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

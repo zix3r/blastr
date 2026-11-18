@@ -21,10 +21,10 @@ pub enum Error {
     /// The operation was cancelled through its `CancelToken`.
     #[error("cancelled")]
     Cancelled,
-    /// A configuration file could not be used.
+    /// An ignore pattern is not a usable glob.
     #[error(transparent)]
-    Config(#[from] crate::config::ConfigError),
-    /// A symbol named on the command line could not be found.
+    Ignore(#[from] crate::config::PatternError),
+    /// A symbol the user named could not be found.
     #[error(transparent)]
     Lookup(#[from] crate::impact::lookup::LookupError),
     /// A what-if query does not fit the symbol it names.
@@ -33,6 +33,14 @@ pub enum Error {
     /// A session was asked for on a comparison it cannot watch.
     #[error("this comparison cannot be watched: {0}")]
     SessionNotWatching(String),
+    /// A cache directory could not be removed.
+    #[error("cannot remove `{}`: {message}", .path.display())]
+    RemoveDir {
+        /// The entry that could not be removed.
+        path: std::path::PathBuf,
+        /// What the system reported for it.
+        message: String,
+    },
     /// The feature exists in the interface but is not implemented yet.
     #[error("`{0}` is not implemented yet")]
     NotImplemented(&'static str),
@@ -42,38 +50,38 @@ impl Error {
     /// One line telling the user what to do next, when there is something useful to say.
     pub fn hint(&self) -> Option<String> {
         let hint = match self {
-            Error::Config(error) => return error.hint(),
+            Error::Ignore(error) => return error.hint(),
             Error::Lookup(error)
             | Error::WhatIf(crate::impact::whatif::WhatIfError::Lookup(error)) => {
                 return lookup_hint(error);
             }
             Error::WhatIf(crate::impact::whatif::WhatIfError::WrongKind { .. }) => {
-                "run `blastr impact --help` for the kinds of change that can be assumed"
+                "assume a kind of change that fits the symbol, such as a body or signature change"
             }
             Error::SessionNotWatching(_) => {
-                "watch the working tree: leave out `--staged`, and let the base side be the revision"
+                "only the working tree can be followed, so compare a revision with it"
             }
             Error::Cancelled | Error::NotImplemented(_) => {
                 return None;
             }
             Error::Git(blastr_git::Error::NotARepository { .. }) => {
-                "run blastr inside a Git repository, or pass its path"
+                "open a folder inside a Git repository"
             }
             Error::Git(blastr_git::Error::Bare { .. }) => {
                 "blastr needs a repository with a working tree"
             }
             Error::Store(blastr_store::Error::NewerSchema { .. }) => {
-                "update blastr, or run `blastr cache clear` with the newer version"
+                "install the newer Blastr, or delete the cache database"
             }
             Error::Store(blastr_store::Error::Sqlite(_))
             | Error::Store(blastr_store::Error::Io(_)) => {
-                "if the cache is damaged, delete it with `blastr cache clear`"
+                "if the cache is damaged, delete the cache database"
             }
             Error::Git(blastr_git::Error::UnknownRevision(_)) => {
                 "check the revision with `git log`; branches, tags and commit ids all work"
             }
             Error::Ra(blastr_ra::Error::NoManifest { .. }) => {
-                "run blastr in a Cargo project, or pass `--manifest-path <Cargo.toml>`"
+                "open the root of a Cargo project or of a workspace"
             }
             Error::Ra(blastr_ra::Error::MissingRustSrc) => {
                 "install them with `rustup component add rust-src`"
@@ -84,7 +92,11 @@ impl Error {
             Error::Ra(blastr_ra::Error::Toolchain(_)) => {
                 "check that `cargo --version` works in this directory"
             }
-            Error::Codec(_) => "clear the cache with `blastr cache clear`",
+            Error::Codec(_) => "delete the cache database",
+            Error::RemoveDir { .. } => {
+                "close whatever holds the file (an editor, an antivirus scan, another build), \
+                 then clear the cache again"
+            }
             Error::Git(_) | Error::Store(_) | Error::Ra(_) | Error::Io(_) => {
                 return None;
             }
@@ -98,8 +110,7 @@ fn lookup_hint(error: &crate::impact::lookup::LookupError) -> Option<String> {
     use crate::impact::lookup::LookupError;
     match error {
         LookupError::NotFound { suggestions, .. } if suggestions.is_empty() => Some(
-            "write the path as `blastr diff` prints it, such as `my_crate::module::item`"
-                .to_owned(),
+            "write the path as the result shows it, such as `my_crate::module::item`".to_owned(),
         ),
         LookupError::NotFound { suggestions, .. } => {
             Some(format!("did you mean {}?", suggestions.join(", ")))
@@ -128,7 +139,7 @@ mod tests {
         let err = Error::Git(blastr_git::Error::NotARepository { path: "x".into() });
         assert_eq!(
             err.hint().as_deref(),
-            Some("run blastr inside a Git repository, or pass its path")
+            Some("open a folder inside a Git repository")
         );
     }
 
@@ -149,7 +160,7 @@ mod tests {
         });
         assert_eq!(
             err.hint().as_deref(),
-            Some("update blastr, or run `blastr cache clear` with the newer version")
+            Some("install the newer Blastr, or delete the cache database")
         );
     }
 
@@ -158,7 +169,7 @@ mod tests {
         let io = Error::Store(blastr_store::Error::Io(std::io::Error::other("x")));
         assert_eq!(
             io.hint().as_deref(),
-            Some("if the cache is damaged, delete it with `blastr cache clear`")
+            Some("if the cache is damaged, delete the cache database")
         );
     }
 
