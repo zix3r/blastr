@@ -30,8 +30,6 @@ ra_ap_vfs = "=0.0.358"
 gpui-kit = "=0.9.1"
 
 blake3 = "1"
-clap = { version = "4.6", features = ["derive"] }
-clap_complete = "4.6"
 directories = "6"
 gix = "0.90"
 postcard = { version = "1", features = ["use-std"] }
@@ -47,12 +45,11 @@ toml = "1"
 unicode-properties = { version = "=0.1.4", default-features = false }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
 zstd = "0.14"
 
-assert_cmd = "2"
-predicates = "3"
 tempfile = "3"
+# Writes the Windows icon and version resource of the executables.
+winresource = "0.1.34"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

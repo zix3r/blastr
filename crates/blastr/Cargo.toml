@@ -6,6 +6,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "../../README.md"
+keywords = ["impact-analysis", "rust-analyzer", "git", "code-review", "gui"]
+categories = ["development-tools", "gui"]
+# `cargo run -p blastr` opens the window; the engine is built beside it.
+default-run = "blastr"
 
 [lints]
 workspace = true
@@ -14,25 +19,20 @@ workspace = true
 name = "blastr"
 path = "src/main.rs"
 
-[features]
-default = ["gui"]
-gui = ["dep:blastr-gui"]
+[[bin]]
+name = "blastr-engine"
+path = "src/bin/blastr-engine.rs"
 
 [dependencies]
 blastr-core.workspace = true
-blastr-model.workspace = true
-blastr-gui = { workspace = true, optional = true }
-clap.workspace = true
-clap_complete.workspace = true
-serde.workspace = true
-serde_json.workspace = true
+blastr-gui.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
-[target.'cfg(windows)'.dependencies]
-windows-sys.workspace = true
+[target.'cfg(windows)'.build-dependencies]
+winresource.workspace = true
 
 [dev-dependencies]
-assert_cmd.workspace = true
-predicates.workspace = true
+blastr-model.workspace = true
+blastr-store.workspace = true
 tempfile.workspace = true
