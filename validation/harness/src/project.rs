@@ -63,7 +63,7 @@ impl Project {
         let load_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         Ok(Project {
-            revision: revision(&dir),
+            revision: revision_of(&dir),
             dir,
             base,
             copy,
@@ -139,7 +139,7 @@ pub const TEST_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// The abbreviated id of the commit `dir` is at, with `-dirty` when the sample
 /// itself has uncommitted changes; `no-git` outside a repository.
-fn revision(dir: &Path) -> String {
+pub fn revision_of(dir: &Path) -> String {
     let Ok(root) = blastr_git::discover(dir) else {
         return "no-git".to_owned();
     };

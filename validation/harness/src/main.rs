@@ -22,11 +22,12 @@ mod project;
 mod reach;
 mod results;
 mod tests_check;
+mod tune;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use cli::{Check, Command, Report};
+use cli::{Check, Command, Report, Tune};
 
 /// The result type of the harness.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -106,7 +107,21 @@ fn run(args: &[String]) -> Result<()> {
         Command::Compiler(options) => run_check(options, true),
         Command::Tests(options) => run_check(options, false),
         Command::Report(options) => run_report(&options),
+        Command::Tune(options) => run_tune(&options),
     }
+}
+
+/// Runs the parameter sweep and writes its report.
+fn run_tune(options: &Tune) -> Result<()> {
+    let options = tune::Options {
+        projects: options.projects.clone(),
+        confirm: options.confirm.clone(),
+        grid: options.grid.clone(),
+        results: options.results.clone(),
+        out: options.out.clone(),
+        limit: options.limit,
+    };
+    tune::run(&options)
 }
 
 /// Runs one check on one project and writes the report when asked to.

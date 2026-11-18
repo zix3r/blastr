@@ -50,6 +50,9 @@ CARGO_TARGET_DIR=../../target cargo run --release -- tests ../projects/shopfront
 
 # both checks over every project under validation/projects, then the report
 CARGO_TARGET_DIR=../../target cargo run --release -- report
+
+# tune the analysis parameters against stored results
+CARGO_TARGET_DIR=../../target cargo run --release -- tune --projects shopfront,pipeline --confirm macrokit
 ```
 
 `report` writes `validation/results/<project>-<check>.json` and
@@ -58,6 +61,9 @@ running the checks again, `--projects a,b` picks the projects, `--limit` and
 `--seed` take a sample, and `--help` prints the options. The last full run over
 the three sample projects is committed as `validation/results/report.md`, next to
 the per-case JSON it was rendered from.
+
+`tune` writes `validation/results/tuning.json` and `validation/results/tuning.md`
+and is described in [Tuning the parameters](#tuning-the-parameters).
 
 Every case result records the file, the item, the edit kind and the text of the
 item before and after the edit, so a miss can be reproduced and inspected with
@@ -151,6 +157,91 @@ The report records all of these numbers per project and per check.
 `cargo test --workspace` dominates the test check; a project whose tests are slow
 to build makes the check slow, which is why every Cargo run has a time limit and
 the timeouts are counted as exclusions.
+
+## Tuning the parameters
+
+`tune` searches the analysis parameters (`blastr_model::AnalysisParams`: depth,
+decay, candidate weight, class weights, score floor, minimum confidence, ignore)
+for a setting that loses fewer true items and lists less.
+
+Both checks spend most of their time in Cargo, but Cargo's verdict of a case —
+which symbols it rejects, which tests it makes fail — does not depend on Blastr's
+parameters. Only Blastr's own analysis does. So the sweep does not run the checks
+again: it reads the per-case results of an earlier `report` as the **ground
+truth**, replans the same cases from the projects as they are on disk (a case is
+matched to its stored result by id, which the plan makes stable), and re-runs
+only the impact analysis. A case's edited graph does not depend on the parameters
+either, so each case is extracted once and the impact analysis runs once per grid
+point on that graph.
+
+The other half of a case's cost is the compiler's judgement of items whose target
+it never built. The stored result does not record the compiler's output, but
+everything it *did* expect or list was in a target that was built, so the crate
+roots of those symbols are taken as the confirmed targets: an item in one of them
+is scored, an item anywhere else is counted as unconfirmed and left out of both
+sides, exactly as the check does. Stored cases that were excluded stay excluded.
+
+| option | meaning |
+|---|---|
+| `--projects a,b` | the projects to tune on (default `shopfront`, `pipeline`) |
+| `--confirm p` | a held-out project; the winner and the current defaults are scored on it and both are reported |
+| `--grid SPEC` | `decay=0.5,0.6;candidate=0.3,0.4;floor=0.01,0.05;depth=6,10` — the cartesian product of the values given; a parameter the spec omits keeps its default |
+| `--results DIR` | where the stored `<project>-{compiler,tests}.json` are (default `validation/results`) |
+| `--out DIR` | where `tuning.json` and `tuning.md` go (default `validation/results`) |
+| `--limit N` | at most N cases per check and project: a smoke test, marked as such in the report |
+
+The default grid is 39 settings: decay {0.5, 0.6, 0.7, 0.8}, score floor
+{0.01, 0.02, 0.05} and depth {6, 8, 10} crossed in full — the two cut-offs and
+the scale they compare against — plus the candidate weight {0.3, 0.4, 0.6, 0.8}
+swept at the default floor and depth. The full four-way cross (144 settings) is
+one `--grid` away.
+
+### Which setting wins
+
+For every setting the sweep adds up, over every scored case of every tuning
+project: the compiler errors Blastr did not list plus the failing tests it did not
+select (**misses**), the false alarms, the size of Blastr's list and the number of
+selected tests. The rule is the plan's:
+
+1. fewest misses — no true item lost to the cut-offs,
+2. then the fewest items listed,
+3. then the fewest selected tests,
+4. then the setting closest to the current defaults (the sum of the relative
+   changes of depth, decay, candidate weight and score floor).
+
+Because 1 and 2 trade against each other, the report also carries the **Pareto
+front**: every setting that no other setting beats in misses, list size and
+selected tests at once. A setting that lists half as much but costs one miss is
+on that front even though the rule does not pick it.
+
+### What it does not tune
+
+The class weights and the minimum confidence stay at their defaults:`possible` is
+already the widest confidence (nothing can be lost by raising it, so the sweep
+could only make the list longer), and a class weight only scales the score the
+floor is compared with, which the decay, candidate weight and floor sweep already
+covers.
+
+The **rename threshold** is `blastr_core::diff::MatchParams::rename_similarity`
+(0.7, `MatchParams::default()`), used by `diff::classify`. The sweep cannot move
+it: `ProjectBase::variant` compares with `MatchParams::default()` and takes no
+match parameters. It would also change nothing on these cases — no edit kind the
+harness plans renames a symbol, so no case contains a rename. Exercising it would
+need a new edit kind (`rename-symbol`) and a general way to pass match parameters
+into `ProjectBase`, neither of which this step adds.
+
+### Cost
+
+One load per project (3–5 s), one extraction per case (0.09–0.18 s) and the
+impact analysis once per case and setting (0.2 ms on `pipeline`, 1.8 ms on
+`shopfront`). Because the impact analysis is an order of magnitude cheaper than
+extraction, a grid is affordable: the round-1 results, 39 settings, a release
+harness on 16 worker threads — `shopfront`'s 1 333 cases in about 4 minutes,
+`pipeline`'s 148 in 16 s, and `macrokit`'s 385 as the held-out confirmation in
+another 1.5 minutes, 5.5 minutes in all. The case queue is fed by a single
+extractor thread and drained by the workers, because one `ProjectBase` owns one
+in-memory file system; the workers only ever touch extracted graphs, so no
+workspace is shared and the result does not depend on the thread count.
 
 ## What excludes a case
 
