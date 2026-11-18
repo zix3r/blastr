@@ -1,0 +1,163 @@
+name: Release
+
+# Runs only when a version tag is pushed, e.g. `git tag v0.1.0 && git push origin v0.1.0`.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  check-version:
+    name: Check version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # The tag and the workspace version must agree, so an archive is never
+      # named after one version while containing another.
+      - name: Compare tag and workspace version
+        id: version
+        run: |
+          version=$(sed -n '/^\[workspace.package\]/,/^\[/{s/^version *= *"\(.*\)"/\1/p}' Cargo.toml)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match the workspace version $version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  windows:
+    name: Windows x86_64
+    needs: check-version
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Show pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Build
+        run: cargo build --release --locked -p blastr
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = "blastr-${{ needs.check-version.outputs.version }}-windows-x86_64"
+          New-Item -ItemType Directory -Path $name | Out-Null
+          Copy-Item target/release/blastr.exe, target/release/blastr-engine.exe $name
+          Copy-Item README.md, LICENSE-MIT, LICENSE-APACHE $name
+          Compress-Archive -Path $name -DestinationPath "$name.zip"
+
+      - name: Upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows
+          path: blastr-*-windows-x86_64.zip
+          if-no-files-found: error
+
+  arch:
+    name: Arch Linux x86_64
+    needs: check-version
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Install system packages
+        run: |
+          pacman -Syu --noconfirm --needed \
+            base-devel git rustup cmake clang lld pkgconf openssl zstd sqlite libgit2 \
+            glib2 fontconfig wayland libxkbcommon libxkbcommon-x11 libx11 libxcb \
+            vulkan-icd-loader vulkan-headers alsa-lib
+
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Show pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Build
+        run: cargo build --release --locked -p blastr
+
+      # The archive mirrors /usr: unpack it into /usr (or ~/.local) and the
+      # desktop entry finds the program and its icon.
+      - name: Package
+        run: |
+          name="blastr-${{ needs.check-version.outputs.version }}-archlinux-x86_64"
+          install -Dm755 target/release/blastr        "$name/bin/blastr"
+          install -Dm755 target/release/blastr-engine "$name/bin/blastr-engine"
+          install -Dm644 assets/linux/blastr.desktop  "$name/share/applications/blastr.desktop"
+          install -Dm644 assets/icons/blastr-256.png  "$name/share/icons/hicolor/256x256/apps/blastr.png"
+          install -Dm644 assets/icons/blastr-512.png  "$name/share/icons/hicolor/512x512/apps/blastr.png"
+          install -Dm644 assets/icons/blastr-tile.svg "$name/share/icons/hicolor/scalable/apps/blastr.svg"
+          install -Dm644 LICENSE-MIT                  "$name/share/licenses/blastr/LICENSE-MIT"
+          install -Dm644 LICENSE-APACHE               "$name/share/licenses/blastr/LICENSE-APACHE"
+          install -Dm644 README.md                    "$name/share/doc/blastr/README.md"
+          tar -czf "$name.tar.gz" "$name"
+
+      - name: Upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: arch
+          path: blastr-*-archlinux-x86_64.tar.gz
+          if-no-files-found: error
+
+  crates:
+    name: Publish to crates.io
+    needs: [check-version, windows, arch]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake clang lld pkg-config libssl-dev libzstd-dev libsqlite3-dev \
+            libgit2-dev libglib2.0-dev libfontconfig-dev libwayland-dev libx11-xcb-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libvulkan1 libvulkan-dev libasound2-dev
+
+      - name: Show pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      # Publishes every crate of the workspace in dependency order (the internal
+      # crates first, `blastr` last), verifying each from its packaged sources.
+      # crates.io refuses a version that already exists, so a re-run after a
+      # partial failure needs `--exclude` for the crates that went through.
+      - name: Publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --workspace --locked
+
+  publish:
+    name: Publish release
+    needs: [check-version, windows, arch]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download archives
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum blastr-* > SHA256SUMS
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Blastr ${{ needs.check-version.outputs.version }}" \
+            --generate-notes

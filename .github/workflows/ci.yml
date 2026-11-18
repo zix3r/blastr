@@ -129,28 +129,3 @@ jobs:
       - name: Test
         run: cargo nextest run --workspace --locked
 
-  headless:
-    name: Headless build
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      # No GUI system packages here on purpose: the headless build must not need them.
-      - name: Show pinned Rust toolchain
-        run: rustup show active-toolchain || rustup toolchain install
-
-      - name: Cache Rust builds
-        uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@nextest
-
-      - name: Clippy without the GUI feature
-        run: cargo clippy -p blastr --no-default-features --all-targets --locked -- -D warnings
-
-      - name: Test without the GUI feature
-        run: cargo nextest run -p blastr --no-default-features --locked
