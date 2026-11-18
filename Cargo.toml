@@ -1,7 +1,9 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
-exclude = ["fixtures"]
+# `fixtures` and the validation harness are projects of their own: Blastr's own
+# builds must not compile them. `validation/projects` holds the sample projects.
+exclude = ["fixtures", "validation/harness", "validation/projects"]
 
 [workspace.package]
 version = "0.1.1"

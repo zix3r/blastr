@@ -1,0 +1,40 @@
+[package]
+name = "blastr-validate"
+description = "Validation harness for Blastr: seeded-edit compiler check, mutation test check, report"
+version = "0.1.1"
+edition = "2024"
+rust-version = "1.100"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/zix3r/blastr"
+publish = false
+
+# A workspace of its own, so that Blastr's workspace does not build the
+# harness and the harness does not inherit Blastr's profile or lint settings.
+# The root `Cargo.toml` lists this directory under `exclude`.
+#
+# `testdata` holds the projects the harness's own tests run checks on. Cargo
+# must not treat them as part of this workspace.
+[workspace]
+exclude = ["testdata"]
+
+[[bin]]
+name = "blastr-validate"
+path = "src/main.rs"
+
+[dependencies]
+blastr-core = { path = "../../crates/blastr-core" }
+blastr-git = { path = "../../crates/blastr-git" }
+blastr-model = { path = "../../crates/blastr-model" }
+blastr-store = { path = "../../crates/blastr-store" }
+# The same version the Blastr workspace pins, so that the harness parses Rust
+# exactly as the analysed build does.
+ra_ap_syntax = "=0.0.358"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
