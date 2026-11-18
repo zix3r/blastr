@@ -172,7 +172,9 @@ pub(crate) static RULES: &[Rule] = &[
             continues: Continue::Always,
         }],
     },
-    // A signature change makes the callers and holders adapt.
+    // A signature change makes the callers and holders adapt. A method that
+    // implements a trait item is left out: its callers name the trait, whose
+    // declaration did not change, so they compile unchanged.
     Rule {
         applies: Applies {
             kind: ChangeKind::Signature,
@@ -188,7 +190,7 @@ pub(crate) static RULES: &[Rule] = &[
             Source {
                 target: Target::Symbol,
                 edges: EdgeSet::Kinds(&[EdgeKind::Calls]),
-                filter: EdgeFilter::None,
+                filter: EdgeFilter::NotInTraitImpl,
                 certainty: CertaintyRule::Edge,
                 reason: Reason::SignatureChanged,
                 continues: Continue::Always,
@@ -196,7 +198,7 @@ pub(crate) static RULES: &[Rule] = &[
             Source {
                 target: Target::Symbol,
                 edges: EdgeSet::Kinds(&[EdgeKind::TakesAsValue]),
-                filter: EdgeFilter::None,
+                filter: EdgeFilter::NotInTraitImpl,
                 certainty: CertaintyRule::Edge,
                 reason: Reason::SignatureChanged,
                 continues: Continue::Always,
@@ -261,15 +263,30 @@ pub(crate) static RULES: &[Rule] = &[
         side: Side::Head,
         class: ImpactClass::Adaptation,
         coarse: Coarse::Restricted,
-        container_kinds: ANY_KIND,
-        sources: &[Source {
-            target: Target::Symbol,
-            edges: EdgeSet::Any,
-            filter: EdgeFilter::OutsideVisibility,
-            certainty: CertaintyRule::Edge,
-            reason: Reason::NoLongerVisible,
-            continues: Continue::Never,
-        }],
+        container_kinds: STRUCT_OR_VARIANT,
+        sources: &[
+            Source {
+                target: Target::Symbol,
+                edges: EdgeSet::Any,
+                filter: EdgeFilter::OutsideVisibility,
+                certainty: CertaintyRule::Edge,
+                reason: Reason::NoLongerVisible,
+                continues: Continue::Never,
+            },
+            // A field is also named by the literals of its container, which
+            // carry no edge of their own to the field: the literal has to
+            // spell the name out, and the compiler rejects it once the field
+            // is out of reach. A literal that ends with `..` may or may not
+            // name it.
+            Source {
+                target: Target::Container,
+                edges: EdgeSet::Kinds(&[EdgeKind::Constructs]),
+                filter: EdgeFilter::OutsideVisibility,
+                certainty: CertaintyRule::WithRestIsCandidate,
+                reason: Reason::NoLongerVisible,
+                continues: Continue::Never,
+            },
+        ],
     },
     // A removal reaches everything that refers to the symbol or to
     // anything inside it, on the base side.
@@ -967,6 +984,13 @@ enum EdgeFilter {
     WithoutRest,
     /// Only edges whose referrer is outside the new visibility of the change.
     OutsideVisibility,
+    /// No edge at all when the changed symbol implements a trait item.
+    ///
+    /// The caller of such a method names the trait, not the implementation:
+    /// its call resolves through the trait declaration, which the change does
+    /// not touch, so it compiles unchanged. Only a change to the trait item
+    /// itself makes callers adapt.
+    NotInTraitImpl,
     /// Only edges emitted by an implementation block.
     FromImpl,
     /// Only edges emitted by an implementation that does not override the
@@ -1216,6 +1240,7 @@ impl<'a> Scope<'a> {
             EdgeFilter::Detail(detail) => edge.detail == detail,
             EdgeFilter::WithoutRest => edge.detail != EdgeDetail::WithRest,
             EdgeFilter::OutsideVisibility => self.outside_new_visibility(edge.from),
+            EdgeFilter::NotInTraitImpl => !self.in_trait_impl(),
             EdgeFilter::FromImpl => self.kind_of(edge.from) == Some(SymbolKind::Impl),
             EdgeFilter::ImplDoesNotOverride => self.impl_does_not_override(edge.from),
         }
@@ -1282,6 +1307,13 @@ impl<'a> Scope<'a> {
             }
             Visibility::Public => false,
         }
+    }
+
+    /// Whether the changed symbol implements a trait item.
+    fn in_trait_impl(&self) -> bool {
+        self.symbol
+            .and_then(|id| self.ctx.graph(self.rule.side).symbols.get(id.0 as usize))
+            .is_some_and(|symbol| symbol.flags.in_trait_impl)
     }
 
     /// Whether any implementation of the container replaces the changed trait
@@ -1790,6 +1822,36 @@ mod tests {
     }
 
     #[test]
+    fn row_5_a_signature_change_to_a_trait_impl_method_leaves_callers_alone() {
+        let mut builder = GraphBuilder::new();
+        let module = builder.add("krate", SymbolKind::Module);
+        let stage = builder.child(module, "krate::Stage", SymbolKind::Trait);
+        let item = builder.child(stage, "krate::Stage::apply", SymbolKind::Method);
+        let block = builder.child(module, "krate::<impl Stage for V>", SymbolKind::Impl);
+        let method = builder.child(
+            block,
+            "krate::<impl Stage for V>::apply",
+            SymbolKind::Method,
+        );
+        builder.symbol(method).flags.in_trait_impl = true;
+        let caller = builder.child(module, "krate::caller", SymbolKind::Function);
+        let holder = builder.child(module, "krate::holder", SymbolKind::Function);
+        builder.edge(block, stage, EdgeKind::Implements, EdgeDetail::None);
+        builder.edge(method, item, EdgeKind::Implements, EdgeDetail::None);
+        builder.edge(caller, method, EdgeKind::Calls, EdgeDetail::None);
+        builder.edge(holder, method, EdgeKind::TakesAsValue, EdgeDetail::None);
+        let head = builder.finish();
+        let change = change(
+            ChangeKind::Signature,
+            "krate::<impl Stage for V>::apply",
+            SymbolKind::Method,
+        );
+
+        // The call above names the trait item, which did not change.
+        assert!(first(&nothing(), &head, &change).is_empty());
+    }
+
+    #[test]
     fn row_6_a_signature_change_reaches_dispatch_only() {
         let mut builder = GraphBuilder::new();
         let module = builder.add("krate", SymbolKind::Module);
@@ -1965,6 +2027,66 @@ mod tests {
             vec!["other::user"]
         );
         assert!(!steps[0].coarse);
+    }
+
+    #[test]
+    fn row_8_a_narrowed_field_reaches_the_literals_and_patterns_that_name_it() {
+        let mut builder = GraphBuilder::new();
+        let root = builder.add("krate", SymbolKind::Module);
+        let spec = builder.child(root, "krate::Spec", SymbolKind::Struct);
+        let argument = builder.child(spec, "krate::Spec::argument", SymbolKind::Field);
+        let name = builder.child(spec, "krate::Spec::name", SymbolKind::Field);
+        let parse = builder.child(root, "krate::Spec::parse", SymbolKind::Function);
+        let build = builder.add("other::build", SymbolKind::Function);
+        let rebuild = builder.add("other::rebuild", SymbolKind::Function);
+        let reader = builder.add("other::reader", SymbolKind::Function);
+        let pattern = builder.add("other::pattern", SymbolKind::Function);
+        let naming = builder.add("other::naming", SymbolKind::Function);
+        builder.krate(build, 1);
+        builder.krate(rebuild, 1);
+        builder.krate(reader, 1);
+        builder.krate(pattern, 1);
+        builder.krate(naming, 1);
+        // A literal carries no edge to the field, only to its container.
+        builder.edge(parse, spec, EdgeKind::Constructs, EdgeDetail::None);
+        builder.edge(build, spec, EdgeKind::Constructs, EdgeDetail::None);
+        builder.edge(rebuild, spec, EdgeKind::Constructs, EdgeDetail::WithRest);
+        builder.edge(reader, argument, EdgeKind::ReadsField, EdgeDetail::None);
+        builder.edge(pattern, argument, EdgeKind::Matches, EdgeDetail::None);
+        builder.edge(naming, name, EdgeKind::ReadsField, EdgeDetail::None);
+        let head = builder.finish();
+        let change = detailed(
+            ChangeKind::Visibility,
+            "krate::Spec::argument",
+            SymbolKind::Field,
+            ChangeDetail::Visibility {
+                from: Visibility::Public,
+                to: Visibility::Crate,
+            },
+        );
+
+        let steps = first(&nothing(), &head, &change);
+
+        assert_eq!(
+            reached_paths(&steps, &nothing(), &head),
+            vec![
+                "other::build",
+                "other::pattern",
+                "other::reader",
+                "other::rebuild"
+            ]
+        );
+        let step = step_to(&steps, &nothing(), &head, "other::build");
+        assert_eq!(step.class, ImpactClass::Adaptation);
+        assert_eq!(step.reason, Reason::NoLongerVisible);
+        assert_eq!(step.certainty, Certainty::Resolved);
+        assert!(!step.continues);
+        let step = step_to(&steps, &nothing(), &head, "other::rebuild");
+        assert_eq!(
+            step.certainty,
+            Certainty::Candidate,
+            "a literal with `..` may leave the field out"
+        );
     }
 
     #[test]

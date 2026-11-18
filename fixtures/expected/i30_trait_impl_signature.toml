@@ -1,0 +1,19 @@
+# The signature of a method that implements a trait item changes while the trait
+# item itself does not. Callers name the trait item, so they compile unchanged:
+# only the implementation has to be edited.
+crates = ["i30_trait_impl_signature"]
+exact_changes = true
+
+[[change]]
+kind = "signature"
+symbol = "i30_trait_impl_signature::<impl Named for Tag>::name"
+
+[[no_change]]
+kind = "trait-item"
+symbol = "i30_trait_impl_signature::Named::name"
+
+[[no_impact]]
+symbol = "i30_trait_impl_signature::label"
+
+[[no_impact]]
+symbol = "i30_trait_impl_signature::Named::name"

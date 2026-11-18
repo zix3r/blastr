@@ -1,0 +1,66 @@
+# A narrowed field visibility reaches the literals and patterns of other crates
+# that name the field, and nothing inside the crate. E0451 is what the compiler
+# reports at those sites.
+crates = ["i29_visibility_field", "i29_visibility_field_user"]
+exact_changes = true
+
+[[change]]
+kind = "visibility"
+detail = "visibility"
+symbol = "i29_visibility_field::Spec::argument"
+
+[[edge]]
+from = "i29_visibility_field_user::build"
+to = "i29_visibility_field::Spec"
+kind = "constructs"
+side = "after"
+detail = "none"
+
+[[edge]]
+from = "i29_visibility_field_user::rebuild"
+to = "i29_visibility_field::Spec"
+kind = "constructs"
+side = "after"
+detail = "with-rest"
+
+[[edge]]
+from = "i29_visibility_field_user::has_argument"
+to = "i29_visibility_field::Spec::argument"
+kind = "matches"
+side = "after"
+
+[[impact]]
+symbol = "i29_visibility_field_user::build"
+class = "adaptation"
+confidence = "definite"
+reason = "no-longer-visible"
+distance = 1
+
+[[impact]]
+symbol = "i29_visibility_field_user::argument_of"
+class = "adaptation"
+confidence = "definite"
+reason = "no-longer-visible"
+distance = 1
+
+[[impact]]
+symbol = "i29_visibility_field_user::has_argument"
+class = "adaptation"
+confidence = "definite"
+reason = "no-longer-visible"
+distance = 1
+
+# The literal ends with `..`, so it may or may not name the field.
+[[impact]]
+symbol = "i29_visibility_field_user::rebuild"
+class = "adaptation"
+confidence = "possible"
+distance = 1
+
+# The constructor inside the library stays inside the new visibility.
+[[no_impact]]
+symbol = "i29_visibility_field::Spec::parse"
+
+# Another field of the same struct is not reached.
+[[no_impact]]
+symbol = "i29_visibility_field_user::name_of"

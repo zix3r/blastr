@@ -1,0 +1,11 @@
+[package]
+name = "i29-visibility-field-user"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "i29_visibility_field_user"
+path = "src/lib.rs"
+
+[dependencies]
+i29-visibility-field = { path = "../i29_visibility_field" }

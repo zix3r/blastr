@@ -1,0 +1,8 @@
+[package]
+name = "i30-trait-impl-signature"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "i30_trait_impl_signature"
+path = "src/lib.rs"

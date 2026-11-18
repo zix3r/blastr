@@ -1,0 +1,8 @@
+[package]
+name = "i29-visibility-field"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "i29_visibility_field"
+path = "src/lib.rs"
