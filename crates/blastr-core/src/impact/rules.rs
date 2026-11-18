@@ -172,6 +172,37 @@ pub(crate) static RULES: &[Rule] = &[
             continues: Continue::Always,
         }],
     },
+    // A body change in a function that defines a procedural macro reaches what
+    // that macro expands to. A seed is never expanded by `onward`, so the
+    // changed function itself needs this first step; the C13 row covers only a
+    // changed `macro_rules!` definition.
+    //
+    // The certainty is a candidate rather than the edge's own one. The edge is
+    // resolved — rust-analyzer resolved the macro path — but a body change says
+    // nothing certain about the tokens the macro now writes, which is the same
+    // uncertainty C13 carries: the expansion may be identical. Taking the
+    // resolved edge would report every invoker as likely affected when only the
+    // expansion, not the reference, is in question.
+    Rule {
+        applies: Applies {
+            kind: ChangeKind::Body,
+            detail: DetailMatch::Any,
+            symbol_kinds: FUNCTION_OR_METHOD,
+            has_body: None,
+        },
+        side: Side::Head,
+        class: ImpactClass::Behaviour,
+        coarse: Coarse::Never,
+        container_kinds: ANY_KIND,
+        sources: &[Source {
+            target: Target::Symbol,
+            edges: EdgeSet::Kinds(&[EdgeKind::Expands]),
+            filter: EdgeFilter::None,
+            certainty: CertaintyRule::Candidate,
+            reason: Reason::InvokesChangedMacro,
+            continues: Continue::Always,
+        }],
+    },
     // A signature change makes the callers and holders adapt. A method that
     // implements a trait item is left out: its callers name the trait, whose
     // declaration did not change, so they compile unchanged.
@@ -1075,6 +1106,12 @@ pub(crate) fn first_steps<'a>(change: &'a Change, ctx: &'a Graphs<'a>) -> Vec<Re
 /// A call or a value read is certain, passing the item around as a value and
 /// dispatching to it through a trait are not, and every item reached this way
 /// continues the propagation.
+///
+/// An `Expands` edge is followed as well, so that a change anywhere in a
+/// procedural macro's implementation continues from the macro function to the
+/// items whose expansion names it. The edge is resolved, but whether the change
+/// alters the expansion is not, so the step is a candidate like C13's first
+/// step.
 pub(crate) fn onward(item: SymbolId, ctx: &Graphs<'_>) -> Vec<Reach> {
     let graph = ctx.head;
     let mut reaches = Vec::new();
@@ -1087,6 +1124,7 @@ pub(crate) fn onward(item: SymbolId, ctx: &Graphs<'_>) -> Vec<Reach> {
             EdgeKind::TakesAsValue => (Certainty::Candidate, Reason::TakesChangedAsValue),
             EdgeKind::MayDispatchTo => (Certainty::Candidate, Reason::DispatchesToChanged),
             EdgeKind::UsesValue => (reference.certainty, Reason::UsesChangedValue),
+            EdgeKind::Expands => (Certainty::Candidate, Reason::InvokesChangedMacro),
             _ => continue,
         };
         if is_self_or_descendant(graph, reference.from, item) {
@@ -1789,6 +1827,55 @@ mod tests {
         assert!(!steps.is_empty());
         assert_eq!(steps[0].reason, Reason::DispatchesToChanged);
         assert!(steps[0].continues);
+    }
+
+    #[test]
+    fn a_body_change_in_a_macro_function_reaches_its_expansions() {
+        let mut builder = GraphBuilder::new();
+        let module = builder.add("krate", SymbolKind::Module);
+        let derive = builder.child(module, "krate::derive_name", SymbolKind::Function);
+        let point = builder.child(module, "krate::Point", SymbolKind::Struct);
+        let block = builder.child(module, "krate::<impl Name for Point>", SymbolKind::Impl);
+        builder.edge(point, derive, EdgeKind::Expands, EdgeDetail::None);
+        builder.edge(block, derive, EdgeKind::Expands, EdgeDetail::None);
+        let head = builder.finish();
+        let change = change(ChangeKind::Body, "krate::derive_name", SymbolKind::Function);
+
+        let steps = first(&nothing(), &head, &change);
+
+        assert_eq!(
+            reached_paths(&steps, &nothing(), &head),
+            vec!["krate::<impl Name for Point>", "krate::Point"]
+        );
+        assert!(
+            steps
+                .iter()
+                .all(|step| step.certainty == Certainty::Candidate),
+            "a body change does not prove the expansion changed"
+        );
+        assert!(
+            steps
+                .iter()
+                .all(|step| step.reason == Reason::InvokesChangedMacro)
+        );
+        assert!(
+            steps
+                .iter()
+                .all(|step| step.class == ImpactClass::Behaviour && step.continues)
+        );
+    }
+
+    #[test]
+    fn a_body_change_in_something_that_is_not_a_function_follows_no_expansion() {
+        let mut builder = GraphBuilder::new();
+        let module = builder.add("krate", SymbolKind::Module);
+        let macro_ = builder.child(module, "krate::declare", SymbolKind::Macro);
+        let invoker = builder.child(module, "krate::invoker", SymbolKind::Function);
+        builder.edge(invoker, macro_, EdgeKind::Expands, EdgeDetail::None);
+        let head = builder.finish();
+        let change = change(ChangeKind::Body, "krate::declare", SymbolKind::Macro);
+
+        assert!(first(&nothing(), &head, &change).is_empty());
     }
 
     #[test]
@@ -3056,10 +3143,37 @@ mod tests {
     }
 
     #[test]
+    fn behaviour_propagation_follows_an_invocation_as_a_candidate() {
+        let mut builder = GraphBuilder::new();
+        let module = builder.add("krate", SymbolKind::Module);
+        let derive = builder.child(module, "krate::derive_name", SymbolKind::Function);
+        let point = builder.child(module, "krate::Point", SymbolKind::Struct);
+        let helper = builder.child(module, "krate::helper", SymbolKind::Function);
+        builder.edge(point, derive, EdgeKind::Expands, EdgeDetail::None);
+        builder.edge(helper, derive, EdgeKind::Calls, EdgeDetail::None);
+        let head = builder.finish();
+        let base = nothing();
+        let graphs = Graphs::new(&base, &head);
+
+        let reached = super::onward(derive, &graphs);
+
+        assert_eq!(
+            reached_paths(&reached, &base, &head),
+            vec!["krate::Point", "krate::helper"]
+        );
+        let expansion = step_to(&reached, &base, &head, "krate::Point");
+        assert_eq!(expansion.class, ImpactClass::Behaviour);
+        assert_eq!(expansion.certainty, Certainty::Candidate);
+        assert_eq!(expansion.reason, Reason::InvokesChangedMacro);
+        assert!(expansion.continues);
+        assert!(!expansion.coarse);
+    }
+
+    #[test]
     fn the_table_holds_every_row_that_follows_edges() {
         assert_eq!(
             super::RULES.len(),
-            30,
+            31,
             "one entry for every kind of change that follows edges"
         );
     }

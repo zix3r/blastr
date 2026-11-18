@@ -1,0 +1,9 @@
+[package]
+name = "i31-proc-macro-body"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "i31_proc_macro_body"
+path = "src/lib.rs"
+proc-macro = true

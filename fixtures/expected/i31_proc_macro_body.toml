@@ -1,0 +1,77 @@
+# A helper inside a procedural-macro crate changes. The change travels up the
+# macro's own calls to the `#[proc_macro_derive]` function, and from there one
+# step back along the invocations: the type the derive is written on, and the
+# impl and the method the derive generated. The invocation step is a candidate,
+# exactly like C13's, because a body change does not have to change the
+# expansion, so everything past the macro function is `possible`.
+crates = ["i31_proc_macro_body", "i31_proc_macro_body_user"]
+exact_changes = true
+
+[[change]]
+kind = "body"
+symbol = "i31_proc_macro_body::greet_value"
+
+# The invocation edges the procedural macro adds: the item the derive is written
+# on and both items the derive generates reach the macro's function.
+[[edge]]
+from = "i31_proc_macro_body_user::Point"
+to = "i31_proc_macro_body::derive_describe"
+kind = "expands"
+side = "after"
+certainty = "resolved"
+
+[[edge]]
+from = "i31_proc_macro_body_user::<impl Greet for Point>"
+to = "i31_proc_macro_body::derive_describe"
+kind = "expands"
+side = "after"
+
+[[edge]]
+from = "i31_proc_macro_body_user::<impl Greet for Point>::greet"
+to = "i31_proc_macro_body::derive_describe"
+kind = "expands"
+side = "after"
+
+[[impact]]
+symbol = "i31_proc_macro_body::describe_impl"
+class = "behaviour"
+confidence = "likely"
+reason = "calls-changed"
+distance = 1
+
+[[impact]]
+symbol = "i31_proc_macro_body::derive_describe"
+class = "behaviour"
+confidence = "likely"
+distance = 2
+tags = ["public-api"]
+
+[[impact]]
+symbol = "i31_proc_macro_body_user::Point"
+class = "behaviour"
+confidence = "possible"
+distance = 3
+
+# The generated impl and its method are separate symbols of the expansion.
+[[impact]]
+symbol = "i31_proc_macro_body_user::<impl Greet for Point>"
+class = "behaviour"
+confidence = "possible"
+distance = 3
+
+[[impact]]
+symbol = "i31_proc_macro_body_user::<impl Greet for Point>::greet"
+class = "behaviour"
+confidence = "possible"
+distance = 3
+
+# The callers of the generated method follow the behaviour propagation.
+[[impact]]
+symbol = "i31_proc_macro_body_user::greet_point"
+class = "behaviour"
+confidence = "possible"
+distance = 4
+
+# A helper the change does not go through is not reached.
+[[no_impact]]
+symbol = "i31_proc_macro_body::struct_name"
