@@ -111,6 +111,9 @@ the same file — and the innermost one is the item that has to be edited.
 An error in a file that is not part of the project (a dependency, the standard
 library) is counted as *outside*, and an error inside a project file but outside
 every symbol as *unmapped*; both are reported per case rather than guessed at.
+An error whose primary span lies in the body of a macro from another crate — a
+comparison in `assert_eq!`, say — is mapped through the macro's expansion chain
+to the call site in the project, which is where a person would edit.
 The changed definition itself is excused on both sides: it is allowed to break
 inside its own body, and that is not what the list is for.
 
@@ -165,17 +168,20 @@ Every exclusion is counted and reported by reason:
   with an error type and suppresses the errors the code around it would produce,
   so the error list is not the whole truth for that edit; the case is not
   scored.
-- `crate-not-checked` — no crate holding an item of the case was built, because
+- `crate-not-checked` — no target holding an item of the case was built, because
   a dependency failed to compile.
 - `failed-only-in-doc-tests` — version 1 of Blastr does not analyse doctests
   (a documented limit), so a mutant that only breaks a doc example is not an
   accuracy question.
 
-Items in crates that the compiler did not build are not counted as misses or as
+Items in targets the compiler never started are not counted as misses or as
 false alarms either: they are counted as **unconfirmed** and left out of both
-sides. That happens whenever an edit to a library makes its dependents fail to
-build — the dependents are then never checked, and nothing can confirm or refute
-what Blastr says about them.
+sides. A target counts as judged when Cargo reports an artifact for it or a
+diagnostic from it — Cargo labels every diagnostic with the crate root of the
+target it came from. That happens whenever an edit to a library makes its
+dependents fail to build: the dependents, the integration tests and the binary
+that link against the library are then never compiled, and nothing can confirm
+or refute what Blastr says about them.
 
 ## Known limits
 
@@ -186,15 +192,20 @@ what Blastr says about them.
   and so should anyone analysing it by hand. This looks like a bug in the loading
   path rather than a property of the project; it is recorded here instead of
   being papered over.
-- A crate is treated as checked or unchecked as a whole. Cargo reports its
-  progress per package, not per target, so a case where only one target of a
-  package was built is not distinguished.
+- A target that failed with a message of its own but no source span (a
+  `failure-note`) is not distinguished from one that never started, since Cargo
+  names no crate root for such a message.
 - Test names are compared as libtest prints them (the path without the crate
   segment, which is what `SelectedTest::filter` holds). Two tests with the same
   name in different targets cannot be told apart, which can only make Blastr
   look better than it is.
 - Only `cargo check`'s and `cargo test`'s output is used; a build script or a
   procedural macro that fails shows up as `cargo-failed`.
+- rustc reports at most one privacy error per target when a private field is
+  *accessed* (`E0616`) and then stops checking the privacy of the other sites in
+  that target, so a case whose errors include `E0616` can under-report the
+  literals and patterns that name the field. Blastr may list a site the error
+  list does not mention; the list is right and the compiler stopped early.
 - Items that a macro produced have the span of the macro call, not of a syntax
   node of their own, so no edit is planned for them. The number of unplanned
   edits is reported.

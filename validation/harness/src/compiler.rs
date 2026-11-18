@@ -14,9 +14,10 @@
 //! itself failed, the case is excluded and counted under its reason.
 
 use std::collections::BTreeSet;
+use std::path::Path;
 
 use blastr_core::{FileEdit, build_id};
-use blastr_model::{AnalysisParams, ImpactClass, RevisionGraph, SymbolId};
+use blastr_model::{AnalysisParams, ImpactClass, RelPath, RevisionGraph, SymbolId};
 
 use crate::cargo::{self, CheckOutput, Diagnostic};
 use crate::edits::EditKind;
@@ -222,12 +223,12 @@ fn run_case(
     let mut expected: BTreeSet<String> = BTreeSet::new();
     let mut outside = 0_u32;
     let mut unmapped = 0_u32;
-    let mut relevant_crates: BTreeSet<String> = BTreeSet::new();
+    let mut relevant_roots: BTreeSet<RelPath> = BTreeSet::new();
     for error in &check.errors {
         match place(&span_index, project.copy(), error) {
             Placement::Symbol(path) => {
                 expected.insert(path.path.clone());
-                note_crate(&variant.head, &path.path, &mut relevant_crates);
+                note_roots(&variant.head, &path.path, &mut relevant_roots);
             }
             Placement::FileOnly(file) => {
                 unmapped = unmapped.saturating_add(1);
@@ -258,17 +259,25 @@ fn run_case(
         .filter(|path| path != &case.symbol)
         .collect();
 
-    // A crate the compiler never built cannot confirm or deny its items: a
-    // crate whose dependency failed to compile is not built at all, so the
-    // items it holds are neither confirmed nor refuted. Those items are left
-    // out of both sides and counted; a case whose items are all in such crates
-    // is not scored at all.
-    note_crate(&variant.head, &case.symbol, &mut relevant_crates);
-    let built = built_packages(&check, &run.stderr);
+    // A target the compiler never started cannot confirm or deny its items: a
+    // failing library stops every target that links against it, so a test, a
+    // binary or a dependent crate is not built at all. Cargo names the target
+    // of every diagnostic and the crate root of every artifact, so an item is
+    // judged exactly when the root file of its target was compiled. Items that
+    // were not are left out of both sides and counted; a case whose items are
+    // all in such targets is not scored at all.
+    note_roots(&variant.head, &case.symbol, &mut relevant_roots);
+    for path in expected.iter().chain(listed.iter()) {
+        note_roots(&variant.head, path, &mut relevant_roots);
+    }
+    let judged = judged_targets(&check, project.copy());
     let checked = |path: &String| {
-        let mut packages = BTreeSet::new();
-        note_crate(&variant.head, path, &mut packages);
-        packages.is_empty() || packages.iter().any(|package| built.contains(package))
+        let Some(judged) = &judged else {
+            return true;
+        };
+        let mut roots = BTreeSet::new();
+        note_roots(&variant.head, path, &mut roots);
+        roots.is_empty() || roots.iter().any(|root| judged.contains(root))
     };
     let expected_checked: BTreeSet<String> = expected
         .iter()
@@ -285,35 +294,33 @@ fn run_case(
     )
     .unwrap_or(u32::MAX);
 
-    let confirmed_crates: Vec<&String> = relevant_crates
-        .iter()
-        .filter(|package| built.contains(*package))
-        .collect();
-    if confirmed_crates.is_empty() && !relevant_crates.is_empty() {
+    let confirmed: Vec<&RelPath> = match &judged {
+        Some(judged) => relevant_roots
+            .iter()
+            .filter(|root| judged.contains(*root))
+            .collect(),
+        None => relevant_roots.iter().collect(),
+    };
+    if confirmed.is_empty() && !relevant_roots.is_empty() {
         result.excluded = Some("crate-not-checked".to_owned());
         result.notes.push(format!(
             "the compiler did not build {}",
-            relevant_crates
-                .iter()
-                .map(|package| package.as_str())
-                .collect::<Vec<&str>>()
-                .join(", ")
+            target_names(&variant.head, &relevant_roots)
         ));
         return Ok((result, evidence));
     }
-    if result.unconfirmed > 0 {
-        let missing: Vec<&String> = relevant_crates
+    if result.unconfirmed > 0
+        && let Some(judged) = &judged
+    {
+        let missing: BTreeSet<RelPath> = relevant_roots
             .iter()
-            .filter(|package| !built.contains(*package))
+            .filter(|root| !judged.contains(*root))
+            .cloned()
             .collect();
         result.notes.push(format!(
-            "{} item(s) in crates the compiler did not build ({})",
+            "{} item(s) in targets the compiler did not build ({})",
             result.unconfirmed,
-            missing
-                .iter()
-                .map(|package| package.as_str())
-                .collect::<Vec<&str>>()
-                .join(", ")
+            target_names(&variant.head, &missing)
         ));
     }
 
@@ -358,34 +365,69 @@ fn place(index: &SpanIndex, copy: &std::path::Path, error: &Diagnostic) -> Place
     map::place(index, copy, file, error.start, error.end)
 }
 
-/// Adds the package a symbol belongs to, when the graph knows it.
-fn note_crate(graph: &RevisionGraph, path: &str, into: &mut BTreeSet<String>) {
+/// Adds the crate roots of the crates that hold the symbol at `path`.
+fn note_roots(graph: &RevisionGraph, path: &str, into: &mut BTreeSet<RelPath>) {
     for symbol in &graph.symbols {
         if symbol.path.path != path {
             continue;
         }
         if let Some(info) = graph.crates.get(symbol.krate.0 as usize) {
-            into.insert(info.package.clone());
+            into.insert(info.root_file.clone());
         }
     }
 }
 
-/// The packages the compiler built something for, over every target kind but
-/// build scripts.
+/// The crate root files of the targets the compiler started, whether they
+/// succeeded or not; `None` when Cargo's messages named no root file at all.
 ///
-/// A unit that failed to compile produces no artifact message at all, so the
-/// progress lines on standard error are read as well: they name every unit
-/// Cargo checked, built or found fresh.
-fn built_packages(check: &CheckOutput, stderr: &str) -> BTreeSet<String> {
-    let mut packages = cargo::progress_packages(stderr);
-    packages.extend(
-        check
-            .artifacts
-            .iter()
-            .filter(|artifact| artifact.kind != "custom-build")
-            .map(|artifact| artifact.package.clone()),
-    );
-    packages
+/// A target that compiled reports an artifact; a target that failed reports
+/// diagnostics, which Cargo labels with the crate root of the target they come
+/// from. A target that never started does neither.
+fn judged_targets(check: &CheckOutput, root: &Path) -> Option<BTreeSet<RelPath>> {
+    let mut roots = BTreeSet::new();
+    let mut named = false;
+    for artifact in &check.artifacts {
+        if artifact.kind == "custom-build" {
+            continue;
+        }
+        if let Some(path) = &artifact.root_file {
+            named = true;
+            if let Some(relative) = map::rel_path(root, path) {
+                roots.insert(relative);
+            }
+        }
+    }
+    for error in &check.errors {
+        if let Some(path) = &error.root_file {
+            named = true;
+            if let Some(relative) = map::rel_path(root, path) {
+                roots.insert(relative);
+            }
+        }
+    }
+    named.then_some(roots)
+}
+
+/// How the given crate roots are shown in a note: `package (target)`, or the
+/// path of a root no crate of the graph owns.
+fn target_names(graph: &RevisionGraph, roots: &BTreeSet<RelPath>) -> String {
+    let mut names: Vec<String> = Vec::new();
+    for root in roots {
+        let mut owned = false;
+        for info in &graph.crates {
+            if &info.root_file != root {
+                continue;
+            }
+            owned = true;
+            names.push(format!("{} ({})", info.package, info.target_name));
+        }
+        if !owned {
+            names.push(root.as_str().to_owned());
+        }
+    }
+    names.sort();
+    names.dedup();
+    names.join(", ")
 }
 
 /// The number of symbols that depend on the changed one, by plain reverse
@@ -547,33 +589,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_missing_crate_is_reported_not_scored() {
+    fn a_target_that_never_started_is_not_judged() {
+        let root = Path::new("C:/tmp/copy");
         let check = CheckOutput {
             artifacts: vec![cargo::Artifact {
                 package: "tinycore".to_owned(),
                 kind: "lib".to_owned(),
                 target: "tinycore".to_owned(),
+                root_file: Some(root.join("tinycore/src/lib.rs")),
+            }],
+            errors: vec![Diagnostic {
+                code: "E0308".to_owned(),
+                message: String::new(),
+                file: None,
+                start: 0,
+                end: 0,
+                line: 1,
+                root_file: Some(root.join("tinycore/src/lib.rs")),
             }],
             ..CheckOutput::default()
         };
-        let stderr = "   Checking tinyapp v0.1.0 (C:\\tmp)\\n    Fresh tinycore v0.1.0";
-        let built = built_packages(&check, stderr);
-        assert!(built.contains("tinycore"));
-        assert!(built.contains("tinyapp"));
-        assert!(!built.contains("tinyother"));
+
+        let judged = judged_targets(&check, root).expect("the messages name their targets");
+
+        assert!(judged.contains(&RelPath::new("tinycore/src/lib.rs")));
+        assert!(
+            !judged.contains(&RelPath::new("tinyapp/tests/smoke.rs")),
+            "a test of a crate that failed to compile never ran"
+        );
     }
 
     #[test]
-    fn progress_lines_name_the_units_cargo_checked() {
-        let stderr = concat!(
-            "   Compiling tinycore v0.1.0 (/tmp/copy/geometry)\n",
-            "    Building [===>     ] 1/2: tinycore\n",
-            "error: could not compile `tinycore` (lib)\n",
-            "warning: build failed, waiting for other jobs to finish...\n",
-        );
-        let packages = cargo::progress_packages(stderr);
-        assert_eq!(packages.len(), 1);
-        assert!(packages.contains("tinycore"));
+    fn without_target_information_every_item_is_judged() {
+        let check = CheckOutput::default();
+        assert!(judged_targets(&check, Path::new("C:/tmp/copy")).is_none());
     }
 
     #[test]

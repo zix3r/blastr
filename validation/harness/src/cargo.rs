@@ -5,7 +5,7 @@
 //! output of one libtest binary after another. Both are parsed here, so that
 //! the checks themselves only deal with diagnostics and test names.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -42,6 +42,8 @@ pub struct Diagnostic {
     pub end: u32,
     /// Line of the primary span, starting at 1.
     pub line: u32,
+    /// The crate root of the target the compiler reported this in.
+    pub root_file: Option<PathBuf>,
 }
 
 /// One target Cargo built.
@@ -53,6 +55,8 @@ pub struct Artifact {
     pub kind: String,
     /// The target name.
     pub target: String,
+    /// The crate root file of the target.
+    pub root_file: Option<PathBuf>,
 }
 
 /// What `cargo check` said.
@@ -172,7 +176,12 @@ pub fn parse_check(stdout: &str, dir: &Path) -> CheckOutput {
         match value.get("reason").and_then(|reason| reason.as_str()) {
             Some("compiler-message") => {
                 if let Some(message) = value.get("message") {
-                    read_message(message, dir, &mut output);
+                    let root_file = value
+                        .get("target")
+                        .and_then(|target| target.get("src_path"))
+                        .and_then(|path| path.as_str())
+                        .map(PathBuf::from);
+                    read_message(message, dir, root_file, &mut output);
                 }
             }
             Some("compiler-artifact") => {
@@ -192,10 +201,15 @@ pub fn parse_check(stdout: &str, dir: &Path) -> CheckOutput {
                     .and_then(|target| target.get("name"))
                     .and_then(|name| name.as_str())
                     .unwrap_or_default();
+                let root_file = target
+                    .and_then(|target| target.get("src_path"))
+                    .and_then(|path| path.as_str())
+                    .map(PathBuf::from);
                 output.artifacts.push(Artifact {
                     package,
                     kind: kind.to_owned(),
                     target: name.to_owned(),
+                    root_file,
                 });
             }
             _ => {}
@@ -205,7 +219,12 @@ pub fn parse_check(stdout: &str, dir: &Path) -> CheckOutput {
 }
 
 /// Reads one `compiler-message` payload into `output`.
-fn read_message(message: &serde_json::Value, dir: &Path, output: &mut CheckOutput) {
+fn read_message(
+    message: &serde_json::Value,
+    dir: &Path,
+    root_file: Option<PathBuf>,
+    output: &mut CheckOutput,
+) {
     if message.get("level").and_then(|level| level.as_str()) != Some("error") {
         return;
     }
@@ -233,6 +252,7 @@ fn read_message(message: &serde_json::Value, dir: &Path, output: &mut CheckOutpu
         output.spanless.push(text);
         return;
     };
+    let primary = project_span(primary);
     let file = primary
         .get("file_name")
         .and_then(|name| name.as_str())
@@ -258,7 +278,33 @@ fn read_message(message: &serde_json::Value, dir: &Path, output: &mut CheckOutpu
         start: number("byte_start"),
         end: number("byte_end"),
         line: number("line_start"),
+        root_file,
     });
+}
+
+/// The span of `first` that lies in the project, following the expansion chain
+/// of a macro when the diagnostic points into the macro's own definition.
+///
+/// `assert_eq!` and friends are defined in the standard library, and an error
+/// about the comparison itself is reported at the macro's body, in a file
+/// outside the project. Its expansion names the call site, which is the place a
+/// person would edit, so the innermost project span wins.
+fn project_span(first: &serde_json::Value) -> &serde_json::Value {
+    let mut span = first;
+    for _ in 0..8 {
+        if span
+            .get("file_name")
+            .and_then(|name| name.as_str())
+            .is_some_and(|name| !Path::new(name).is_absolute())
+        {
+            return span;
+        }
+        let Some(next) = span.get("expansion").and_then(|chain| chain.get("span")) else {
+            break;
+        };
+        span = next;
+    }
+    first
 }
 
 /// The package name of a Cargo package id such as
@@ -389,32 +435,6 @@ pub fn stopped_at_resolution(codes: &[String]) -> bool {
             .all(|code| RESOLUTION_CODES.contains(&code.as_str()))
 }
 
-/// The packages Cargo said it was checking, from the progress lines it writes
-/// to standard error: `   Checking tinycore v0.1.0 (…)`.
-///
-/// Cargo emits no `compiler-artifact` message for a unit that failed, and a
-/// failing build is exactly when the question "was this crate checked?" has to
-/// be answered, so the progress lines are read as well.
-pub fn progress_packages(stderr: &str) -> BTreeSet<String> {
-    let mut packages = BTreeSet::new();
-    for line in stderr.lines() {
-        let head = line.trim_start();
-        for prefix in ["Checking ", "Compiling ", "Fresh ", "Documenting "] {
-            let Some(rest) = head.strip_prefix(prefix) else {
-                continue;
-            };
-            // `name v1.0.0 (path)`; a progress bar line starts with `[`.
-            if let Some((name, _)) = rest.split_once(" v") {
-                let name = name.trim();
-                if !name.is_empty() {
-                    packages.insert(name.to_owned());
-                }
-            }
-        }
-    }
-    packages
-}
-
 /// Counts of error codes, for the report.
 pub fn error_codes(errors: &[Diagnostic]) -> BTreeMap<String, u32> {
     let mut counts = BTreeMap::new();
@@ -453,13 +473,13 @@ mod tests {
     #[test]
     fn compiler_messages_are_read_with_their_primary_span() {
         let stdout = concat!(
-            r#"{"reason":"compiler-message","message":{"level":"error","code":{"code":"E0308"},"message":"mismatched types","spans":[{"is_primary":true,"file_name":"src/lib.rs","byte_start":10,"byte_end":14,"line_start":2}]}}"#,
+            r#"{"reason":"compiler-message","package_id":"path+file:///p#app@0.1.0","target":{"kind":["lib"],"name":"app","src_path":"/project/src/lib.rs"},"message":{"level":"error","code":{"code":"E0308"},"message":"mismatched types","spans":[{"is_primary":true,"file_name":"src/lib.rs","byte_start":10,"byte_end":14,"line_start":2}]}}"#,
             "\n",
             r#"{"reason":"compiler-message","message":{"level":"warning","code":{"code":"unused"},"message":"unused","spans":[]}}"#,
             "\n",
             r#"{"reason":"compiler-message","message":{"level":"error","code":null,"message":"could not compile `app` (lib)","spans":[]}}"#,
             "\n",
-            r#"{"reason":"compiler-artifact","package_id":"path+file:///p#app@0.1.0","target":{"kind":["lib"],"name":"app"}}"#,
+            r#"{"reason":"compiler-artifact","package_id":"path+file:///p#app@0.1.0","target":{"kind":["lib"],"name":"app","src_path":"/project/src/lib.rs"}}"#,
             "\n"
         );
         let dir = Path::new("/project");
@@ -474,11 +494,20 @@ mod tests {
             error.file.as_deref(),
             Some(dir.join("src/lib.rs").as_path())
         );
+        assert_eq!(
+            error.root_file.as_deref(),
+            Some(Path::new("/project/src/lib.rs")),
+            "the diagnostic names the crate root of its target"
+        );
         assert_eq!(parsed.spanless.len(), 1);
         assert_eq!(parsed.artifacts.len(), 1);
         assert_eq!(parsed.artifacts[0].package, "app");
         assert_eq!(parsed.artifacts[0].kind, "lib");
         assert_eq!(parsed.artifacts[0].target, "app");
+        assert_eq!(
+            parsed.artifacts[0].root_file.as_deref(),
+            Some(Path::new("/project/src/lib.rs"))
+        );
     }
 
     #[test]
@@ -538,6 +567,7 @@ test result: FAILED. 0 passed; 1 failed;\n";
                 start: 0,
                 end: 0,
                 line: 1,
+                root_file: None,
             },
             Diagnostic {
                 code: "E0308".to_owned(),
@@ -546,6 +576,7 @@ test result: FAILED. 0 passed; 1 failed;\n";
                 start: 0,
                 end: 0,
                 line: 1,
+                root_file: None,
             },
             Diagnostic {
                 code: String::new(),
@@ -554,6 +585,7 @@ test result: FAILED. 0 passed; 1 failed;\n";
                 start: 0,
                 end: 0,
                 line: 1,
+                root_file: None,
             },
         ];
         let counts = error_codes(&errors);
