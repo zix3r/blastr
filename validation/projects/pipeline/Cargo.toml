@@ -1,0 +1,19 @@
+[workspace]
+resolver = "3"
+members = ["pipeline-core", "pipeline-stages", "pipeline-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[workspace.dependencies]
+pipeline-core = { path = "pipeline-core" }
+pipeline-stages = { path = "pipeline-stages" }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

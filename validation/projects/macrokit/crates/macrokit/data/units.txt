@@ -1,0 +1,106 @@
+# Unit table for macrokit.
+#
+# Columns, separated by `|`:
+#   symbol | dimension | scale | offset
+#
+# The canonical value of a unit is `value * scale + offset`, expressed in the
+# base units of its dimension. Dimensions are written as space separated
+# `CODE<exponent>` tokens; codes are, in the order used by `[i8; 7]`:
+#   LEN MASS TIME CURR TEMP AMT LUM
+# An omitted exponent means 1, an empty dimension means "dimensionless".
+#
+# The file is sorted by symbol; `build.rs` sorts again and rejects duplicates,
+# so the generated table is stable across machines.
+
+# --- ratios ---------------------------------------------------------------
+percent|LEN0|0.01|0
+ppm|LEN0|0.000001|0
+ratio|LEN0|1|0
+
+# --- length ---------------------------------------------------------------
+m|LEN1|1|0
+km|LEN1|1000|0
+dm|LEN1|0.1|0
+cm|LEN1|0.01|0
+mm|LEN1|0.001|0
+um|LEN1|0.000001|0
+in|LEN1|0.0254|0
+ft|LEN1|0.3048|0
+yd|LEN1|0.9144|0
+mi|LEN1|1609.344|0
+
+# --- mass -----------------------------------------------------------------
+kg|MASS1|1|0
+g|MASS1|0.001|0
+mg|MASS1|0.000001|0
+t|MASS1|1000|0
+lb|MASS1|0.45359237|0
+
+# --- time -----------------------------------------------------------------
+s|TIME1|1|0
+ms|TIME1|0.001|0
+us|TIME1|0.000001|0
+min|TIME1|60|0
+h|TIME1|3600|0
+day|TIME1|86400|0
+
+# --- electric current -----------------------------------------------------
+A|CURR1|1|0
+mA|CURR1|0.001|0
+
+# --- temperature ----------------------------------------------------------
+K|TEMP1|1|0
+degC|TEMP1|1|273.15
+degF|TEMP1|0.5555555555555556|255.37222222222223
+degR|TEMP1|0.5555555555555556|0
+
+# --- amount of substance --------------------------------------------------
+mol|AMT1|1|0
+kmol|AMT1|1000|0
+
+# --- luminous intensity ---------------------------------------------------
+cd|LUM1|1|0
+
+# --- mechanics ------------------------------------------------------------
+N|MASS1 LEN1 TIME-2|1|0
+kN|MASS1 LEN1 TIME-2|1000|0
+Pa|MASS1 LEN-1 TIME-2|1|0
+hPa|MASS1 LEN-1 TIME-2|100|0
+kPa|MASS1 LEN-1 TIME-2|1000|0
+MPa|MASS1 LEN-1 TIME-2|1000000|0
+bar|MASS1 LEN-1 TIME-2|100000|0
+mbar|MASS1 LEN-1 TIME-2|100|0
+psi|MASS1 LEN-1 TIME-2|6894.757293168361|0
+J|MASS1 LEN2 TIME-2|1|0
+kJ|MASS1 LEN2 TIME-2|1000|0
+kWh|MASS1 LEN2 TIME-2|3600000|0
+W|MASS1 LEN2 TIME-3|1|0
+kW|MASS1 LEN2 TIME-3|1000|0
+MW|MASS1 LEN2 TIME-3|1000000|0
+
+# --- volume and flow ------------------------------------------------------
+m2|LEN2|1|0
+mm2|LEN2|0.000001|0
+m3|LEN3|1|0
+l|LEN3|0.001|0
+ml|LEN3|0.000001|0
+gal|LEN3|0.003785411784|0
+m3/s|LEN3 TIME-1|1|0
+l/s|LEN3 TIME-1|0.001|0
+l/min|LEN3 TIME-1|0.000016666666666666666|0
+l/h|LEN3 TIME-1|0.0000002777777777777778|0
+
+# --- speed ----------------------------------------------------------------
+m/s|LEN1 TIME-1|1|0
+mm/s|LEN1 TIME-1|0.001|0
+km/h|LEN1 TIME-1|0.2777777777777778|0
+
+# --- fluid properties -----------------------------------------------------
+kg/m3|MASS1 LEN-3|1|0
+J/(kg K)|LEN2 TIME-2 TEMP-1|1|0
+kJ/(kg K)|LEN2 TIME-2 TEMP-1|1000|0
+J/K|MASS1 LEN2 TIME-2 TEMP-1|1|0
+
+# --- rotation -------------------------------------------------------------
+Hz|TIME-1|1|0
+rpm|TIME-1|0.016666666666666666|0

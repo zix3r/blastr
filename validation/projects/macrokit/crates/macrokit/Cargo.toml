@@ -1,0 +1,19 @@
+[package]
+name = "macrokit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Typed, unit-aware configuration settings driven by hand-written macros."
+build = "build.rs"
+
+[features]
+default = ["metric"]
+# Metric helpers: SI prefix ladders and human readable scale names.
+metric = []
+# Imperial helpers: Fahrenheit, psi and US gallon conversions.
+imperial = []
+
+[dependencies]
+macrokit-derive = { path = "../macrokit-derive", version = "0.1.0" }

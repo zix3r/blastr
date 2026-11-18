@@ -1,0 +1,46 @@
+# Baseline setting definitions for macrokit's generated schema.
+#
+# Columns, separated by `|`:
+#   key | kind | default | required | aliases | deprecated | doc
+#
+# `kind` is one of:
+#   bool
+#   int:<min>..<max>
+#   float:<min>..<max>
+#   text:<max-len>
+#   quantity:<dimension>;<min>..<max>
+#
+# Quantity bounds are expressed in the canonical (base SI) unit of the
+# dimension. `aliases` is a comma separated list and may be empty. Defaults are
+# validated by `build.rs` against the unit table, which keeps the two generated
+# tables consistent.
+
+fluid.density|quantity:MASS1 LEN-3;1..20000|998 kg/m3|false|rho,density||Density of the working fluid.
+fluid.flow.maximum|quantity:LEN3 TIME-1;0..10|0.005 m3/s|false|||Upper volumetric flow limit of the loop.
+fluid.flow.nominal|quantity:LEN3 TIME-1;0..10|0.0025 m3/s|true|flow||Nominal volumetric flow of the loop.
+fluid.heat.capacity|quantity:LEN2 TIME-2 TEMP-1;100..10000|4186 J/(kg K)|false|cp||Specific heat capacity of the working fluid.
+heat.design.duty|quantity:MASS1 LEN2 TIME-3;0..10000000|320000 W|false|||Thermal duty the loop is designed for.
+io.scan.rate|quantity:TIME-1;0.1..10000|50 Hz|false|||Field bus scan rate.
+io.timeout|quantity:TIME1;0..60|2.5 s|false|||Field bus response timeout.
+legacy.offset|quantity:LEN1;-100..100||false||Superseded by site.elevation.|Legacy export offset kept for old configurations.
+logging.format|text:16|plain|false|log-format||Log line format.
+logging.level|text:8|info|false|||Log verbosity.
+loop.enabled|bool|true|false|||Enable closed loop control.
+loop.gain|float:0..1000|1.25|false|kp||Proportional gain of the controller.
+loop.integral|quantity:TIME1;0..3600|30 s|false|ti||Integral (reset) time of the controller.
+loop.name|text:32|primary|false|||Operator label of the control loop.
+motor.nominal.speed|quantity:TIME-1;0..200|1450 rpm|false|rpm||Nominal motor speed.
+motor.poles|int:2..24|4|false|||Number of motor poles.
+power.limit|quantity:MASS1 LEN2 TIME-3;0..10000000|350000 W|false|max.power||Electrical power budget of the station.
+pump.efficiency|float:0.2..1|0.68|false|eff||Hydraulic efficiency of the circulation pump.
+pump.head|quantity:MASS1 LEN-1 TIME-2;0..5000000|150000 Pa|false|||Pressure the circulation pump has to deliver.
+safety.trip.enabled|bool|true|false|||Trip the loop when a sensor fails.
+safety.trip.margin|float:0..100|12.5|false|||Trip margin as a percentage of the sensor range.
+sample.averaging|int:1..64|4|false|avg,window||Samples in the moving average.
+sample.interval|quantity:TIME1;0.001..3600|1 s|true|||Interval between control loop samples.
+sensor.return.temperature|quantity:TEMP1;200..500|320 K|false|return.temp||Return side temperature.
+sensor.supply.pressure|quantity:MASS1 LEN-1 TIME-2;0..2000000|101325 Pa|false|||Supply side pressure.
+sensor.supply.temperature|quantity:TEMP1;200..500|350 K|true|supply.temp||Supply side temperature.
+site.elevation|quantity:LEN1;-500..9000|120 m|false|||Site elevation above sea level.
+site.name|text:64|bay-1|false|||Site identifier.
+vessel.rating.pressure|quantity:MASS1 LEN-1 TIME-2;0..5000000|1000000 Pa|false|||Maximum design pressure of the vessel.

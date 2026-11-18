@@ -1,0 +1,13 @@
+[package]
+name = "macrokit-derive"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Hand-written proc_macro crate for macrokit: derive(Describe) and #[command]."
+
+[lib]
+proc-macro = true
+
+[dependencies]
