@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+mod base;
 mod codec;
 pub mod config;
 pub mod diff;
@@ -23,6 +24,10 @@ pub mod wording;
 /// The version of this build, as `Cargo.toml` states it.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The version of the rust-analyzer libraries this build uses.
+pub const RUST_ANALYZER_VERSION: &str = blastr_ra::RUST_ANALYZER_VERSION;
+
+pub use base::{FileEdit, ProjectBase, Variant};
 pub use blastr_model::{CancelToken, NoProgress, Progress};
 pub use codec::{decode_graph, encode_graph};
 pub use engine::{CacheStatus, DiffOutput, Engine, IndexReport, build_id};

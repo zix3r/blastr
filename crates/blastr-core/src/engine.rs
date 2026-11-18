@@ -1376,7 +1376,7 @@ fn read_text_file(root: &Path, path: &RelPath) -> Result<Option<String>> {
 }
 
 /// What limits the completeness of a comparison.
-fn collect_limits(
+pub(crate) fn collect_limits(
     repo: Option<&Repo>,
     head: &RevisionGraph,
     _changed_files: &[ChangedFile],
