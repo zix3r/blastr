@@ -1001,9 +1001,10 @@ mod tests {
 
     #[test]
     fn an_engine_of_another_build_is_refused() {
-        assert!(mismatch(protocol::PROTOCOL_VERSION, "0.1.0+abcd1234").is_none());
-        let wrong_protocol = mismatch(protocol::PROTOCOL_VERSION + 1, "0.1.0+abcd1234")
-            .expect("a mismatched protocol");
+        let this_build = format!("{}+abcd1234", blastr_core::VERSION);
+        assert!(mismatch(protocol::PROTOCOL_VERSION, &this_build).is_none());
+        let wrong_protocol =
+            mismatch(protocol::PROTOCOL_VERSION + 1, &this_build).expect("a mismatched protocol");
         assert!(wrong_protocol.contains("protocol"), "{wrong_protocol}");
         let wrong_version =
             mismatch(protocol::PROTOCOL_VERSION, "9.9.9+abcd1234").expect("a mismatched version");

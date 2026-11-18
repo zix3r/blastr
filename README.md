@@ -15,8 +15,15 @@
   <img alt="Licence: MIT or Apache-2.0" src="https://img.shields.io/badge/licence-MIT%20%2F%20Apache--2.0-0b1220?style=flat-square&labelColor=111827&color=ff7048">
   <img alt="Rust 1.100" src="https://img.shields.io/badge/rust-1.100-0b1220?style=flat-square&labelColor=111827&color=ff7048">
   <img alt="Windows and Linux" src="https://img.shields.io/badge/platforms-windows%20%7C%20linux-0b1220?style=flat-square&labelColor=111827&color=ff7048">
-  <img alt="Status: pre-release" src="https://img.shields.io/badge/status-pre--release-0b1220?style=flat-square&labelColor=111827&color=9aa3b2">
+  <a href="https://crates.io/crates/blastr"><img alt="crates.io" src="https://img.shields.io/crates/v/blastr?style=flat-square&logo=rust&logoColor=white&labelColor=111827&color=ff7048"></a>
   <a href="https://ko-fi.com/zix3r"><img alt="Support on Ko-fi" src="https://img.shields.io/badge/support-ko--fi-0b1220?style=flat-square&logo=kofi&logoColor=white&labelColor=111827&color=ff7048"></a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/zix3r/blastr"><b>GitHub</b></a> ·
+  <a href="https://crates.io/crates/blastr"><b>crates.io</b></a> ·
+  <a href="https://github.com/zix3r/blastr/releases"><b>Downloads</b></a> ·
+  <a href="https://ko-fi.com/zix3r"><b>Support</b></a>
 </p>
 
 <p align="center">
