@@ -251,6 +251,9 @@ pub struct AnalysisOptions {
     /// Directory containing the `Cargo.toml` to load, relative to the
     /// repository root; `None` means the root itself.
     pub manifest_dir: Option<RelPath>,
+    /// Whether a comparison of the working tree keeps following it: the
+    /// engine then recomputes when a saved file changes it.
+    pub watch: bool,
 }
 
 /// Identifies exactly what a result describes. Two results with equal keys
@@ -440,6 +443,12 @@ pub enum Limit {
     Unresolved {
         /// How many.
         count: u32,
+    },
+    /// The procedural macros of crates the analysed code uses could not be
+    /// loaded, so everything they expand to is missing from the graph.
+    MacrosNotExpanded {
+        /// The crates whose macros failed, sorted and without duplicates.
+        crates: Vec<String>,
     },
 }
 

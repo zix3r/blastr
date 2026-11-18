@@ -927,6 +927,31 @@
             "unresolved"
           ],
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The procedural macros of crates the analysed code uses could not be\nloaded, so everything they expand to is missing from the graph.",
+          "properties": {
+            "macros-not-expanded": {
+              "properties": {
+                "crates": {
+                  "description": "The crates whose macros failed, sorted and without duplicates.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "crates"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "macros-not-expanded"
+          ],
+          "type": "object"
         }
       ]
     },

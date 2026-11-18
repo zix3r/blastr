@@ -1,6 +1,6 @@
 [package]
 name = "blastr-ra"
-description = "rust-analyzer adapter for Blastr"
+description = "Internal crate of Blastr (the rust-analyzer adapter); not a stable API"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -21,6 +21,7 @@ ra_ap_project_model.workspace = true
 ra_ap_syntax.workspace = true
 ra_ap_vfs.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 unicode-properties.workspace = true
 
 [dev-dependencies]

@@ -6,12 +6,13 @@
 //! virtual file system. The build scripts and the procedural-macro server are
 //! only used when the caller allows execution.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
 
 use blastr_model::{CancelToken, CrateInfo, ExecMode, Progress, TargetKind};
-use ra_ap_ide::AnalysisHost;
+use ra_ap_hir::{Crate, ProcMacros};
+use ra_ap_ide::{AnalysisHost, RootDatabase};
 use ra_ap_load_cargo::{LoadCargoConfig, ProcMacroServerChoice, ProjectFolders, load_workspace};
 use ra_ap_paths::{AbsPathBuf, Utf8PathBuf};
 use ra_ap_project_model::{
@@ -53,7 +54,52 @@ impl Workspace {
     /// `root` is the directory that `RelPath`s in the result are relative to
     /// (the repository root, or its snapshot); `manifest_dir` is `root` or below
     /// it. `cfg(test)` is always enabled for the crates of the workspace.
+    ///
+    /// A load that comes back without the procedural macros a crate of the
+    /// workspace depends on is tried again; what it lost is returned with the
+    /// project rather than refused, see [`Workspace::load_once`].
     pub fn load(
+        root: &Path,
+        manifest_dir: &Path,
+        options: &LoadOptions,
+        progress: &dyn Progress,
+        cancel: &CancelToken,
+    ) -> Result<Workspace, Error> {
+        let mut attempt = 1;
+        loop {
+            let workspace = Workspace::load_once(root, manifest_dir, options, progress, cancel)?;
+            if workspace.missing_proc_macros.is_empty() || attempt >= LOAD_ATTEMPTS {
+                return Ok(workspace);
+            }
+            attempt += 1;
+            // Whatever made the macros unavailable (a build that raced another
+            // cargo process, a server that was still starting) is often gone by
+            // the next attempt.
+            tracing::warn!("the load came back without some procedural macros; loading again");
+        }
+    }
+
+    /// One attempt at [`Workspace::load`].
+    ///
+    /// rust-analyzer reports a crate whose procedural macros could not be loaded
+    /// by expanding every call of them to nothing. Nothing in its API fails, so
+    /// a load that ran into that would quietly produce a graph without the items
+    /// those macros generate: without a derive's impls, or without the modules a
+    /// `automod::dir!` names, which is how a whole test target goes missing.
+    ///
+    /// Which macros load is not up to Blastr (the dylibs are built by Cargo and
+    /// expanded by server processes), so a load cannot fix a dylib that is not
+    /// there. It does not fail either: the missing crates are recorded in
+    /// [`Workspace::missing_proc_macros`] so that the result can say what it
+    /// does not contain, and no front end is left without an analysis.
+    ///
+    /// Only the procedural-macro crates that a crate of this workspace depends
+    /// on directly count. Those are the ones whose macros can expand in the
+    /// code Blastr extracts; a macro crate deeper in the dependency graph only
+    /// expands inside a dependency crate, whose items are not part of the graph
+    /// anyway, and one that Cargo never builds for this configuration (another
+    /// platform, an inactive feature) cannot affect anything at all.
+    fn load_once(
         root: &Path,
         manifest_dir: &Path,
         options: &LoadOptions,
@@ -139,6 +185,15 @@ impl Workspace {
             load_workspace(workspace, &cargo_config.extra_env, &load_config)
                 .map_err(|error| Error::Cargo(format!("{error:#}")))?;
         check_cancel(cancel)?;
+        // Every crate whose macros did not load contributes nothing to the
+        // graph, so the load records which ones a crate of this workspace
+        // depends on; the analysis reports them as a limit. Without execution
+        // they are not expected to load at all.
+        let missing_proc_macros = if options.exec == ExecMode::Full {
+            missing_proc_macros(&db)
+        } else {
+            Vec::new()
+        };
 
         let crates = loaded_targets(root, &vfs, targets);
         progress.report("database", 1, Some(1));
@@ -151,6 +206,7 @@ impl Workspace {
             toolchain,
             crates,
             restricted: options.exec == ExecMode::Restricted,
+            missing_proc_macros,
         })
     }
 }
@@ -161,6 +217,98 @@ impl Workspace {
 /// a time, so several of them let the workers of an extraction expand derives
 /// without waiting for each other.
 const PROC_MACRO_PROCESSES: usize = 4;
+
+/// How often [`Workspace::load`] tries before it keeps what it got.
+///
+/// Only a load that lost the procedural macros a crate depends on is tried
+/// again, so the second attempt costs nothing in the normal case.
+const LOAD_ATTEMPTS: u32 = 2;
+
+/// One crate of the database, reduced to what decides which macros are checked.
+#[derive(Debug, Clone)]
+struct CrateNode {
+    /// The crate is a member of this workspace, so Blastr extracts its items.
+    local: bool,
+    /// The crate is a procedural-macro crate, so its macros expand in whoever
+    /// calls them.
+    proc_macro: bool,
+    /// The indices of the crates it depends on directly.
+    depends_on: Vec<usize>,
+}
+
+/// The indices of the procedural-macro crates a local crate depends on
+/// directly, in order.
+///
+/// A macro can only expand in the crate that calls it, and only local crates
+/// are extracted, so these are the only macro crates whose failure can make the
+/// graph incomplete. A macro crate that only a dependency uses expands inside
+/// it, and one that Cargo never builds for this configuration expands nowhere;
+/// neither changes the graph.
+fn direct_proc_macro_dependencies(nodes: &[CrateNode]) -> Vec<usize> {
+    let mut selected = Vec::new();
+    for node in nodes.iter().filter(|node| node.local) {
+        for &dependency in &node.depends_on {
+            if nodes[dependency].proc_macro && !selected.contains(&dependency) {
+                selected.push(dependency);
+            }
+        }
+    }
+    selected.sort_unstable();
+    selected
+}
+
+/// The crates whose procedural macros a local crate needs but did not get,
+/// sorted and without duplicates.
+///
+/// Called after a load that was allowed to run build scripts and procedural
+/// macros, where a missing dylib is a failure of the environment and not the
+/// configuration the caller asked for. An empty list means every macro a local
+/// crate can expand arrived and the graph is complete.
+fn missing_proc_macros(db: &RootDatabase) -> Vec<String> {
+    let all = Crate::all(db);
+    let index: HashMap<Crate, usize> = all
+        .iter()
+        .enumerate()
+        .map(|(position, krate)| (*krate, position))
+        .collect();
+    let nodes: Vec<CrateNode> = all
+        .iter()
+        .map(|krate| CrateNode {
+            local: krate.origin(db).is_local(),
+            proc_macro: ProcMacros::get_for_crate(db, krate.base()).is_some(),
+            depends_on: krate
+                .dependencies(db)
+                .into_iter()
+                .filter_map(|dependency| index.get(&dependency.krate).copied())
+                .collect(),
+        })
+        .collect();
+
+    let mut failures = Vec::new();
+    for selected in direct_proc_macro_dependencies(&nodes) {
+        let krate = all[selected];
+        let Some(macros) = ProcMacros::get_for_crate(db, krate.base()) else {
+            continue;
+        };
+        if macros.get_error().is_some() {
+            // Any failure counts: a crate whose dylib was not built, or was not
+            // loaded, expands to nothing, so the items its macros generate are
+            // missing from the graph either way.
+            failures.push(display_name(krate, db));
+        }
+    }
+    failures.sort();
+    failures.dedup();
+    failures
+}
+
+/// The name of a crate as the project spells it.
+fn display_name(krate: Crate, db: &RootDatabase) -> String {
+    krate
+        .display_name(db)
+        .map(|name| name.canonical_name().as_str().to_owned())
+        .unwrap_or_else(|| "an unnamed crate".to_owned())
+}
 
 /// The Cargo features to enable.
 fn features(options: &LoadOptions) -> CargoFeatures {
@@ -373,8 +521,53 @@ fn path_text(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{crate_name, kind_rank, package_selector};
+    use super::{
+        CrateNode, crate_name, direct_proc_macro_dependencies, kind_rank, package_selector,
+    };
     use blastr_model::TargetKind;
+
+    /// One crate of the graph: local or not, a procedural macro or not, and
+    /// what it depends on directly.
+    fn node(local: bool, proc_macro: bool, depends_on: &[usize]) -> CrateNode {
+        CrateNode {
+            local,
+            proc_macro,
+            depends_on: depends_on.to_vec(),
+        }
+    }
+
+    #[test]
+    fn only_macros_a_local_crate_depends_on_directly_are_checked() {
+        // 0: the workspace member that is extracted;
+        // 1: a macro it calls;
+        // 2: a dependency that is not extracted; 3: a macro only 2 calls;
+        // 4: a macro Cargo never builds for this configuration, used by nobody.
+        let nodes = [
+            node(true, false, &[1, 2]),
+            node(false, true, &[]),
+            node(false, false, &[3]),
+            node(false, true, &[]),
+            node(false, true, &[]),
+        ];
+        assert_eq!(direct_proc_macro_dependencies(&nodes), [1]);
+    }
+
+    #[test]
+    fn a_macro_of_another_member_is_checked_once() {
+        // Two members call the same macro crate, which is a dependency of both.
+        let nodes = [
+            node(true, false, &[2]),
+            node(true, false, &[2]),
+            node(false, true, &[]),
+        ];
+        assert_eq!(direct_proc_macro_dependencies(&nodes), [2]);
+    }
+
+    #[test]
+    fn no_local_crate_means_no_macro_is_checked() {
+        let nodes = [node(false, false, &[1]), node(false, true, &[])];
+        assert!(direct_proc_macro_dependencies(&nodes).is_empty());
+    }
 
     #[test]
     fn crate_names_use_underscores() {

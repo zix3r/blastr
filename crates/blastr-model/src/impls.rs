@@ -117,6 +117,7 @@ impl Default for AnalysisOptions {
             target: None,
             exec: ExecMode::Full,
             manifest_dir: None,
+            watch: true,
         }
     }
 }

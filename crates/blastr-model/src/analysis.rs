@@ -1,8 +1,8 @@
 //! The result of an impact analysis: what a set of changes can affect, why,
 //! and which tests exercise it.
 //!
-//! These types are what the command line prints, what the JSON output
-//! contains and what the GUI consumes.
+//! These types are what the JSON output contains, what the window shows and
+//! what the engine process sends across its pipes.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -313,7 +313,7 @@ pub enum Assume {
 }
 
 impl Assume {
-    /// The kebab-case name of the assumed change, as written on the command line.
+    /// The kebab-case name of the assumed change, as a configuration file writes it.
     pub fn as_str(&self) -> &'static str {
         match self {
             Assume::Body => "body",

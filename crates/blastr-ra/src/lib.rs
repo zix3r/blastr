@@ -135,12 +135,27 @@ pub struct Workspace {
     crates: Vec<MemberCrate>,
     /// True when build scripts and procedural macros were not run.
     restricted: bool,
+    /// The procedural-macro crates a crate of this workspace depends on
+    /// directly whose macros did not load, sorted and without duplicates.
+    missing_proc_macros: Vec<String>,
 }
 
 impl Workspace {
     /// The toolchain version the project was loaded with, e.g. `rustc 1.100.0 (...)`.
     pub fn toolchain(&self) -> &str {
         &self.toolchain
+    }
+
+    /// The crates whose procedural macros the analysed code calls but did not
+    /// get, sorted and without duplicates.
+    ///
+    /// rust-analyzer expands a macro whose dylib failed to load to nothing and
+    /// reports no error, so the items such a macro would generate are missing
+    /// from the graph. Empty means nothing the extracted code can call was
+    /// lost. Never set when procedural macros were not run at all, because
+    /// [`blastr_model::Limit::Restricted`] already says so then.
+    pub fn missing_proc_macros(&self) -> &[String] {
+        &self.missing_proc_macros
     }
 }
 

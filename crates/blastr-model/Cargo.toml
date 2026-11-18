@@ -1,6 +1,6 @@
 [package]
 name = "blastr-model"
-description = "Shared data types for Blastr"
+description = "Internal crate of Blastr (shared data types); not a stable API"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
