@@ -1,6 +1,10 @@
 //! Blastr's desktop interface.
 
 mod app;
+mod editor;
+mod settings;
+mod state;
+mod theme;
 mod views;
 
 /// Opens the main window and blocks until the application quits.

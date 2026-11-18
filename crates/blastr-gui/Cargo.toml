@@ -1,6 +1,6 @@
 [package]
 name = "blastr-gui"
-description = "Desktop interface for Blastr"
+description = "Internal crate of Blastr (the desktop interface); not a stable API"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,5 +11,14 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+blastr-core.workspace = true
 blastr-git.workspace = true
+blastr-model.workspace = true
+blastr-store.workspace = true
 gpui-kit.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+similar.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

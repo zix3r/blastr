@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" fill="none">
+<title>Blastr</title>
+<defs><linearGradient id="g" x1="56" y1="24" x2="200" y2="232" gradientUnits="userSpaceOnUse"><stop stop-color="#FFB15A"/><stop offset=".5" stop-color="#FF7048"/><stop offset="1" stop-color="#E94C38"/></linearGradient></defs>
+<path d="M128 24L218.07 76V180L128 232L37.93 180V76Z" fill="#111827" stroke="url(#g)" stroke-width="14" stroke-linejoin="round"/>
+<path d="M148 62L90 144H121L106 196L166 112H134Z" fill="url(#g)" stroke="url(#g)" stroke-width="5" stroke-linejoin="round"/>
+</svg>
