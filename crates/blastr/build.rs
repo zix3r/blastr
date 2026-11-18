@@ -11,6 +11,7 @@
 //! the build script does nothing.
 
 /// The resource id the Windows backend and Explorer read the icon from.
+#[cfg(windows)]
 const ICON_ID: &str = "1";
 
 /// The brand icon, relative to the package root.

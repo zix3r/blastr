@@ -236,10 +236,13 @@ struct Env {
     /// The directories of `PATH`.
     path: Vec<PathBuf>,
     /// `LOCALAPPDATA`, where per-user installations live.
+    #[cfg_attr(not(windows), allow(dead_code))]
     local: Option<PathBuf>,
     /// `ProgramFiles`.
+    #[cfg_attr(not(windows), allow(dead_code))]
     programs: Option<PathBuf>,
     /// `ProgramFiles(x86)`.
+    #[cfg_attr(not(windows), allow(dead_code))]
     programs_x86: Option<PathBuf>,
     /// The user's home directory, where a per-user installation lands on the
     /// platforms that have no `LOCALAPPDATA`.
