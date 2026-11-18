@@ -228,8 +228,26 @@ struct Extractor<'a> {
     modules: Vec<Module>,
     /// The regions the dependency pass walks.
     containers: Vec<PendingContainer>,
+    /// The procedural macros of the crate, waiting for the symbol of the
+    /// function that implements them.
+    aliases: Vec<MacroAlias>,
     /// Records the time spent in each kind of work.
     profile: Profile,
+}
+
+/// A procedural macro, which has no item of its own.
+///
+/// Its definition is the function that implements it, which is written as one
+/// item and walked as a function: the macro shares the symbol of that function,
+/// so that a change to either reaches the same code and an invocation of the
+/// macro names the one item the definition is written as.
+struct MacroAlias {
+    /// The key the macro itself is resolved by.
+    key: DefKey,
+    /// The key of the function that implements it.
+    function: DefKey,
+    /// The symbol to add when the function produced none.
+    fallback: Raw,
 }
 
 impl<'a> Extractor<'a> {
@@ -256,6 +274,7 @@ impl<'a> Extractor<'a> {
             defs: HashMap::new(),
             modules: Vec::new(),
             containers: Vec::new(),
+            aliases: Vec::new(),
             profile: Profile::new(measure),
         }
     }
@@ -273,7 +292,28 @@ impl<'a> Extractor<'a> {
         let name = self.member.name.clone();
         let krate = self.member.resolved.krate;
         self.walk_crate(krate, &name)?;
+        self.resolve_aliases();
         Ok(self)
+    }
+
+    /// Points every procedural macro at the symbol of the function it is
+    /// implemented by.
+    ///
+    /// That function is walked on its own, and the walk may reach it before or
+    /// after the macro that it implements. A macro whose function produced no
+    /// symbol keeps a symbol of its own, so that invocations of it stay in the
+    /// graph.
+    fn resolve_aliases(&mut self) {
+        for alias in std::mem::take(&mut self.aliases) {
+            match self.defs.get(&alias.function).copied() {
+                Some(index) => {
+                    self.defs.insert(alias.key, index);
+                }
+                None => {
+                    self.push(alias.fallback, Some(alias.key));
+                }
+            }
+        }
     }
 
     /// Adds the crate root module and everything below it.
@@ -982,8 +1022,31 @@ impl<'a> Extractor<'a> {
             from_macro: source.from_macro,
             ..SymbolFlags::default()
         };
+        // A procedural macro is implemented by a function of the crate, which
+        // is walked as a function of its own; the two are one item.
+        if let Some(function) = self.implementing_function(&source) {
+            self.aliases.push(MacroAlias {
+                key,
+                function: DefKey::Function(function),
+                fallback: raw,
+            });
+            return Ok(());
+        }
         self.push(raw, Some(key));
         Ok(())
+    }
+
+    /// The function that implements a procedural macro, if `source` is one.
+    ///
+    /// The source of a `macro_rules!` or of a `macro` 2.0 item is the item
+    /// itself; the source of a procedural macro is the `fn` that the compiler
+    /// calls, which is a definition of the same module.
+    fn implementing_function<A: AstNode>(&self, source: &Source<A>) -> Option<Function> {
+        let node = source.syntax()?;
+        let function = ast::Fn::cast(node.clone())?;
+        self.timed(Kind::ResolveDef, || {
+            self.sema.to_def2(InFile::new(source.file, &function))
+        })
     }
 
     /// Adds an impl block and the items it defines.

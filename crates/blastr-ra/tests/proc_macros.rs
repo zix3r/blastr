@@ -1,4 +1,5 @@
-//! A load that lost a procedural macro says so instead of failing.
+//! A load that lost a procedural macro says so instead of failing, and a
+//! procedural macro a workspace crate defines is a definition like any other.
 //!
 //! rust-analyzer expands a macro whose procedural macro failed to load to
 //! nothing, and reports no error of its own. A graph made from such a project
@@ -6,13 +7,14 @@
 //! item the macro generates is missing. What such a load lost is reported, not
 //! refused, and only the macros that the extracted code can call count.
 //!
-//! The tests load projects whose procedural macro cannot be built; a machine
-//! without `rust-src` cannot load a project at all, so they are skipped there.
+//! The tests load projects whose procedural macro cannot be built, and a project
+//! whose macros do build; a machine without `rust-src` cannot load a project at
+//! all, so they are skipped there.
 
 use std::fs;
 use std::path::Path;
 
-use blastr_model::{CancelToken, ExecMode, NoProgress, RevisionGraph};
+use blastr_model::{CancelToken, Certainty, EdgeKind, ExecMode, NoProgress, RevisionGraph};
 use blastr_ra::{Error, LoadOptions, Workspace};
 
 /// Writes one file, creating the directories it needs.
@@ -64,6 +66,150 @@ fn paths(graph: &RevisionGraph) -> Vec<&str> {
         .iter()
         .map(|symbol| symbol.path.path.as_str())
         .collect()
+}
+
+#[test]
+fn a_procedural_macro_is_a_definition_that_reaches_what_invokes_it() {
+    // A workspace with a procedural-macro crate and the crate that uses it. The
+    // macros work on tokens only, so the crate builds offline in a second.
+    let temp = tempfile::tempdir().expect("create a temporary directory");
+    let root = temp.path();
+    write(
+        &root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"app\", \"macros\"]\nresolver = \"2\"\n",
+    );
+    write(
+        &root.join("macros/Cargo.toml"),
+        "[package]\nname = \"macros\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+         [lib]\nproc-macro = true\n",
+    );
+    write(
+        &root.join("macros/src/lib.rs"),
+        r#"use proc_macro::{TokenStream, TokenTree};
+
+/// Derives `app::Greet` for a struct.
+#[proc_macro_derive(Greet)]
+pub fn derive_greet(input: TokenStream) -> TokenStream {
+    let mut after_struct = false;
+    let mut name = String::new();
+    for tree in input {
+        let TokenTree::Ident(ident) = tree else { continue };
+        let text = ident.to_string();
+        if text == "struct" {
+            after_struct = true;
+        } else if after_struct {
+            name = text;
+            break;
+        }
+    }
+    format!("impl Greet for {name} {{ fn greet(&self) -> u8 {{ 1 }} }}")
+        .parse()
+        .expect("the generated impl parses")
+}
+
+/// Keeps the annotated item and adds a constant next to it.
+#[proc_macro_attribute]
+pub fn tagged(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let mut output = item;
+    output.extend(
+        "pub const TAGGED_MARK: u8 = 3;"
+            .parse::<TokenStream>()
+            .expect("the generated constant parses"),
+    );
+    output
+}
+
+/// Generates an expression.
+#[proc_macro]
+pub fn make_item(_input: TokenStream) -> TokenStream {
+    "1 + 3"
+        .parse()
+        .expect("the generated expression parses")
+}
+"#,
+    );
+    write(
+        &root.join("app/Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+         [dependencies]\nmacros = { path = \"../macros\" }\n",
+    );
+    write(
+        &root.join("app/src/lib.rs"),
+        r#"use macros::{Greet, make_item, tagged};
+
+pub trait Greet {
+    fn greet(&self) -> u8;
+}
+
+// A derive of another crate adds no edge: only a macro of a workspace member
+// has a definition in the graph.
+#[derive(Debug, Clone, Greet)]
+pub struct Point {
+    pub x: u8,
+}
+
+#[tagged]
+pub fn handler() -> u8 {
+    2
+}
+
+pub fn made() -> u8 {
+    make_item!()
+}
+
+pub fn greet_point(point: &Point) -> u8 {
+    point.greet()
+}
+"#,
+    );
+
+    let Some(workspace) = load(root) else {
+        return;
+    };
+    let graph = extract(&workspace);
+
+    // The proc-macro functions are the definitions of the macros, so they are
+    // the symbols an invocation reaches, and a macro and its function are one
+    // symbol rather than two.
+    let mut expands: Vec<(&str, &str)> = graph
+        .edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::Expands)
+        .map(|edge| {
+            assert_eq!(edge.certainty, Certainty::Resolved);
+            (
+                graph.symbols[edge.from.0 as usize].path.path.as_str(),
+                graph.symbols[edge.to.0 as usize].path.path.as_str(),
+            )
+        })
+        .collect();
+    expands.sort_unstable();
+    assert_eq!(
+        expands,
+        [
+            // The item the derive is written on, and the impl and the method
+            // the derive generated for it.
+            ("app::<impl Greet for Point>", "macros::derive_greet"),
+            ("app::<impl Greet for Point>::greet", "macros::derive_greet"),
+            ("app::Point", "macros::derive_greet"),
+            // The item the attribute macro is written on, and the constant it
+            // generated next to it.
+            ("app::TAGGED_MARK", "macros::tagged"),
+            ("app::handler", "macros::tagged"),
+            // The function whose body invokes a function-like macro.
+            ("app::made", "macros::make_item"),
+        ],
+        "unexpected `Expands` edges"
+    );
+
+    // The derives of the standard library are not definitions of the workspace,
+    // so they add nothing.
+    assert!(
+        !expands
+            .iter()
+            .any(|(_, to)| to.starts_with("std") || *to == "app::Greet"),
+        "a derive of another crate has no definition to reach"
+    );
 }
 
 #[test]

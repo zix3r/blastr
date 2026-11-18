@@ -39,10 +39,10 @@ use blastr_model::{
 };
 use ra_ap_hir::{
     Adt, AsAssocItem, AssocItem, AssocItemContainer, Crate, Field, Function, HirFileId, Impl,
-    InFile, ModuleDef, PathResolution, Semantics, Trait, Variant, db::HirDatabase,
+    InFile, Macro, ModuleDef, PathResolution, Semantics, Trait, Variant, db::HirDatabase,
 };
 use ra_ap_ide_db::base_db::Crate as BaseCrate;
-use ra_ap_syntax::ast::HasArgList;
+use ra_ap_syntax::ast::{HasArgList, HasAttrs};
 use ra_ap_syntax::{AstNode, AstToken, SyntaxNode, ast};
 
 use crate::hashing;
@@ -126,6 +126,7 @@ pub(crate) fn collect(input: Input<'_, '_>, measure: bool) -> (Output, Collector
             .map(|container| container.node.clone())
             .collect(),
         impls: Vec::new(),
+        invocations: HashMap::new(),
         quiet: false,
         expansion_site: None,
         profile: Profile::new(measure),
@@ -200,6 +201,13 @@ struct Collector<'a, 'db> {
     regions: HashSet<SyntaxNode>,
     /// The impl blocks of the workspace, for trait dispatch and `Implements`.
     impls: Vec<(SymbolId, Impl)>,
+    /// Where a derive or an attribute macro was invoked, and the macro it
+    /// resolved to.
+    ///
+    /// The items such a macro generates are located at the invocation in the
+    /// real file, so this is how they are found: see
+    /// [`Collector::generated_items`].
+    invocations: HashMap<Location, Vec<SymbolId>>,
     /// True while walking code that a macro produced.
     ///
     /// rust-analyzer does not resolve the copies of an item that a `#[cfg]`
@@ -244,6 +252,7 @@ impl Collector<'_, '_> {
             });
             let previous = self.quiet;
             self.quiet = container.file.macro_file().is_some();
+            self.attrs(&container.node, container.file, container.id);
             self.visit(&container.node, container.id, 0, true);
             self.quiet = previous;
             if let Some(start) = start {
@@ -257,6 +266,7 @@ impl Collector<'_, '_> {
                     as u64;
             }
         }
+        self.generated_items();
         self.sort_unresolved();
     }
 
@@ -329,7 +339,9 @@ impl Collector<'_, '_> {
         if !root && self.regions.contains(node) {
             return;
         }
-        // Attributes are not part of the signature or the body of anything.
+        // Attributes are not part of the signature or the body of anything, but
+        // the ones that invoke a macro are references like any other; they were
+        // read with the item that declares them.
         if ast::Attr::can_cast(node.kind()) {
             return;
         }
@@ -453,6 +465,172 @@ impl Collector<'_, '_> {
             site,
             EdgeDetail::None,
         );
+    }
+
+    /// Adds the `Expands` edges of the attributes of the item a region belongs
+    /// to.
+    ///
+    /// Two kinds of procedural macro are invoked by an attribute: a derive
+    /// names its macros in `#[derive(..)]`, while an attribute macro is an
+    /// attribute itself. Both build the item they are written on, and a derive
+    /// additionally builds the impls, the items inside them and whatever else
+    /// its output holds, which [`Collector::generated_items`] covers.
+    ///
+    /// The item is read where it is written: an item a macro produced carries
+    /// the attributes of the code the macro was invoked at, while an attribute
+    /// a macro writes itself is no choice of that item and names no macro.
+    fn attrs(&mut self, node: &SyntaxNode, file: HirFileId, from: SymbolId) {
+        let Some(item) = self.written_item(node, file) else {
+            return;
+        };
+        let attrs: Vec<ast::Attr> = item.attrs().collect();
+        if attrs.is_empty() {
+            return;
+        }
+        // The definition map already knows whether an attribute macro applies
+        // to the item, which is much cheaper than resolving the attributes of
+        // every item of the workspace.
+        let attribute_macro = self.timed(Kind::ResolveMacro, || {
+            let file = self.input.sema.hir_file_for(item.syntax());
+            Some(self.input.sema.is_attr_macro_call(InFile::new(file, &item)))
+        });
+        for attr in attrs {
+            if self.derives(&attr, from) {
+                continue;
+            }
+            if attribute_macro.unwrap_or(false) {
+                self.attribute_macro(&attr, from);
+            }
+        }
+    }
+
+    /// The item whose attributes are written at `node`, which may be code a
+    /// macro wrote.
+    ///
+    /// An item inside a macro expansion is reached through the call the macro
+    /// was invoked at, until the code is written in a real file.
+    fn written_item(&self, node: &SyntaxNode, file: HirFileId) -> Option<ast::Item> {
+        let mut file = file;
+        let mut node = node.clone();
+        while let Some(call) = file.macro_file() {
+            let call = call.call_node(self.input.db);
+            file = call.file_id;
+            node = call.value;
+        }
+        ast::Item::cast(node)
+    }
+
+    /// Adds the `Expands` edges of one `#[derive(..)]` attribute, if it is one.
+    ///
+    /// A derive of another crate, the standard library's included, resolves to
+    /// a macro of that crate and produces nothing: only a macro of a workspace
+    /// member is a symbol of the graph.
+    fn derives(&mut self, attr: &ast::Attr, from: SymbolId) -> bool {
+        let Some(meta) = attr.meta() else {
+            return false;
+        };
+        if !meta
+            .simple_name()
+            .is_some_and(|name| name.as_str() == "derive")
+        {
+            return false;
+        }
+        let Some(site) = self.site(meta.syntax()) else {
+            return true;
+        };
+        let derives = self.timed(Kind::ResolveMacro, || {
+            self.input.sema.resolve_derive_macro(&meta)
+        });
+        for derive in derives.into_iter().flatten().flatten() {
+            self.invocation(derive, from, &site);
+        }
+        true
+    }
+
+    /// Adds the `Expands` edge of an attribute macro on an item.
+    fn attribute_macro(&mut self, attr: &ast::Attr, from: SymbolId) {
+        let Some(meta) = attr.meta() else {
+            return;
+        };
+        let Some(path) = meta.path() else {
+            return;
+        };
+        let resolved = self.timed(Kind::ResolveMacro, || {
+            self.input.sema.resolve_path_per_ns(&path)
+        });
+        let Some(PathResolution::Def(ModuleDef::Macro(macro_))) =
+            resolved.and_then(|resolution| resolution.macro_ns)
+        else {
+            return;
+        };
+        let Some(site) = self.site(meta.syntax()) else {
+            return;
+        };
+        self.invocation(macro_, from, &site);
+    }
+
+    /// Adds the `Expands` edge of one derive or attribute macro invocation.
+    ///
+    /// The site is the range of the attribute, which is also where every item
+    /// the macro generates is located; [`Collector::generated_items`] uses that
+    /// to give those items the edge as well.
+    fn invocation(&mut self, macro_: Macro, from: SymbolId, site: &Location) {
+        let Some(to) = self.input.symbols.get(DefKey::Macro(macro_)) else {
+            return;
+        };
+        self.push(
+            from,
+            to,
+            EdgeKind::Expands,
+            Certainty::Resolved,
+            site.clone(),
+            EdgeDetail::None,
+        );
+        let recorded = self.invocations.entry(site.clone()).or_default();
+        if !recorded.contains(&to) {
+            recorded.push(to);
+        }
+    }
+
+    /// Adds an `Expands` edge from every item a derive or an attribute macro
+    /// generated to the macro that generated it.
+    ///
+    /// Such an item has no text of its own: it is located at the attribute that
+    /// produced it, which is the site its invocation recorded. Its users then
+    /// follow through the ordinary edges, so a change to the macro reaches the
+    /// code it wrote as well as the item it was invoked on.
+    fn generated_items(&mut self) {
+        if self.invocations.is_empty() {
+            return;
+        }
+        for (index, symbol) in self.input.graph.symbols.iter().enumerate() {
+            if !symbol.flags.from_macro {
+                continue;
+            }
+            let Some(sources) = self
+                .invocations
+                .get(&symbol.location)
+                .cloned()
+                .filter(|sources| !sources.is_empty())
+            else {
+                continue;
+            };
+            let from = SymbolId(index as u32);
+            let sites = symbol.location.clone();
+            for to in sources {
+                if to == from {
+                    continue;
+                }
+                self.push(
+                    from,
+                    to,
+                    EdgeKind::Expands,
+                    Certainty::Resolved,
+                    sites.clone(),
+                    EdgeDetail::None,
+                );
+            }
+        }
     }
 
     /// Whether the expansion of `call` holds code that the configuration
