@@ -1,0 +1,49 @@
+# A variant that loses a field: only the patterns and literals that name that
+# field adapt, not every use of the variant.
+crates = ["i32_variant_field_removed"]
+exact_changes = true
+exact_impact = true
+
+[[change]]
+kind = "variant"
+detail = "member-modified"
+symbol = "i32_variant_field_removed::Carrier::Courier"
+
+[[change]]
+kind = "field"
+detail = "member-removed"
+symbol = "i32_variant_field_removed::Carrier::Courier::express"
+
+[[change]]
+kind = "body"
+symbol = "i32_variant_field_removed::is_express"
+
+[[change]]
+kind = "body"
+symbol = "i32_variant_field_removed::express_courier"
+
+# A pattern that names the field.
+[[impact]]
+symbol = "i32_variant_field_removed::is_express"
+class = "adaptation"
+confidence = "definite"
+reason = "uses-changed-field"
+distance = 1
+tags = ["changed"]
+
+# A literal that names the field.
+[[impact]]
+symbol = "i32_variant_field_removed::express_courier"
+class = "adaptation"
+confidence = "definite"
+reason = "uses-changed-field"
+distance = 1
+tags = ["changed"]
+
+# A pattern that names another field and leaves the rest to a `..`.
+[[no_impact]]
+symbol = "i32_variant_field_removed::tag"
+
+# A pattern that names no field of the variant at all.
+[[no_impact]]
+symbol = "i32_variant_field_removed::speed"

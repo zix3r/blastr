@@ -96,8 +96,6 @@ const DECLARATIONS: &[SymbolKind] = &[
 ];
 /// The containers a field can belong to.
 const STRUCT_OR_VARIANT: &[SymbolKind] = &[SymbolKind::Struct, SymbolKind::Variant];
-/// A struct, as the only container whose literal happens to miss a field.
-const STRUCT_ONLY: &[SymbolKind] = &[SymbolKind::Struct];
 /// An enum, as the only container whose variant a `match` misses.
 const ENUM_ONLY: &[SymbolKind] = &[SymbolKind::Enum];
 /// A trait, as the only container whose item an implementation can miss.
@@ -363,8 +361,10 @@ pub(crate) static RULES: &[Rule] = &[
             continues: Continue::Never,
         }],
     },
-    // A removed field reaches its readers, writers and patterns, and
-    // the literals of its container.
+    // A removed field reaches the sites that name it: its readers and
+    // writers, the patterns that destructure it and the literals that supply
+    // it. A literal or pattern that leaves its fields to a `..` does not name
+    // it and still compiles.
     Rule {
         applies: Applies {
             kind: ChangeKind::Field,
@@ -376,28 +376,18 @@ pub(crate) static RULES: &[Rule] = &[
         class: ImpactClass::Adaptation,
         coarse: Coarse::Never,
         container_kinds: STRUCT_OR_VARIANT,
-        sources: &[
-            Source {
-                target: Target::Symbol,
-                edges: EdgeSet::Kinds(&[
-                    EdgeKind::ReadsField,
-                    EdgeKind::WritesField,
-                    EdgeKind::Matches,
-                ]),
-                filter: EdgeFilter::None,
-                certainty: CertaintyRule::Edge,
-                reason: Reason::UsesChangedField,
-                continues: Continue::Never,
-            },
-            Source {
-                target: Target::Container,
-                edges: EdgeSet::Kinds(&[EdgeKind::Constructs]),
-                filter: EdgeFilter::None,
-                certainty: CertaintyRule::WithRestIsCandidate,
-                reason: Reason::UsesChangedField,
-                continues: Continue::Never,
-            },
-        ],
+        sources: &[Source {
+            target: Target::Symbol,
+            edges: EdgeSet::Kinds(&[
+                EdgeKind::ReadsField,
+                EdgeKind::WritesField,
+                EdgeKind::Matches,
+            ]),
+            filter: EdgeFilter::None,
+            certainty: CertaintyRule::Edge,
+            reason: Reason::UsesChangedField,
+            continues: Continue::Never,
+        }],
     },
     // the same on the head side, and only a field read
     // carries behaviour further.
@@ -412,28 +402,18 @@ pub(crate) static RULES: &[Rule] = &[
         class: ImpactClass::Adaptation,
         coarse: Coarse::Never,
         container_kinds: STRUCT_OR_VARIANT,
-        sources: &[
-            Source {
-                target: Target::Symbol,
-                edges: EdgeSet::Kinds(&[
-                    EdgeKind::ReadsField,
-                    EdgeKind::WritesField,
-                    EdgeKind::Matches,
-                ]),
-                filter: EdgeFilter::None,
-                certainty: CertaintyRule::Edge,
-                reason: Reason::UsesChangedField,
-                continues: Continue::Kinds(&[EdgeKind::ReadsField]),
-            },
-            Source {
-                target: Target::Container,
-                edges: EdgeSet::Kinds(&[EdgeKind::Constructs]),
-                filter: EdgeFilter::None,
-                certainty: CertaintyRule::WithRestIsCandidate,
-                reason: Reason::UsesChangedField,
-                continues: Continue::Never,
-            },
-        ],
+        sources: &[Source {
+            target: Target::Symbol,
+            edges: EdgeSet::Kinds(&[
+                EdgeKind::ReadsField,
+                EdgeKind::WritesField,
+                EdgeKind::Matches,
+            ]),
+            filter: EdgeFilter::None,
+            certainty: CertaintyRule::Edge,
+            reason: Reason::UsesChangedField,
+            continues: Continue::Kinds(&[EdgeKind::ReadsField]),
+        }],
     },
     // A new field reaches the literals that name every field.
     Rule {
@@ -456,7 +436,8 @@ pub(crate) static RULES: &[Rule] = &[
             continues: Continue::Never,
         }],
     },
-    // A new field reaches the struct patterns that name every field.
+    // A new field reaches the struct and variant patterns that name every
+    // field.
     Rule {
         applies: Applies {
             kind: ChangeKind::Field,
@@ -467,7 +448,7 @@ pub(crate) static RULES: &[Rule] = &[
         side: Side::Head,
         class: ImpactClass::Adaptation,
         coarse: Coarse::Never,
-        container_kinds: STRUCT_ONLY,
+        container_kinds: STRUCT_OR_VARIANT,
         sources: &[Source {
             target: Target::Container,
             edges: EdgeSet::Kinds(&[EdgeKind::Matches]),
@@ -521,6 +502,10 @@ pub(crate) static RULES: &[Rule] = &[
     },
     // A removed variant reaches everything that used it, on the base
     // side.
+    //
+    // A *reshaped* variant has no rule of its own: the fields that reshaped
+    // it are reported with it, and each of them reaches exactly the literals
+    // and patterns that name it.
     Rule {
         applies: Applies {
             kind: ChangeKind::Variant,
@@ -529,27 +514,6 @@ pub(crate) static RULES: &[Rule] = &[
             has_body: None,
         },
         side: Side::Base,
-        class: ImpactClass::Adaptation,
-        coarse: Coarse::Never,
-        container_kinds: ANY_KIND,
-        sources: &[Source {
-            target: Target::SelfAndDescendants,
-            edges: EdgeSet::Any,
-            filter: EdgeFilter::None,
-            certainty: CertaintyRule::Edge,
-            reason: Reason::UsesChangedVariant,
-            continues: Continue::Never,
-        }],
-    },
-    // A reshaped variant reaches everything that uses it.
-    Rule {
-        applies: Applies {
-            kind: ChangeKind::Variant,
-            detail: DetailMatch::Member(Delta::Modified),
-            symbol_kinds: ANY_KIND,
-            has_body: None,
-        },
-        side: Side::Head,
         class: ImpactClass::Adaptation,
         coarse: Coarse::Never,
         container_kinds: ANY_KIND,
@@ -2261,13 +2225,8 @@ mod tests {
         builder.edge(reader, x, EdgeKind::ReadsField, EdgeDetail::None);
         builder.edge(other_reader, y, EdgeKind::ReadsField, EdgeDetail::None);
         builder.edge(writer, x, EdgeKind::WritesField, EdgeDetail::None);
-        builder.edge(literal, point, EdgeKind::Constructs, EdgeDetail::None);
-        builder.edge(
-            rest_literal,
-            point,
-            EdgeKind::Constructs,
-            EdgeDetail::WithRest,
-        );
+        builder.edge(literal, x, EdgeKind::WritesField, EdgeDetail::None);
+        builder.edge(rest_literal, y, EdgeKind::WritesField, EdgeDetail::None);
         let base = builder.finish();
         let change = member(
             ChangeKind::Field,
@@ -2281,23 +2240,13 @@ mod tests {
 
         assert_eq!(
             reached_paths(&steps, &base, &head),
-            vec![
-                "krate::literal",
-                "krate::reader",
-                "krate::rest_literal",
-                "krate::writer"
-            ],
-            "a reader of another field is not reached"
+            vec!["krate::literal", "krate::reader", "krate::writer"],
+            "a reader of another field is not reached, and neither is a literal\n             that supplies another field"
         );
         assert!(steps.iter().all(|step| step.side == Side::Base));
         assert_eq!(
             step_to(&steps, &base, &head, "krate::reader").certainty,
             Certainty::Resolved
-        );
-        assert_eq!(
-            step_to(&steps, &base, &head, "krate::rest_literal").certainty,
-            Certainty::Candidate,
-            "a literal with `..` may not name the field"
         );
         assert!(steps.iter().all(|step| !step.continues));
         assert_eq!(steps[0].reason, Reason::UsesChangedField);
@@ -2318,7 +2267,7 @@ mod tests {
         builder.edge(reader, x, EdgeKind::ReadsField, EdgeDetail::None);
         builder.edge(other_reader, y, EdgeKind::ReadsField, EdgeDetail::None);
         builder.edge(writer, x, EdgeKind::WritesField, EdgeDetail::None);
-        builder.edge(literal, point, EdgeKind::Constructs, EdgeDetail::None);
+        builder.edge(literal, x, EdgeKind::WritesField, EdgeDetail::None);
         let head = builder.finish();
         let change = member(
             ChangeKind::Field,
@@ -2408,7 +2357,7 @@ mod tests {
     }
 
     #[test]
-    fn row_15_a_new_field_reaches_struct_patterns_without_rest() {
+    fn row_15_a_new_field_reaches_patterns_without_rest() {
         let mut builder = GraphBuilder::new();
         let module = builder.add("krate", SymbolKind::Module);
         let point = builder.child(module, "krate::Point", SymbolKind::Struct);
@@ -2446,9 +2395,14 @@ mod tests {
             SymbolKind::Field,
             Delta::Added,
         );
-        assert!(
-            first(&nothing(), &head, &variant_change).is_empty(),
-            "a field of a variant is not a struct pattern"
+        assert_eq!(
+            reached_paths(
+                &first(&nothing(), &head, &variant_change),
+                &nothing(),
+                &head
+            ),
+            vec!["krate::variant_pattern"],
+            "a pattern of a variant that names every field misses a new one too"
         );
     }
 
@@ -2564,8 +2518,10 @@ mod tests {
         assert!(!steps[0].continues);
     }
 
+    // A reshaped variant has no rule of its own: its fields are reported with
+    // it, and each field rule reaches the literals and patterns that name it.
     #[test]
-    fn row_19_a_reshaped_variant_reaches_its_uses() {
+    fn row_19_a_reshaped_variant_reaches_nobody_by_itself() {
         let mut builder = GraphBuilder::new();
         let module = builder.add("krate", SymbolKind::Module);
         let choice = builder.child(module, "krate::Choice", SymbolKind::Enum);
@@ -2589,12 +2545,10 @@ mod tests {
 
         let steps = first(&nothing(), &head, &change);
 
-        assert_eq!(
-            reached_paths(&steps, &nothing(), &head),
-            vec!["krate::constructor"]
+        assert!(
+            steps.is_empty(),
+            "the fields that reshaped the variant carry its consequences"
         );
-        assert_eq!(steps[0].class, ImpactClass::Adaptation);
-        assert_eq!(steps[0].reason, Reason::UsesChangedVariant);
     }
 
     #[test]
@@ -3173,7 +3127,7 @@ mod tests {
     fn the_table_holds_every_row_that_follows_edges() {
         assert_eq!(
             super::RULES.len(),
-            31,
+            30,
             "one entry for every kind of change that follows edges"
         );
     }

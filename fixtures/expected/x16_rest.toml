@@ -104,7 +104,8 @@ kind = "matches"
 certainty = "resolved"
 detail = "with-rest"
 
-# A variant pattern keeps the detail of the `match` it is in, also with a rest.
+# A variant pattern with a rest carries the rest on the variant, and leaves the
+# detail of the `match` it is in on the enum.
 [[edge]]
 from = "x16_rest::is_busy"
 to = "x16_rest::State"
@@ -117,7 +118,7 @@ from = "x16_rest::is_busy"
 to = "x16_rest::State::Busy"
 kind = "matches"
 certainty = "resolved"
-detail = "match-wildcard"
+detail = "with-rest"
 
 # An exhaustive `match` over a variant.
 [[edge]]

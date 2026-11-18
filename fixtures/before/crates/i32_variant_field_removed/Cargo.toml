@@ -1,0 +1,8 @@
+[package]
+name = "i32-variant-field-removed"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "i32_variant_field_removed"
+path = "src/lib.rs"

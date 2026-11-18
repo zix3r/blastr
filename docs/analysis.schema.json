@@ -548,7 +548,7 @@
         },
         {
           "const": "writes-field",
-          "description": "A write to a field.",
+          "description": "A write to a field, or the value a literal supplies for it.",
           "type": "string"
         },
         {

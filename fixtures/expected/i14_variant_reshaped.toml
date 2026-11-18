@@ -1,6 +1,6 @@
 # A reshaped variant: its constructor and its pattern adapt, another variant's do not.
 crates = ["i14_variant_reshaped"]
-# The new tuple field belongs to the variant change, which covers its own fields.
+# A reshaped variant is reported together with its fields.
 exact_changes = true
 exact_impact = true
 
@@ -10,6 +10,11 @@ detail = "member-modified"
 symbol = "i14_variant_reshaped::Message::Notice"
 
 [[change]]
+kind = "field"
+detail = "member-added"
+symbol = "i14_variant_reshaped::Message::Notice::0"
+
+[[change]]
 kind = "body"
 symbol = "i14_variant_reshaped::notice"
 
@@ -21,7 +26,7 @@ symbol = "i14_variant_reshaped::describe"
 symbol = "i14_variant_reshaped::notice"
 class = "adaptation"
 confidence = "definite"
-reason = "uses-changed-variant"
+reason = "constructs-without-field"
 distance = 1
 tags = ["changed"]
 
@@ -29,7 +34,7 @@ tags = ["changed"]
 symbol = "i14_variant_reshaped::describe"
 class = "adaptation"
 confidence = "definite"
-reason = "uses-changed-variant"
+reason = "pattern-misses-field"
 distance = 1
 tags = ["changed"]
 

@@ -1,0 +1,16 @@
+# A function a macro writes has no text of its own: the macro is edited, and the
+# function is written again, so it is never a *needs editing* item.
+crates = ["i33_generated_reader"]
+exact_changes = true
+
+[[change]]
+kind = "field"
+detail = "member-removed"
+symbol = "i33_generated_reader::Point::y"
+
+[[change]]
+kind = "body"
+symbol = "i33_generated_reader::vertical"
+
+[[no_impact]]
+symbol = "i33_generated_reader::vertical"

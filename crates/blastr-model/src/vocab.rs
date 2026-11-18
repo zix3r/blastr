@@ -100,7 +100,7 @@ pub enum EdgeKind {
     UsesType,
     /// A read of a field.
     ReadsField,
-    /// A write to a field.
+    /// A write to a field, or the value a literal supplies for it.
     WritesField,
     /// A struct or variant literal.
     Constructs,

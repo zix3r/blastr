@@ -1007,7 +1007,8 @@ fn macro_invocations_and_rest_patterns_carry_their_details() {
         EdgeKind::Matches,
         EdgeDetail::MatchWildcard,
     );
-    // A rest in a variant pattern leaves the detail of the `match` alone.
+    // A rest in a variant pattern leaves the detail of the `match` on the enum
+    // alone and marks the variant itself: the pattern does not name its fields.
     edge(
         &graph,
         "impact::is_busy",
@@ -1020,7 +1021,7 @@ fn macro_invocations_and_rest_patterns_carry_their_details() {
         "impact::is_busy",
         "impact::State::Busy",
         EdgeKind::Matches,
-        EdgeDetail::MatchWildcard,
+        EdgeDetail::WithRest,
     );
 
     // A `match` a macro of this crate writes is still a choice of this crate.
@@ -1068,18 +1069,16 @@ fn macro_invocations_and_rest_patterns_carry_their_details() {
         EdgeDetail::MatchWildcard,
     );
 
-    // No variant, and no tuple struct, ever carries `WithRest` unless it has a
-    // rest pattern of its own.
+    // No tuple struct carries `WithRest` without a rest pattern of its own,
+    // and no other kind of item carries it at all.
     for edge in &graph.edges {
         if edge.detail != EdgeDetail::WithRest {
             continue;
         }
         let kind = &graph.symbols[edge.to.0 as usize].path.kind;
-        assert_eq!(
-            *kind,
-            SymbolKind::Struct,
-            "`WithRest` on a `{}` instead of a struct",
-            kind
+        assert!(
+            matches!(*kind, SymbolKind::Struct | SymbolKind::Variant),
+            "`WithRest` on a `{kind}` instead of a struct or a variant"
         );
     }
 }

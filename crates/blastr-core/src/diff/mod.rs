@@ -14,7 +14,7 @@ mod testkit;
 #[cfg(test)]
 mod tests;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use blastr_model::{
     Change, ChangeDetail, ChangeKind, ChangedFile, Delta, FileStatus, GraphIndex, Location,
@@ -60,19 +60,6 @@ pub fn classify(
 
     let mut changes = Vec::new();
 
-    // A variant reported as reshaped covers its own fields, whether they are
-    // matched, added or removed.
-    let mut reshaped_base = HashSet::new();
-    let mut reshaped_head = HashSet::new();
-    for &(base_id, head_id) in &matches.pairs {
-        let old = &base.symbols[base_id.0 as usize];
-        let new = &head.symbols[head_id.0 as usize];
-        if new.path.kind == SymbolKind::Variant && old.signature_hash != new.signature_hash {
-            reshaped_base.insert(base_id);
-            reshaped_head.insert(head_id);
-        }
-    }
-
     for &(base_id, head_id) in &matches.pairs {
         let old = &base.symbols[base_id.0 as usize];
         let new = &head.symbols[head_id.0 as usize];
@@ -88,16 +75,6 @@ pub fn classify(
                 },
             });
         }
-        let inside_variant = new.path.kind == SymbolKind::Field
-            && (old
-                .parent
-                .is_some_and(|parent| reshaped_base.contains(&parent))
-                || new
-                    .parent
-                    .is_some_and(|parent| reshaped_head.contains(&parent)));
-        if inside_variant {
-            continue;
-        }
         compare(old, new, &mut changes);
     }
 
@@ -105,7 +82,6 @@ pub fn classify(
         base,
         &scope.base,
         &matches.base_to_head,
-        &reshaped_base,
         &matching::unpaired(base, &scope.base, &matches.base_to_head),
         Delta::Removed,
         &mut changes,
@@ -114,7 +90,6 @@ pub fn classify(
         head,
         &scope.head,
         &matches.head_to_base,
-        &reshaped_head,
         &matching::unpaired(head, &scope.head, &matches.head_to_base),
         Delta::Added,
         &mut changes,
@@ -218,15 +193,12 @@ fn compare(old: &Symbol, new: &Symbol, out: &mut Vec<Change>) {
 
 /// Reports the symbols of one side that have no counterpart on the other.
 ///
-/// `reshaped` holds the matched variants of this side that are reported as
-/// modified; their fields are covered by that change. `unpaired` holds the
-/// types and traits of this side that have no counterpart, which cover the impl
-/// blocks written for them.
+/// `unpaired` holds the types and traits of this side that have no counterpart,
+/// which cover the impl blocks written for them.
 fn report_unmatched(
     graph: &RevisionGraph,
     scope: &[SymbolId],
     matched: &HashMap<SymbolId, SymbolId>,
-    reshaped: &HashSet<SymbolId>,
     unpaired: &matching::Unpaired,
     delta: Delta,
     out: &mut Vec<Change>,
@@ -242,12 +214,6 @@ fn report_unmatched(
         let symbol = &graph.symbols[id.0 as usize];
         if matching::covered_by_ancestor(graph, id, matched)
             || matching::covered_by_unpaired_impl(graph, id, unpaired)
-        {
-            continue;
-        }
-        if symbol
-            .parent
-            .is_some_and(|parent| reshaped.contains(&parent))
         {
             continue;
         }

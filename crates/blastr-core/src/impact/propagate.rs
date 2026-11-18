@@ -424,7 +424,13 @@ impl<'a> Search<'a> {
             let Some(symbol) = head.symbols.get(index) else {
                 continue;
             };
-            let class = if node.best[BEST_ADAPTATION].is_some() {
+            // An item a macro or a derive produced has no text of its own: it
+            // is written at the invocation, and it is written again from the
+            // macro once the item the invocation names changes. There is no
+            // place to edit, so it is never a *needs editing* item; it still
+            // carries propagation on to the macro and to its users.
+            let adaptable = node.best[BEST_ADAPTATION].is_some() && !symbol.flags.from_macro;
+            let class = if adaptable {
                 ImpactClass::Adaptation
             } else {
                 ImpactClass::Behaviour

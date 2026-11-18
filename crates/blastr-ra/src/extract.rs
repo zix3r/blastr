@@ -22,8 +22,8 @@ use blastr_model::{
 };
 use ra_ap_hir::{
     Adt, AssocItem, Crate, EnumVariant, Field, FieldSource, Function, HasSource, HasVisibility,
-    HirFileId, Impl, InFile, Module, ModuleDef, Semantics, Trait, Visibility as HirVisibility,
-    attach_db, db::HirDatabase,
+    HirFileId, Impl, InFile, MacroKind, Module, ModuleDef, Semantics, Trait,
+    Visibility as HirVisibility, attach_db, db::HirDatabase,
 };
 use ra_ap_ide_db::base_db::SourceDatabase;
 use ra_ap_syntax::ast;
@@ -1393,13 +1393,41 @@ impl<'a> Extractor<'a> {
         let file = source.file_id;
         let (range, node) = source.value;
         let location = self.locate(file, range)?;
-        let from_macro = file.macro_file().is_some() || node.is_none();
+        let from_macro = node.is_none() || self.written_by_macro(file, &location);
         Some(Source {
             file,
             node: node.map(|node| InFile::new(file, node)),
             location,
             from_macro,
         })
+    }
+
+    /// Whether the item is only written into the file by the macro, with no
+    /// text of its own.
+    ///
+    /// A derive and a function-like macro write everything they produce: every
+    /// item of their expansion is located at the call and has no text of its
+    /// own.
+    ///
+    /// An attribute macro is written *on* an item: its call node is that whole
+    /// item, attributes and doc comments included. The item itself, which the
+    /// macro rewrites, keeps the range of the whole item — it is written out,
+    /// and only its body was replaced — while the items the macro generates are
+    /// located at the attribute alone.
+    fn written_by_macro(&self, file: HirFileId, location: &Location) -> bool {
+        let Some(call) = file.macro_file() else {
+            return false;
+        };
+        if !matches!(call.kind(self.db), MacroKind::Attr | MacroKind::AttrBuiltIn) {
+            return true;
+        }
+        let Some(node) = self.guarded(|| Some(call.call_node(self.db))) else {
+            return true;
+        };
+        let Some(site) = self.locate(node.file_id, node.value.text_range()) else {
+            return true;
+        };
+        !(site.file == location.file && site.span == location.span)
     }
 
     fn push(&mut self, raw: Raw, key: Option<DefKey>) -> usize {

@@ -684,7 +684,7 @@ fn reports_a_macro_definition_change() {
 }
 
 #[test]
-fn a_reshaped_variant_covers_its_added_and_removed_fields() {
+fn a_reshaped_variant_also_reports_its_removed_and_added_fields() {
     // `Circle(f64)` becomes `Circle { radius: f64 }`.
     let mut base = GraphBuilder::new();
     let old = base
@@ -737,11 +737,19 @@ fn a_reshaped_variant_covers_its_added_and_removed_fields() {
     .sig(31)
     .parent(circle);
     let changes = classify_in(base.finish(), head.finish(), &[modified("src/lib.rs")]);
-    assert_eq!(summary(&changes), ["variant krate::Shape::Circle modified"]);
+    assert_eq!(
+        summary(&changes),
+        [
+            "variant krate::Shape::Circle modified",
+            "field krate::Shape::Circle::0 removed",
+            "field krate::Shape::Circle::radius added",
+        ],
+        "the field rules need the field changes to name the field they reach"
+    );
 }
 
 #[test]
-fn a_reshaped_variant_covers_its_matched_fields() {
+fn a_reshaped_variant_also_reports_its_matched_fields() {
     // `Rect { w: f64 }` becomes `Rect { w: u32, h: u32 }`.
     let mut base = GraphBuilder::new();
     let rect = base
@@ -793,7 +801,14 @@ fn a_reshaped_variant_covers_its_matched_fields() {
     .sig(32)
     .parent(rect);
     let changes = classify_in(base.finish(), head.finish(), &[modified("src/lib.rs")]);
-    assert_eq!(summary(&changes), ["variant krate::Shape::Rect modified"]);
+    assert_eq!(
+        summary(&changes),
+        [
+            "variant krate::Shape::Rect modified",
+            "field krate::Shape::Rect::w modified",
+            "field krate::Shape::Rect::h added",
+        ]
+    );
 }
 
 #[test]

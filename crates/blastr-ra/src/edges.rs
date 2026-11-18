@@ -375,6 +375,7 @@ impl Collector<'_, '_> {
         }
         if let Some(pat) = ast::TupleStructPat::cast(node.clone()) {
             self.pattern_path(pat.path(), pat.syntax(), from, tuple_struct_has_rest(&pat));
+            self.tuple_pattern_fields(&pat, from);
             for field in pat.fields() {
                 self.visit(field.syntax(), from, depth, false);
             }
@@ -660,6 +661,7 @@ impl Collector<'_, '_> {
                         && path.parent_path().is_none()
                     {
                         self.path_call(&path, from);
+                        self.tuple_literal_fields(&path, call.arg_list(), from);
                         self.type_arguments(&path, from, depth);
                     }
                 }
@@ -881,9 +883,12 @@ impl Collector<'_, '_> {
         let Some(list) = expr.record_expr_field_list() else {
             return;
         };
-        // A field named in a literal is neither read nor written: the literal
-        // itself is what constructs the value.
+        // A field named in a literal is not read: the literal itself is what
+        // constructs the value. It does name the field, so a change to that
+        // field has to reach this site, and a field the literal does not name
+        // leaves it alone.
         for field in list.fields() {
+            self.literal_field(&field, from);
             if let Some(value) = field.expr() {
                 self.visit(value.syntax(), from, depth, false);
             }
@@ -952,7 +957,9 @@ impl Collector<'_, '_> {
     /// constant.
     ///
     /// `rest` says that the pattern ends with `..`, which is recorded on the edge
-    /// to a struct: the pattern then matches whatever fields the struct grows.
+    /// to a struct or a variant: the pattern then matches whatever fields the
+    /// struct or variant grows, and leaves the fields it already has to be
+    /// checked individually.
     fn pattern_path(
         &mut self,
         path: Option<ast::Path>,
@@ -965,7 +972,11 @@ impl Collector<'_, '_> {
         };
         match self.timed(Kind::ResolvePath, || self.input.sema.resolve_path(&path)) {
             Some(PathResolution::Def(def)) => {
-                let leaves_fields_out = rest && matches!(def, ModuleDef::Adt(Adt::Struct(_)));
+                let leaves_fields_out = rest
+                    && matches!(
+                        def,
+                        ModuleDef::Adt(Adt::Struct(_)) | ModuleDef::EnumVariant(_)
+                    );
                 let key = match def {
                     ModuleDef::Adt(adt) => Some(DefKey::Adt(adt)),
                     ModuleDef::EnumVariant(variant) => Some(DefKey::Variant(variant)),
@@ -1128,10 +1139,116 @@ impl Collector<'_, '_> {
         }
     }
 
+    /// Adds the `WritesField` edge of a field named in a literal.
+    ///
+    /// The literal supplies the field: it spells its name out and gives it a
+    /// value, so a removed or retyped field has to reach this site, and a field
+    /// the literal leaves to a `..base` does not.
+    fn literal_field(&mut self, field: &ast::RecordExprField, from: SymbolId) {
+        let resolved = self.timed(Kind::ResolveRecord, || {
+            self.input.sema.resolve_record_field(field)
+        });
+        let Some((def, _, _)) = resolved else {
+            return;
+        };
+        let Some(id) = self.input.symbols.get(DefKey::Field(def)) else {
+            return;
+        };
+        let node = field
+            .name_ref()
+            .map_or_else(|| field.syntax().clone(), |name| name.syntax().clone());
+        self.located_edge(
+            from,
+            id,
+            EdgeKind::WritesField,
+            Certainty::Resolved,
+            &node,
+            EdgeDetail::None,
+        );
+    }
+
+    /// Adds a `WritesField` edge to every positional field a tuple constructor
+    /// literal supplies.
+    ///
+    /// `Wrapper(1)` names its field by position rather than by name; the field
+    /// it supplies is the one at that position.
+    fn tuple_literal_fields(
+        &mut self,
+        path: &ast::Path,
+        args: Option<ast::ArgList>,
+        from: SymbolId,
+    ) {
+        let Some(args) = args else {
+            return;
+        };
+        let Some(fields) = self.container_fields(path) else {
+            return;
+        };
+        for (index, arg) in args.args().enumerate() {
+            let Some(field) = fields.get(index) else {
+                return;
+            };
+            if let Some(id) = self.input.symbols.get(DefKey::Field(*field)) {
+                self.located_edge(
+                    from,
+                    id,
+                    EdgeKind::WritesField,
+                    Certainty::Resolved,
+                    arg.syntax(),
+                    EdgeDetail::None,
+                );
+            }
+        }
+    }
+
+    /// Adds a `Matches` edge to every positional field a tuple pattern names.
+    ///
+    /// A pattern with a `..` does not line its fields up with the declaration
+    /// positions, so only a pattern that names every field gets one.
+    fn tuple_pattern_fields(&mut self, pat: &ast::TupleStructPat, from: SymbolId) {
+        let Some(path) = pat.path() else {
+            return;
+        };
+        let Some(fields) = self.container_fields(&path) else {
+            return;
+        };
+        let inner: Vec<ast::Pat> = pat.fields().collect();
+        if inner.len() != fields.len() {
+            return;
+        }
+        for (sub, field) in inner.iter().zip(fields.iter()) {
+            let Some(id) = self.input.symbols.get(DefKey::Field(*field)) else {
+                continue;
+            };
+            let detail = self.match_detail(sub.syntax());
+            self.located_edge(
+                from,
+                id,
+                EdgeKind::Matches,
+                Certainty::Resolved,
+                sub.syntax(),
+                detail,
+            );
+        }
+    }
+
+    /// The fields of the struct or variant a path names, in declaration order.
+    fn container_fields(&mut self, path: &ast::Path) -> Option<Vec<Field>> {
+        let db = self.input.db;
+        self.timed(Kind::ResolvePath, || {
+            match self.input.sema.resolve_path(path)? {
+                PathResolution::Def(ModuleDef::Adt(Adt::Struct(it))) => Some(it.fields(db)),
+                PathResolution::Def(ModuleDef::Adt(Adt::Union(it))) => Some(it.fields(db)),
+                PathResolution::Def(ModuleDef::EnumVariant(variant)) => Some(variant.fields(db)),
+                _ => None,
+            }
+        })
+    }
+
     /// Adds the `Constructs` edge of a struct, union or enum variant literal.
     ///
     /// `spread` says that the literal ends with `..base`, which is recorded on the
-    /// edge to a struct.
+    /// edge to a struct or a variant.
     fn constructs_variant(
         &mut self,
         variant: &Variant,
@@ -1175,15 +1292,15 @@ impl Collector<'_, '_> {
 
     /// The detail of a `Constructs` edge to `id`.
     ///
-    /// Only a struct can be built from another value of its type, and only the
-    /// literal that does it leaves fields out; a variant literal keeps the detail
-    /// its kind always has.
+    /// Only a struct or a variant field can be given from another value of its
+    /// type, and only the literal that does it leaves fields out; any other
+    /// literal names every field.
     fn constructs_detail(&self, id: SymbolId, spread: bool) -> EdgeDetail {
         if !spread {
             return EdgeDetail::None;
         }
         let symbol = &self.input.graph.symbols[id.0 as usize];
-        if symbol.path.kind == SymbolKind::Struct {
+        if matches!(symbol.path.kind, SymbolKind::Struct | SymbolKind::Variant) {
             EdgeDetail::WithRest
         } else {
             EdgeDetail::None

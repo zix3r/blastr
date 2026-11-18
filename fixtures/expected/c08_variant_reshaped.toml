@@ -1,10 +1,22 @@
 crates = ["c08_variant_reshaped"]
 exact_changes = true
 
+# A reshaped variant is reported with the fields that reshaped it: the field
+# rules name the field they reach, the variant rule does not.
 [[change]]
 kind = "variant"
 detail = "member-modified"
 symbol = "c08_variant_reshaped::Shape::Circle"
+
+[[change]]
+kind = "field"
+detail = "member-removed"
+symbol = "c08_variant_reshaped::Shape::Circle::0"
+
+[[change]]
+kind = "field"
+detail = "member-added"
+symbol = "c08_variant_reshaped::Shape::Circle::radius"
 
 [[change]]
 kind = "body"
