@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/wordmark-dark.svg">
-    <img src="assets/brand/wordmark-light.svg" alt="Blastr — change impact analysis" width="440">
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/zix3r/blastr/main/assets/brand/wordmark-dark.svg">
+    <img src="https://raw.githubusercontent.com/zix3r/blastr/main/assets/brand/wordmark-light.svg" alt="Blastr — change impact analysis" width="440">
   </picture>
 </p>
 
@@ -27,7 +27,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/images/window.png" alt="The Blastr window: changes and their impact on the left, the impact graph and source in the centre, the evidence on the right" width="900">
+  <img src="https://raw.githubusercontent.com/zix3r/blastr/main/docs/images/window.png" alt="The Blastr window: changes and their impact on the left, the impact graph and source in the centre, the evidence on the right" width="900">
 </p>
 
 ---
@@ -160,4 +160,4 @@ an unnecessary full test run, you can buy me a coffee — it keeps the work goin
 
 ## Licence
 
-Dual-licensed under [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE), at your option.
+Dual-licensed under [MIT](https://github.com/zix3r/blastr/blob/main/LICENSE-MIT) or [Apache 2.0](https://github.com/zix3r/blastr/blob/main/LICENSE-APACHE), at your option.
