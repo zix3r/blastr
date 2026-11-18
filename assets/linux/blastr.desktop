@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Blastr
+Comment=See what a Rust change can reach
+Exec=blastr %F
+Icon=blastr
+Terminal=false
+Categories=Development;
