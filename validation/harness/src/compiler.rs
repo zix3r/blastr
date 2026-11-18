@@ -334,6 +334,32 @@ fn run_case(
         .collect();
     result.expected = expected_checked.into_iter().collect();
     result.listed = listed_checked.into_iter().collect();
+    // rustc reports one privacy error per target and then stops looking at the
+    // other literals and accesses of the same item, so a target that reported
+    // one says nothing about the items of that target it did not report. An
+    // item Blastr lists there is not a false alarm and cannot be confirmed
+    // either; it is counted as unconfirmed, as an item of a target the
+    // compiler never built is.
+    let privacy = privacy_targets(&check, project.copy());
+    if !privacy.is_empty() {
+        let mut suppressed = 0_u32;
+        result.false_alarms.retain(|path| {
+            let mut roots = BTreeSet::new();
+            note_roots(&variant.head, path, &mut roots);
+            let stopped = roots.iter().any(|root| privacy.contains(root));
+            if stopped {
+                suppressed = suppressed.saturating_add(1);
+            }
+            !stopped
+        });
+        if suppressed > 0 {
+            result.unconfirmed = result.unconfirmed.saturating_add(suppressed);
+            result.notes.push(format!(
+                "{suppressed} item(s) unconfirmed: rustc stopped after the first privacy error \
+                 of their target"
+            ));
+        }
+    }
     result.blastr_items = variant.analysis.items.len() as u32;
     result.reachable = reachable(project.graph(), &variant.head, case);
 
@@ -406,6 +432,29 @@ fn judged_targets(check: &CheckOutput, root: &Path) -> Option<BTreeSet<RelPath>>
         }
     }
     named.then_some(roots)
+}
+
+/// The error codes that report a use of something the change made private.
+///
+/// rustc stops after the first of them in a target: the code that checks
+/// privacy reports one site and returns, so the other literals and accesses of
+/// the same field produce no error at all.
+pub const PRIVACY_CODES: &[&str] = &[
+    "E0451", // field is private, in a struct expression
+    "E0603", // item is private, and cannot be resolved
+    "E0616", // field is private, in an access
+    "E0624", // method is private
+];
+
+/// The crate roots of the targets that reported a privacy error.
+fn privacy_targets(check: &CheckOutput, root: &Path) -> BTreeSet<RelPath> {
+    check
+        .errors
+        .iter()
+        .filter(|error| PRIVACY_CODES.contains(&error.code.as_str()))
+        .filter_map(|error| error.root_file.as_deref())
+        .filter_map(|file| map::rel_path(root, file))
+        .collect()
 }
 
 /// How the given crate roots are shown in a note: `package (target)`, or the
@@ -623,6 +672,35 @@ mod tests {
     fn without_target_information_every_item_is_judged() {
         let check = CheckOutput::default();
         assert!(judged_targets(&check, Path::new("C:/tmp/copy")).is_none());
+    }
+
+    #[test]
+    fn a_target_that_reported_a_privacy_error_stopped_early() {
+        let root = Path::new("C:/tmp/copy");
+        let error = |code: &str, file: &str| Diagnostic {
+            code: code.to_owned(),
+            message: String::new(),
+            file: None,
+            start: 0,
+            end: 0,
+            line: 1,
+            root_file: Some(root.join(file)),
+        };
+        let check = CheckOutput {
+            errors: vec![
+                error("E0616", "storage/src/lib.rs"),
+                error("E0308", "domain/src/lib.rs"),
+            ],
+            ..CheckOutput::default()
+        };
+
+        let stopped = privacy_targets(&check, root);
+
+        assert!(stopped.contains(&RelPath::new("storage/src/lib.rs")));
+        assert!(
+            !stopped.contains(&RelPath::new("domain/src/lib.rs")),
+            "a type error says nothing about privacy"
+        );
     }
 
     #[test]

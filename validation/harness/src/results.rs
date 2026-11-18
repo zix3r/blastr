@@ -521,7 +521,7 @@ pub fn markdown(reports: &[CheckReport]) -> String {
     let _ = writeln!(out, "\n## How to read this\n");
     let _ = writeln!(
         out,
-        "A **case** is one edited definition. It is *scored* unless the compiler or Cargo could not judge it; the reason is counted under Exclusions. **expected** counts the symbols the compiler reported errors in (or the tests that failed), **listed** counts what Blastr listed as needing editing (or the tests it selected) for the same edit. **unconfirmed** counts items left out because the compiler did not build their crate. **blastr items** counts every item of the result, of both classes, and **reachable** what plain reverse reachability from the change returns; the last column is the first as a share of the second, so 100% means Blastr lists as much as a reference search, less means it is more selective."
+        "A **case** is one edited definition. It is *scored* unless the compiler or Cargo could not judge it; the reason is counted under Exclusions. **expected** counts the symbols the compiler reported errors in (or the tests that failed), **listed** counts what Blastr listed as needing editing (or the tests it selected) for the same edit. **unconfirmed** counts items the compiler could not judge: those in a crate it did not build, and those in a target where it stopped after the first privacy error. **blastr items** counts every item of the result, of both classes, and **reachable** what plain reverse reachability from the change returns; the last column is the first as a share of the second, so 100% means Blastr lists as much as a reference search, less means it is more selective."
     );
     out
 }

@@ -267,7 +267,10 @@ Every exclusion is counted and reported by reason:
 
 Items in targets the compiler never started are not counted as misses or as
 false alarms either: they are counted as **unconfirmed** and left out of both
-sides. A target counts as judged when Cargo reports an artifact for it or a
+sides. So are the items of a target that reported a privacy error: rustc stops
+checking privacy after the first one, so its error list cannot refute the other
+sites Blastr lists in that target (see [Known limits](#known-limits)). A target
+counts as judged when Cargo reports an artifact for it or a
 diagnostic from it — Cargo labels every diagnostic with the crate root of the
 target it came from. That happens whenever an edit to a library makes its
 dependents fail to build: the dependents, the integration tests and the binary
@@ -296,7 +299,32 @@ or refute what Blastr says about them.
   *accessed* (`E0616`) and then stops checking the privacy of the other sites in
   that target, so a case whose errors include `E0616` can under-report the
   literals and patterns that name the field. Blastr may list a site the error
-  list does not mention; the list is right and the compiler stopped early.
+  list does not mention; the list is right and the compiler stopped early. The
+  check counts such an item as **unconfirmed**, not as a false alarm: an item
+  whose target already reported a privacy error (`E0451`, `E0603`, `E0616`,
+  `E0624`) cannot be refuted by that target's error list. Measured on the sample
+  projects: narrowing a field of `StageSpec` made `config_dsl` report the access
+  at `config_dsl.rs:56` and nothing about the three literals in the same file
+  that also name the field; removing that one error made the next literal
+  (`:63`) report. The same holds for `storage::text::encode`, `decode_customer`
+  and `decode_order` after `Address::line1` was narrowed.
+- The `retype-field` edit wraps the type in a one-element tuple, and a tuple
+  keeps `Debug`, `Ord`, `Copy` and the other traits the value may have had, so a
+  reader that only formats, compares or copies the value still compiles, and so
+  does a literal that passes the field through (`Money { currency:
+  self.currency }`) because the value is already the new type. Blastr's C7 rule
+  reaches every reader and every literal naming the field, so those sites are
+  counted as false alarms it cannot avoid without type information. Measured on
+  the sample projects: `Money::percent_bp`, `Money::scaled`, `product::cheapest`
+  and the two `describe_impl` sites of `macrokit-derive`, all of which the
+  compiler accepts after `Money::currency` or `FieldModel::name` was retyped.
+- Removing an inherent method that shares its name with a provided trait method
+  leaves the call sites compiling: they resolve to the trait's default instead,
+  which the head graph already contains, so nothing is unresolved and nothing
+  reports an error. Blastr's C5 rule reads every referrer on the base graph, so
+  it lists them. Measured on `macrokit`: removing `ThermalProfile::name` leaves
+  `profile.name()` resolving to `macrokit::describe::Describe::name`. Telling the
+  two apart would need the resolution of the same call on the head side.
 - Items that a macro produced have the span of the macro call, not of a syntax
   node of their own, so no edit is planned for them. The number of unplanned
   edits is reported.
