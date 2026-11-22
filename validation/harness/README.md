@@ -175,7 +175,7 @@ baseline is in this table, and every row was checked by rerunning its cases with
 |---|---|---|---|---|
 | a project `macro_rules!` body (`ensure!`, `E0308`) | `change-return-type` | 127, 202, 255, 297, 336, 340, 344, 348, 383, 684, 712 | 11 | 0 — mapped to the invocation, which is the changed item |
 | `#[command]` output (`E0061`, `E0308`, `E0624`) | `change-return-type`, `remove-function`, `narrow-visibility` | 585, 586, 587 | 24 | 0 — 24 unconfirmed |
-| `#[derive(Describe)]` output (`E0046`, `E0053`, `E0061`, `E0599`) | `add-parameter`, `change-return-type`, `remove-function`, `narrow-visibility`, `add-required-trait-method` | 765-771, 798, 800 | 43 | 5 unconfirmed, 4 misses at the call sites of case `800` (see below) |
+| `#[derive(Describe)]` output (`E0046`, `E0053`, `E0061`, `E0599`) | `add-parameter`, `change-return-type`, `remove-function`, `narrow-visibility`, `add-required-trait-method` | 765-771, 798, 800 | 43 | 5 unconfirmed, 4 misses at the call sites of case `800` (since closed by the C9 chain, see [Known limits](#known-limits)) |
 | builtin `#[derive(Default)]` output (`E0665`, `#[default]`) | `remove-variant` | 906, 1590 | 2 | 0 — 2 unconfirmed |
 | a proc-macro crate that failed to build (`E0277`, `E0432`, `E0599`) | `remove-function` | 003 | 5 | 5 misses — a cascade, not measurable |
 | a plain call site, paired with the wrong twin symbol | `remove-function` | 2472 | 2 | 0 — fixed in `diff/matching.rs`, fixture `i40_duplicate_method_path` |
@@ -382,6 +382,25 @@ or refute what Blastr says about them.
   the sample projects: `Money::percent_bp`, `Money::scaled`, `product::cheapest`
   and the two `describe_impl` sites of `macrokit-derive`, all of which the
   compiler accepts after `Money::currency` or `FieldModel::name` was retyped.
+- The `change-return-type` edit has the same blind spot for the same reason: it
+  returns `(T,)`, and a caller that only assigns the result, passes it to a
+  method call statement, compares it or formats it still compiles because the
+  tuple keeps the traits `T` had. Blastr's C2 rule lists every caller of a
+  changed signature, so those call sites are counted as false alarms it cannot
+  avoid without type information. Measured on `pipeline`: `Level::at_least`
+  (`(u8,)` still compares, case `252`), `Pipeline::with_stage` (the `(&mut Self,)`
+  result is discarded, case `375`), the `Debug` impl of `Pipeline` (a
+  `(Vec<String>,)` still formats, case `395`), and `Partition::same_bucket`
+  (`(Self::Key,)` still compares, case `1207`, reached by the trait-item row).
+- An accessor that shares its name with the field it reads hides the removal
+  from the compiler in a different way: once the field is gone, the body's
+  `self.first` resolves to the method `first` itself (`E0615`), so the method's
+  return type cannot be inferred and its callers report `E0282` at their own
+  call. The callers do have to be edited together with the accessor, but the
+  error is a cascade from an item Blastr already lists, and telling an accessor
+  that must be deleted from one that will be rewritten needs the type of what
+  the accessor returns. Measured on `pipeline`: the two `Chain` fields that name
+  their accessors (cases `840`, `842`, both `chain_runs_both_halves`).
 - Removing an inherent method that shares its name with a provided trait method
   leaves the call sites compiling: they resolve to the trait's default instead,
   which the head graph already contains, so nothing is unresolved and nothing
@@ -440,10 +459,14 @@ or refute what Blastr says about them.
   - **A trait item whose impls are macro-generated.** Changing
     `Describe::describe` makes every derive-generated impl stale, and rustc then
     rejects the *call sites* of the method as well (`E0053` at the impl,
-    `E0599` where it is called). Blastr reaches those call sites only as
-    *may behave differently*, so 4 of the 9 misses of case `800` remain. They are
-    not specific to macros: the C9 row of the rule matrix reaches the impls of a
-    changed trait item, not the callers of the methods they provide.
+    `E0599` where it is called). The callers that name the implementation are
+    now reached: the C9 row chains a second group of edges from the
+    `implements` step, so the callers of a changed trait item's implementations
+    are *needs editing*, two steps away from the trait item (fixture
+    `i41_trait_impl_callers`). That closed the 4 misses of case `800` on
+    `macrokit` (`4` → `0`, rerun with `--case`) and 25 of the 32 of `pipeline`.
+    A caller that was already listed only as *may behave differently* through
+    the unchanged implementation is now listed by its strongest path.
   - **A removed procedural macro function.** Removing the function makes the
     `macrokit-derive` crate unbuildable, so every use of the items its derives
     had produced reports its own error at a real call site: `E0599` for the
