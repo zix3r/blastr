@@ -1,0 +1,8 @@
+[package]
+name = "i38-collect-dispatch"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "i38_collect_dispatch"
+path = "src/lib.rs"

@@ -1,0 +1,60 @@
+# An operator calls the trait method of the operand's type, and no path in the
+# body names it. `+`, `-`, unary `-` and `[]` need an edge of their own;
+# without it a changed `add` has no callers and the operator looks unused.
+#
+# The change is `add`; `total` reaches it through `+`, `span` through `total`
+# and a multiplication, and the three other operators reach other impls.
+crates = ["i37_operator_dispatch"]
+exact_changes = true
+exact_impact = true
+
+[[edge]]
+from = "i37_operator_dispatch::total"
+to = "i37_operator_dispatch::<impl std::ops::Add for Ticks>::add"
+kind = "calls"
+certainty = "resolved"
+
+[[edge]]
+from = "i37_operator_dispatch::gap"
+to = "i37_operator_dispatch::<impl std::ops::Sub for Ticks>::sub"
+kind = "calls"
+certainty = "resolved"
+
+[[edge]]
+from = "i37_operator_dispatch::mirrored"
+to = "i37_operator_dispatch::<impl std::ops::Neg for Ticks>::neg"
+kind = "calls"
+certainty = "resolved"
+
+[[edge]]
+from = "i37_operator_dispatch::first"
+to = "i37_operator_dispatch::<impl std::ops::Index<usize> for Window>::index"
+kind = "calls"
+certainty = "resolved"
+
+[[change]]
+kind = "body"
+symbol = "i37_operator_dispatch::<impl std::ops::Add for Ticks>::add"
+
+[[impact]]
+symbol = "i37_operator_dispatch::total"
+class = "behaviour"
+confidence = "likely"
+reason = "calls-changed"
+distance = 1
+
+[[impact]]
+symbol = "i37_operator_dispatch::span"
+class = "behaviour"
+confidence = "likely"
+reason = "calls-changed"
+distance = 2
+
+[[no_impact]]
+symbol = "i37_operator_dispatch::gap"
+
+[[no_impact]]
+symbol = "i37_operator_dispatch::mirrored"
+
+[[no_impact]]
+symbol = "i37_operator_dispatch::first"

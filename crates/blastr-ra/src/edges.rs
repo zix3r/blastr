@@ -50,6 +50,44 @@ use crate::locate::Locator;
 use crate::stats::{FileTiming, Kind, Profile};
 use crate::symbols::{DefKey, SymbolTable};
 
+/// The standard operator traits whose methods an operator expression invokes.
+///
+/// Nothing in the syntax names the method, so only a resolution that lands on
+/// an impl of one of these traits produces an edge. The list is also the
+/// pruning set: an operator whose traits have no implementation in the
+/// workspace cannot reach one, and asking rust-analyzer would force the type
+/// inference of the whole body for nothing.
+const OPERATOR_TRAITS: &[&str] = &[
+    "Add",
+    "Sub",
+    "Mul",
+    "Div",
+    "Rem",
+    "Shl",
+    "Shr",
+    "BitXor",
+    "BitOr",
+    "BitAnd",
+    "AddAssign",
+    "SubAssign",
+    "MulAssign",
+    "DivAssign",
+    "RemAssign",
+    "ShlAssign",
+    "ShrAssign",
+    "BitXorAssign",
+    "BitOrAssign",
+    "BitAndAssign",
+    "Neg",
+    "Not",
+    "Deref",
+    "DerefMut",
+    "Index",
+    "IndexMut",
+    "PartialEq",
+    "PartialOrd",
+];
+
 /// The deepest nesting of macro expansions that is walked.
 ///
 /// The limit only exists to guarantee termination: a recursive macro that
@@ -129,6 +167,8 @@ pub(crate) fn collect(input: Input<'_, '_>, measure: bool) -> (Output, Collector
         formatting: Vec::new(),
         conversions: Vec::new(),
         iterators: Vec::new(),
+        collects: Vec::new(),
+        operators: HashSet::new(),
         invocations: HashMap::new(),
         quiet: false,
         expansion_site: None,
@@ -205,6 +245,21 @@ enum ValueType {
     Unknown,
 }
 
+impl ValueType {
+    /// Whether a value of this type can reach one implementation of a trait.
+    ///
+    /// `ty` is the impl's self type, and `None` when the impl names a type this
+    /// pass cannot read: any value may then reach it.
+    fn can_reach(self, ty: Option<Adt>) -> bool {
+        match (self, ty) {
+            (ValueType::Data(value), Some(other)) => value == other,
+            (ValueType::Data(_) | ValueType::Other, None) => true,
+            (ValueType::Other, Some(_)) => false,
+            (ValueType::Unknown, _) => true,
+        }
+    }
+}
+
 /// One workspace implementation of a formatting trait.
 #[derive(Debug, Clone, Copy)]
 struct FormattingImpl {
@@ -240,6 +295,18 @@ struct ConversionImpl {
     symbol: SymbolId,
 }
 
+/// One workspace implementation of `FromIterator`, which `collect` invokes.
+#[derive(Debug, Clone, Copy)]
+struct CollectImpl {
+    /// The collection type, when the impl names one.
+    ///
+    /// `None` for a self type this pass cannot name, such as a reference or a
+    /// type parameter: any `collect` may reach it.
+    self_ty: Option<Adt>,
+    /// The symbol of the impl's `from_iter`.
+    symbol: SymbolId,
+}
+
 /// One workspace implementation of the standard `Iterator`.
 #[derive(Debug, Clone)]
 struct IteratorImpl {
@@ -271,6 +338,15 @@ struct Collector<'a, 'db> {
     /// The workspace's `Iterator` impls, which a `for` loop and an adaptor call
     /// through the trait.
     iterators: Vec<IteratorImpl>,
+    /// The `from_iter` methods of the workspace's `FromIterator` impls, which
+    /// a `collect` invokes without naming one.
+    collects: Vec<CollectImpl>,
+    /// The operator traits the workspace implements.
+    ///
+    /// Resolving an operator to ask what it calls forces the type inference of
+    /// the whole body, so an operator whose trait has no impl in the workspace
+    /// is skipped before that query: it could only reach the standard library.
+    operators: HashSet<&'static str>,
     /// Where a derive or an attribute macro was invoked, and the macro it
     /// resolved to.
     ///
@@ -321,6 +397,12 @@ impl Collector<'_, '_> {
             }
             if let Some(found) = self.iterator_impl(block) {
                 self.iterators.push(found);
+            }
+            if let Some(found) = self.collect_impl(block) {
+                self.collects.push(found);
+            }
+            if let Some(name) = self.operator_trait(block) {
+                self.operators.insert(name);
             }
         }
         for container in self.input.containers {
@@ -499,12 +581,7 @@ impl Collector<'_, '_> {
         let targets: Vec<SymbolId> = self
             .conversions
             .iter()
-            .filter(|impl_| match (error, impl_.source) {
-                (ValueType::Data(ty), Some(other)) => ty == other,
-                (ValueType::Data(_) | ValueType::Other, None) => true,
-                (ValueType::Other, Some(_)) => false,
-                (ValueType::Unknown, _) => true,
-            })
+            .filter(|impl_| error.can_reach(impl_.source))
             .map(|impl_| impl_.symbol)
             .collect();
         for target in targets {
@@ -574,12 +651,7 @@ impl Collector<'_, '_> {
         let targets: Vec<SymbolId> = self
             .iterators
             .iter()
-            .filter(|impl_| match (iterator, impl_.self_ty) {
-                (ValueType::Data(ty), Some(other)) => ty == other,
-                (ValueType::Data(_) | ValueType::Other, None) => true,
-                (ValueType::Other, Some(_)) => false,
-                (ValueType::Unknown, _) => true,
-            })
+            .filter(|impl_| iterator.can_reach(impl_.self_ty))
             .flat_map(|impl_| impl_.symbols.iter().copied())
             .collect();
         for target in targets {
@@ -605,6 +677,93 @@ impl Collector<'_, '_> {
             };
             Some(
                 trait_.name(db).as_str() == "Iterator"
+                    && matches!(trait_.module(db).krate(db).origin(db), CrateOrigin::Lang(_)),
+            )
+        }) == Some(true)
+    }
+
+    /// The collection impl a block provides, if it implements the standard
+    /// `FromIterator`.
+    ///
+    /// `collect` builds a collection by calling the `from_iter` of the type it
+    /// is asked for, so a `from_iter` of this workspace runs without any
+    /// reference naming it.
+    fn collect_impl(&mut self, block: Impl) -> Option<CollectImpl> {
+        let db = self.input.db;
+        let reference = self.timed(Kind::Dispatch, || block.trait_ref(db))?;
+        let trait_ = self.timed(Kind::Dispatch, || Some(reference.trait_()))?;
+        let standard = self.timed(Kind::Dispatch, || {
+            Some(matches!(
+                trait_.module(db).krate(db).origin(db),
+                CrateOrigin::Lang(_)
+            ))
+        })?;
+        if !standard
+            || self
+                .timed(Kind::Dispatch, || Some(trait_.name(db)))?
+                .as_str()
+                != "FromIterator"
+        {
+            return None;
+        }
+        let from_iter = self.timed(Kind::Dispatch, || {
+            block.items(db).into_iter().find_map(|item| match item {
+                AssocItem::Function(function) if function.name(db).as_str() == "from_iter" => {
+                    Some(function)
+                }
+                _ => None,
+            })
+        })?;
+        let symbol = self
+            .input
+            .symbols
+            .assoc_item(AssocItem::Function(from_iter))?;
+        let self_ty = self.timed(Kind::InferType, || {
+            block.self_ty(db).strip_references().as_adt()
+        });
+        Some(CollectImpl { self_ty, symbol })
+    }
+
+    /// Adds the dispatch edges of one `collect`, which builds the collection by
+    /// calling the `from_iter` of its type.
+    ///
+    /// The type of the call decides which impl can run; a collection type this
+    /// pass cannot name reaches every impl, as a coarse candidate.
+    fn collect_use(&mut self, from: SymbolId, node: &SyntaxNode, collection: ValueType) {
+        let Some(site) = self.site(node) else {
+            return;
+        };
+        let targets: Vec<SymbolId> = self
+            .collects
+            .iter()
+            .filter(|impl_| collection.can_reach(impl_.self_ty))
+            .map(|impl_| impl_.symbol)
+            .collect();
+        for target in targets {
+            self.push(
+                from,
+                target,
+                EdgeKind::MayDispatchTo,
+                Certainty::Candidate,
+                site.clone(),
+                EdgeDetail::None,
+            );
+        }
+    }
+
+    /// Whether a function is the standard `Iterator::collect`, which builds a
+    /// collection through `FromIterator`.
+    fn is_collect(&mut self, function: Function) -> bool {
+        let db = self.input.db;
+        self.timed(Kind::Dispatch, || {
+            let container = function.as_assoc_item(db)?.container(db);
+            let trait_ = match container {
+                AssocItemContainer::Trait(trait_) => trait_,
+                AssocItemContainer::Impl(block) => block.trait_(db)?,
+            };
+            Some(
+                function.name(db).as_str() == "collect"
+                    && trait_.name(db).as_str() == "Iterator"
                     && matches!(trait_.module(db).krate(db).origin(db), CrateOrigin::Lang(_)),
             )
         }) == Some(true)
@@ -661,15 +820,7 @@ impl Collector<'_, '_> {
         let targets: Vec<SymbolId> = self
             .formatting
             .iter()
-            .filter(|impl_| {
-                traits.contains(&impl_.trait_)
-                    && match (value, impl_.self_ty) {
-                        (ValueType::Data(ty), Some(other)) => ty == other,
-                        (ValueType::Data(_) | ValueType::Other, None) => true,
-                        (ValueType::Other, Some(_)) => false,
-                        (ValueType::Unknown, _) => true,
-                    }
-            })
+            .filter(|impl_| traits.contains(&impl_.trait_) && value.can_reach(impl_.self_ty))
             .map(|impl_| impl_.symbol)
             .collect();
         for target in targets {
@@ -837,6 +988,12 @@ impl Collector<'_, '_> {
         if let Some(expr) = ast::PathExpr::cast(node.clone()) {
             self.path_expr(&expr, from, depth);
             return;
+        }
+        if ast::BinExpr::can_cast(node.kind())
+            || ast::PrefixExpr::can_cast(node.kind())
+            || ast::IndexExpr::can_cast(node.kind())
+        {
+            self.operator_expr(node, from);
         }
         if let Some(ty) = ast::PathType::cast(node.clone()) {
             self.path_type(&ty, from, depth);
@@ -1120,6 +1277,48 @@ impl Collector<'_, '_> {
         }
     }
 
+    /// The operator trait a block implements, when it is one of the standard
+    /// operator traits.
+    fn operator_trait(&mut self, block: Impl) -> Option<&'static str> {
+        let reference = self.timed(Kind::Dispatch, || block.trait_ref(self.input.db))?;
+        let name = self.timed(Kind::Dispatch, || {
+            Some(reference.trait_().name(self.input.db))
+        })?;
+        OPERATOR_TRAITS
+            .iter()
+            .copied()
+            .find(|known| *known == name.as_str())
+    }
+
+    /// Adds the edge of an operator expression, which calls the operator's
+    /// trait method.
+    ///
+    /// `left * right` is `<impl Mul for T>::mul(left, right)`: no path in the
+    /// syntax names that method, so without this edge a changed `mul` has no
+    /// callers and operator-heavy code looks unused. The same holds for the
+    /// prefix operators (`-`, `*`, `!`), for indexing and for comparisons.
+    fn operator_expr(&mut self, node: &SyntaxNode, from: SymbolId) {
+        if !operator_traits(node)
+            .iter()
+            .any(|name| self.operators.contains(name))
+        {
+            return;
+        }
+        let sema = self.input.sema;
+        let resolved = if let Some(expr) = ast::BinExpr::cast(node.clone()) {
+            self.timed(Kind::ResolveMethod, || sema.resolve_bin_expr(&expr))
+        } else if let Some(expr) = ast::PrefixExpr::cast(node.clone()) {
+            self.timed(Kind::ResolveMethod, || sema.resolve_prefix_expr(&expr))
+        } else if let Some(expr) = ast::IndexExpr::cast(node.clone()) {
+            self.timed(Kind::ResolveMethod, || sema.resolve_index_expr(&expr))
+        } else {
+            None
+        };
+        if let Some(function) = resolved {
+            self.call_to(function, from, node);
+        }
+    }
+
     /// Adds the edge of a path in callee position.
     fn path_call(&mut self, path: &ast::Path, from: SymbolId) {
         match self.timed(Kind::ResolvePath, || self.input.sema.resolve_path(path)) {
@@ -1161,6 +1360,13 @@ impl Collector<'_, '_> {
                             {
                                 let iterator = self.typed_value(&receiver);
                                 self.iterator_use(from, name_ref.syntax(), iterator);
+                            }
+                            // `collect` builds the collection the type asks for
+                            // through `FromIterator`, which nothing names.
+                            if self.is_collect(function) {
+                                let collection =
+                                    self.typed_value(&ast::Expr::MethodCallExpr(call.clone()));
+                                self.collect_use(from, name_ref.syntax(), collection);
                             }
                         }
                         MethodTarget::Field(field) => {
@@ -2086,6 +2292,60 @@ fn value_target(def: ModuleDef) -> Option<(DefKey, EdgeKind)> {
         ModuleDef::Adt(item) => (DefKey::Adt(item), EdgeKind::Constructs),
         _ => return None,
     })
+}
+
+/// The traits one arithmetic operator invokes, plain and assigning.
+fn arithmetic_traits(op: ast::ArithOp, assignment: bool) -> &'static [&'static str] {
+    match (op, assignment) {
+        (ast::ArithOp::Add, false) => &["Add"],
+        (ast::ArithOp::Add, true) => &["AddAssign"],
+        (ast::ArithOp::Sub, false) => &["Sub"],
+        (ast::ArithOp::Sub, true) => &["SubAssign"],
+        (ast::ArithOp::Mul, false) => &["Mul"],
+        (ast::ArithOp::Mul, true) => &["MulAssign"],
+        (ast::ArithOp::Div, false) => &["Div"],
+        (ast::ArithOp::Div, true) => &["DivAssign"],
+        (ast::ArithOp::Rem, false) => &["Rem"],
+        (ast::ArithOp::Rem, true) => &["RemAssign"],
+        (ast::ArithOp::Shl, false) => &["Shl"],
+        (ast::ArithOp::Shl, true) => &["ShlAssign"],
+        (ast::ArithOp::Shr, false) => &["Shr"],
+        (ast::ArithOp::Shr, true) => &["ShrAssign"],
+        (ast::ArithOp::BitXor, false) => &["BitXor"],
+        (ast::ArithOp::BitXor, true) => &["BitXorAssign"],
+        (ast::ArithOp::BitOr, false) => &["BitOr"],
+        (ast::ArithOp::BitOr, true) => &["BitOrAssign"],
+        (ast::ArithOp::BitAnd, false) => &["BitAnd"],
+        (ast::ArithOp::BitAnd, true) => &["BitAndAssign"],
+    }
+}
+
+/// The operator traits one operator expression may invoke.
+///
+/// `&&` and `||` are not calls, and a plain `=` assigns a place rather than
+/// invoking a trait.
+fn operator_traits(node: &SyntaxNode) -> &'static [&'static str] {
+    if let Some(expr) = ast::BinExpr::cast(node.clone()) {
+        return match expr.op_kind() {
+            Some(ast::BinaryOp::ArithOp(op)) => arithmetic_traits(op, false),
+            Some(ast::BinaryOp::Assignment { op: Some(op) }) => arithmetic_traits(op, true),
+            Some(ast::BinaryOp::CmpOp(ast::CmpOp::Eq { .. })) => &["PartialEq"],
+            Some(ast::BinaryOp::CmpOp(ast::CmpOp::Ord { .. })) => &["PartialOrd"],
+            Some(ast::BinaryOp::Assignment { op: None } | ast::BinaryOp::LogicOp(_)) | None => &[],
+        };
+    }
+    if let Some(expr) = ast::PrefixExpr::cast(node.clone()) {
+        return match expr.op_kind() {
+            Some(ast::UnaryOp::Deref) => &["Deref", "DerefMut"],
+            Some(ast::UnaryOp::Not) => &["Not"],
+            Some(ast::UnaryOp::Neg) => &["Neg"],
+            None => &[],
+        };
+    }
+    if ast::IndexExpr::can_cast(node.kind()) {
+        return &["Index", "IndexMut"];
+    }
+    &[]
 }
 
 /// Which formatting traits a format string invokes.

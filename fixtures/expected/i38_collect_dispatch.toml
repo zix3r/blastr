@@ -1,0 +1,30 @@
+# `collect` asks the collection type for a `FromIterator` and calls its
+# `from_iter`; no path names the impl. A `collect` into a type this workspace
+# implements reaches that `from_iter`, and one into a `Vec` reaches nothing.
+#
+# The change is the `from_iter` of `Lines`; `collected` is the only function
+# that collects into it, and `line_count` calls `collected`.
+crates = ["i38_collect_dispatch"]
+exact_changes = true
+exact_impact = true
+
+[[change]]
+kind = "body"
+symbol = "i38_collect_dispatch::<impl FromIterator<String> for Lines>::from_iter"
+
+[[impact]]
+symbol = "i38_collect_dispatch::collected"
+class = "behaviour"
+confidence = "possible"
+reason = "dispatches-to-changed"
+distance = 1
+
+[[impact]]
+symbol = "i38_collect_dispatch::line_count"
+class = "behaviour"
+confidence = "possible"
+reason = "dispatches-to-changed"
+distance = 2
+
+[[no_impact]]
+symbol = "i38_collect_dispatch::copied"
