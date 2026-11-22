@@ -346,3 +346,37 @@ or refute what Blastr says about them.
 - Items that a macro produced have the span of the macro call, not of a syntax
   node of their own, so no edit is planned for them. The number of unplanned
   edits is reported.
+- An item's distance is the length of its strongest evidence path, and the
+  search follows an item's own references once, from that path. When the
+  strongest path is also the longest, its callers are one step past it and the
+  depth limit cuts them although a shorter path to the item exists. Measured on
+  `macrokit` at depth 8, decay 0.8: `session::station` is listed at distance 8
+  through a fully resolved chain, so
+  `station_commands_coexist_with_the_library_commands` is not selected even
+  though a candidate chain reaches it at distance 6 (test cases `358`, `417`).
+  Following an item again when a shorter path arrives
+  would carry the propagation on, but it changes the reachable set of every
+  project and the default parameters cannot exercise it: at decay 0.6 a
+  resolved hop is cheaper than a candidate one, so the longest path is never
+  the strongest. Chains of nine steps on the shortest route are cut by the same
+  depth limit without any shorter path to blame (cases `251`, `259`, `357`,
+  `379`, `390`, `429`).
+- Two candidate steps on one path compound below the score floor: on `macrokit`,
+  `Entry::source` and `Issue::render` reach their failing tests at 0.042 against
+  a floor of 0.05 (cases `168`, `395`).
+- Behaviour propagation continues from a function's references, not from a
+  type's. A changed procedural macro reaches the items whose expansion names it
+  and, through their generated methods, the code that calls those methods; code
+  that only *mentions* the annotated type does not continue the propagation.
+  Measured on `macrokit`: four tests reach the changed `parse_describe_attribute`
+  only through a `uses-type` edge into `CommandSpec` or `Estimate` (case `011`),
+  while the call chain the rules can follow is longer than the depth limit.
+- The compiler check maps an error to the innermost project symbol containing
+  its span. An error inside the body of a `macro_rules!` macro of the project,
+  or inside an impl a `#[derive]` generated, therefore maps to the macro-side
+  symbol: the macro definition, or the generated impl at the attribute. Blastr
+  deliberately never lists a macro-generated item as *needs editing* (it has no
+  text of its own) and lists the invokers of a changed macro, not the macro
+  definition of a changed signature of an invoker, so such errors are counted
+  as misses. Measured on `macrokit` with the complete graph: 46 of the 87
+  compiler misses name `macros::ensure` or a derive-generated `Describe` impl.
