@@ -41,6 +41,112 @@ pub fn dependents(graph: &RevisionGraph, seeds: &[SymbolId]) -> BTreeSet<SymbolI
     found
 }
 
+/// Why a test a mutation makes fail is or is not in plain reverse reachability.
+///
+/// For every missed test offer, the shortest chain from the test to `seed`
+/// along the graph's own edges, whatever they mean. A chain the plain search
+/// has and Blastr's selection does not points at a rule that does not follow
+/// one of the edge kinds on it; no chain at all points at an edge the extraction
+/// never saw. Either way the line names the case's gap.
+pub fn explain(graph: &RevisionGraph, seed: Option<SymbolId>, missed: &[String]) -> Vec<String> {
+    let Some(seed) = seed else {
+        return vec!["the changed function has no node in the edited graph".to_owned()];
+    };
+    let mut lines = Vec::new();
+    for filter in missed {
+        let tests: Vec<SymbolId> = graph
+            .symbols
+            .iter()
+            .enumerate()
+            .filter(|(_, symbol)| symbol.flags.is_test && test_filter(&symbol.path.path) == *filter)
+            .map(|(index, _)| SymbolId(index as u32))
+            .collect();
+        if tests.is_empty() {
+            lines.push(format!(
+                "{filter}: no test symbol in the edited graph carries this name"
+            ));
+            continue;
+        }
+        for test in tests {
+            let name = &graph.symbols[test.0 as usize].path.path;
+            match chain(graph, test, seed) {
+                Some(steps) => {
+                    lines.push(format!("{filter}: plain reverse path from {name}: {steps}"))
+                }
+                None => lines.push(format!(
+                    "{filter}: {name} does not reach the changed function on the graph's edges"
+                )),
+            }
+        }
+    }
+    lines
+}
+
+/// The shortest chain of edges leading from `from` to `to`, rendered.
+fn chain(graph: &RevisionGraph, from: SymbolId, to: SymbolId) -> Option<String> {
+    if from == to {
+        return Some(String::from("the test is the changed function"));
+    }
+    let index = GraphIndex::new(graph);
+    let mut previous: Vec<Option<u32>> = vec![None; graph.symbols.len()];
+    let mut seen: BTreeSet<SymbolId> = BTreeSet::new();
+    let mut queue: std::collections::VecDeque<SymbolId> = std::collections::VecDeque::new();
+    seen.insert(from);
+    queue.push_back(from);
+    while let Some(current) = queue.pop_front() {
+        for edge_index in index.edges_from(current) {
+            let Some(edge) = graph.edges.get(*edge_index as usize) else {
+                continue;
+            };
+            if edge.kind == EdgeKind::Contains || !seen.insert(edge.to) {
+                continue;
+            }
+            previous[edge.to.0 as usize] = Some(*edge_index);
+            if edge.to == to {
+                return Some(render_chain(graph, &previous, from, to));
+            }
+            queue.push_back(edge.to);
+        }
+    }
+    None
+}
+
+/// Walks the predecessors of `to` back to `from` and renders every step.
+fn render_chain(
+    graph: &RevisionGraph,
+    previous: &[Option<u32>],
+    from: SymbolId,
+    to: SymbolId,
+) -> String {
+    let mut steps = Vec::new();
+    let mut current = to;
+    while current != from {
+        let Some(edge_index) = previous[current.0 as usize] else {
+            break;
+        };
+        let Some(edge) = graph.edges.get(edge_index as usize) else {
+            break;
+        };
+        steps.push(format!(
+            "{} -[{}]-> {}",
+            graph.symbols[edge.from.0 as usize].path.path,
+            edge.kind,
+            graph.symbols[edge.to.0 as usize].path.path
+        ));
+        current = edge.from;
+    }
+    steps.reverse();
+    steps.join(", then ")
+}
+
+/// The name `cargo test` matches a test by: its path without the crate segment.
+fn test_filter(path: &str) -> &str {
+    match path.split_once("::") {
+        Some((_, rest)) if !rest.is_empty() => rest,
+        _ => path,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -49,8 +155,17 @@ mod tests {
         SymbolKind, SymbolPath, Visibility,
     };
 
-    /// A symbol with an empty location.
+    /// A symbol with an empty location. A path ending in `!` names a test.
     fn symbol(path: &str, kind: SymbolKind) -> Symbol {
+        let mut symbol = plain_symbol(path.trim_end_matches('!'), kind);
+        if path.ends_with('!') {
+            symbol.flags.is_test = true;
+        }
+        symbol
+    }
+
+    /// A symbol with an empty location and no flags.
+    fn plain_symbol(path: &str, kind: SymbolKind) -> Symbol {
         Symbol {
             path: SymbolPath::new(path, kind),
             krate: CrateId(0),
@@ -150,5 +265,40 @@ mod tests {
     fn a_symbol_nothing_refers_to_has_no_dependents() {
         let graph = chain();
         assert!(dependents(&graph, &[SymbolId(4)]).is_empty());
+    }
+
+    #[test]
+    fn a_missed_test_is_explained_by_the_chain_to_the_change() {
+        let mut graph = chain();
+        graph.symbols[1].flags.is_test = true;
+        let lines = explain(&graph, Some(SymbolId(3)), &["main".to_owned()]);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("plain reverse path"), "{lines:?}");
+        assert!(
+            lines[0].contains("krate::main -[calls]-> krate::middle")
+                && lines[0].contains("krate::middle -[calls]-> krate::leaf"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_miss_without_a_chain_names_the_gap() {
+        let mut graph = chain();
+        graph.symbols[1].flags.is_test = true;
+        let lines = explain(&graph, Some(SymbolId(4)), &["main".to_owned()]);
+        assert!(
+            lines[0].contains("does not reach the changed function"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_miss_no_test_symbol_carries_is_named_as_such() {
+        let mut graph = chain();
+        graph.symbols[1].flags.is_test = true;
+        let lines = explain(&graph, Some(SymbolId(3)), &["no_such_test".to_owned()]);
+        assert!(lines[0].contains("no test symbol"), "{lines:?}");
+        let lines = explain(&graph, None, &["main".to_owned()]);
+        assert!(lines[0].contains("no node"), "{lines:?}");
     }
 }

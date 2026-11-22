@@ -127,11 +127,16 @@ fn run_tune(options: &Tune) -> Result<()> {
 /// Runs one check on one project and writes the report when asked to.
 fn run_check(options: Check, compiler: bool) -> Result<()> {
     let mut project = project::Project::open(&options.project)?;
+    let params = match &options.params {
+        Some(spec) => Some(tune::parse_params(spec)?),
+        None => None,
+    };
     let check_options = compiler::Options {
         limit: options.limit,
         seed: options.seed,
         kinds: options.kinds.clone(),
         case: options.case.clone(),
+        params,
     };
     let report = if compiler {
         compiler::run(&mut project, &check_options)?
@@ -222,6 +227,7 @@ fn run_report(options: &Report) -> Result<()> {
                 seed: options.seed,
                 kinds: Vec::new(),
                 case: None,
+                params: None,
             };
             let report = if compiler {
                 compiler::run(&mut project, &check_options)?

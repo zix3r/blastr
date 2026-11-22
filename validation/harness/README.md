@@ -48,6 +48,11 @@ CARGO_TARGET_DIR=../../target cargo run --release -- compiler ../projects/shopfr
 # the test check
 CARGO_TARGET_DIR=../../target cargo run --release -- tests ../projects/shopfront
 
+# one test case under a tuned setting, with the reason for every miss
+CARGO_TARGET_DIR=../../target cargo run --release -- tests ../projects/shopfront \
+  --case 004-swap-operator-billing-discount-percent_text \
+  --params depth=8,decay=0.8,candidate=0.4,floor=0.05
+
 # both checks over every project under validation/projects, then the report
 CARGO_TARGET_DIR=../../target cargo run --release -- report
 
@@ -69,6 +74,19 @@ Every case result records the file, the item, the edit kind and the text of the
 item before and after the edit, so a miss can be reproduced and inspected with
 `--case <id>`. Case ids are `NNN-<kind>-<symbol>`, numbered in the order the
 graph lists the definitions, so two runs of the same project plan the same cases.
+
+`--params depth=8,decay=0.8,candidate=0.4,floor=0.05` runs a check with those
+`AnalysisParams` instead of the defaults; a parameter the spec omits keeps its
+default, and the JSON report records the set that was used. It is how a case is
+rerun under a setting the sweep picked, and the JSON of that run is the evidence
+for the case. `--params` belongs to `compiler` and `tests`; `report` and `tune`
+keep the defaults and their own settings.
+
+`--case` on the test check prints, for every missed test, the shortest chain of
+edges that leads from the test to the changed function. A chain the plain search
+has and Blastr's selection does not points at a rule that does not follow one of
+the edges on it; no chain at all points at an edge the extraction never saw. The
+line names the case's gap without anyone having to read the graph by hand.
 
 ## How the edits are made
 

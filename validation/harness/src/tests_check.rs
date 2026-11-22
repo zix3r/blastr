@@ -23,7 +23,7 @@ use crate::{Error, Result, compiler::Options, reach};
 
 /// Runs the test check over the project.
 pub fn run(project: &mut Project, options: &Options) -> Result<CheckReport> {
-    let params = AnalysisParams::default();
+    let params = options.params.clone().unwrap_or_default();
     let (planned, unplanned) = plan::mutant_cases(project.graph(), project.dir())?;
     let available = planned.len() as u32;
     let planned = plan::sample_mutants(planned, options.limit, options.seed);
@@ -226,6 +226,16 @@ fn run_case(
     let failing: BTreeSet<String> = output.failed.iter().cloned().collect();
 
     result.misses = failing.difference(&selected_set).cloned().collect();
+    if wants_evidence && !result.misses.is_empty() {
+        let seed = compiler::seed_in(
+            &variant.head,
+            &mutant.symbol,
+            &mutant.file,
+            mutant.edit.range.start as u32,
+        );
+        evidence.push("why each missed test was not selected".to_owned());
+        evidence.extend(reach::explain(&variant.head, seed, &result.misses));
+    }
     result.expected = failing.into_iter().collect();
     result.listed = selected;
     result.blastr_items = variant.analysis.items.len() as u32;

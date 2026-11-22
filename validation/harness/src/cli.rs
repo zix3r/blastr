@@ -32,6 +32,8 @@ pub struct Check {
     pub kinds: Vec<EditKind>,
     /// Rerun one case by id.
     pub case: Option<String>,
+    /// The analysis parameters to run with, as `depth=8,decay=0.8,...`.
+    pub params: Option<String>,
     /// Where to write the JSON report, when anywhere.
     pub out: Option<PathBuf>,
 }
@@ -98,6 +100,9 @@ OPTIONS
                    add-required-trait-method, remove-function,
                    narrow-visibility).
   --case ID        Rerun one case and print Blastr's evidence for it.
+  --params SPEC    Run the check with these analysis parameters instead of the
+                   defaults, as `depth=8,decay=0.8,candidate=0.4,floor=0.05`.
+                   A parameter the spec omits keeps its default.
   --out PATH       Where to write the JSON report (default: none for a single
                    check, validation/results for the report command and for
                    `tune`, which writes a directory).
@@ -170,6 +175,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 }
             }
             "--case" => check.case = Some(value("--case")?),
+            "--params" => check.params = Some(value("--params")?),
             "--out" => {
                 let path = PathBuf::from(value("--out")?);
                 check.out = Some(path.clone());
@@ -233,6 +239,9 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
         if project.is_some() {
             return Err("`report` takes its projects through `--projects`".to_owned());
         }
+        if check.params.is_some() {
+            return Err("`--params` is a `compiler` and `tests` option".to_owned());
+        }
         return Ok(Command::Report(report));
     }
     let Some(project) = project else {
@@ -287,6 +296,20 @@ mod tests {
         assert_eq!(check.kinds, vec![EditKind::AddField, EditKind::RemoveField]);
         assert_eq!(check.case.as_deref(), Some("002-add-field-x"));
         assert_eq!(check.out, Some(PathBuf::from("r.json")));
+    }
+
+    #[test]
+    fn a_check_runs_with_the_parameters_it_is_given() {
+        let parsed = parse_text(
+            "tests shopfront --case 004-swap-operator-x --params depth=8,decay=0.8,candidate=0.4,floor=0.05",
+        );
+        let Ok(Command::Tests(check)) = parsed else {
+            panic!("the command parses: {parsed:?}");
+        };
+        assert_eq!(
+            check.params.as_deref(),
+            Some("depth=8,decay=0.8,candidate=0.4,floor=0.05")
+        );
     }
 
     #[test]
@@ -355,5 +378,6 @@ mod tests {
         assert!(parse_text("report --grid decay=0.5").is_err());
         assert!(parse_text("compiler x --results r1").is_err());
         assert!(parse_text("tests x --confirm macrokit").is_err());
+        assert!(parse_text("report --params depth=8").is_err());
     }
 }

@@ -38,11 +38,13 @@ pub struct Options {
     pub kinds: Vec<EditKind>,
     /// Rerun one case by id and print its evidence.
     pub case: Option<String>,
+    /// The analysis parameters to run with; `None` takes the defaults.
+    pub params: Option<AnalysisParams>,
 }
 
 /// Runs the compiler check over the project.
 pub fn run(project: &mut Project, options: &Options) -> Result<CheckReport> {
-    let params = AnalysisParams::default();
+    let params = options.params.clone().unwrap_or_default();
     let kinds = if options.kinds.is_empty() {
         crate::edits::EDIT_KINDS.to_vec()
     } else {

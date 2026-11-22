@@ -251,17 +251,7 @@ pub fn parse_grid(spec: &str) -> Result<Vec<Setting>> {
             .split_once('=')
             .ok_or_else(|| Error::Harness(format!("`{part}` is not `parameter=value,...`")))?;
         let key = key.trim();
-        let canonical = match key {
-            "decay" => "decay",
-            "candidate" | "candidate_weight" => "candidate",
-            "floor" | "score_floor" => "floor",
-            "depth" => "depth",
-            other => {
-                return Err(Error::Harness(format!(
-                    "`{other}` is not a tunable parameter; use decay, candidate, floor or depth"
-                )));
-            }
-        };
+        let canonical = canonical_parameter(key)?;
         if !named.insert(canonical) {
             return Err(Error::Harness(format!("`{key}` is given twice")));
         }
@@ -327,6 +317,70 @@ pub fn parse_grid(spec: &str) -> Result<Vec<Setting>> {
         }
     }
     Ok(normalised(settings))
+}
+
+/// Parses one setting: `depth=8,decay=0.8,candidate=0.4,floor=0.05`.
+///
+/// The form is one `parameter=value` pair per searched parameter, separated by
+/// commas; a parameter the spec does not name keeps its default value, and a
+/// parameter may be named once. The aliases are the grid's (`score_floor` for
+/// `floor`, `candidate_weight` for `candidate`).
+///
+/// A check runs with these parameters instead of the defaults, so a case can be
+/// rerun under a tuned setting and the selection it causes can be inspected.
+pub fn parse_params(spec: &str) -> Result<AnalysisParams> {
+    let mut setting = Setting::defaults();
+    let mut named: HashSet<&'static str> = HashSet::new();
+
+    for part in spec
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        let (key, value) = part
+            .split_once('=')
+            .ok_or_else(|| Error::Harness(format!("`{part}` is not `parameter=value`")))?;
+        let key = key.trim();
+        let value = value.trim();
+        let canonical = canonical_parameter(key)?;
+        if !named.insert(canonical) {
+            return Err(Error::Harness(format!("`{key}` is given twice")));
+        }
+        if value.contains(',') {
+            return Err(Error::Harness(format!(
+                "`{key}={value}` names more than one value; `--params` takes one per parameter"
+            )));
+        }
+        match canonical {
+            "decay" => setting.decay = float(key, value)?,
+            "candidate" => setting.candidate_weight = float(key, value)?,
+            "floor" => setting.score_floor = float(key, value)?,
+            _ => {
+                setting.depth = value
+                    .parse::<u32>()
+                    .map_err(|_| Error::Harness(format!("`{key}={value}` is not a number")))?;
+            }
+        }
+    }
+    if named.is_empty() {
+        return Err(Error::Harness(
+            "`--params` names no parameter; use decay, candidate, floor or depth".to_owned(),
+        ));
+    }
+    Ok(setting.params())
+}
+
+/// The name a parameter is known by in a spec.
+fn canonical_parameter(key: &str) -> Result<&'static str> {
+    match key {
+        "decay" => Ok("decay"),
+        "candidate" | "candidate_weight" => Ok("candidate"),
+        "floor" | "score_floor" => Ok("floor"),
+        "depth" => Ok("depth"),
+        other => Err(Error::Harness(format!(
+            "`{other}` is not a tunable parameter; use decay, candidate, floor or depth"
+        ))),
+    }
 }
 
 /// One value of a grid spec as a float.
@@ -2064,6 +2118,45 @@ mod tests {
         assert!(parse_grid("decay=-0.5").is_err());
         assert!(parse_grid("depth=6;depth=8").is_err());
         assert!(parse_grid("depth=x").is_err());
+    }
+
+    #[test]
+    fn one_setting_parses_from_a_pairs_list() {
+        let params =
+            parse_params("depth=8,decay=0.8,candidate=0.4,floor=0.05").expect("a valid spec");
+        assert_eq!(params.depth, 8);
+        assert!((params.ranking.decay - 0.8).abs() < f32::EPSILON);
+        assert!((params.ranking.candidate_weight - 0.4).abs() < f32::EPSILON);
+        assert!((params.ranking.score_floor - 0.05).abs() < f32::EPSILON);
+        assert_eq!(params, Setting::from_params(&params).params());
+        assert_eq!(Setting::from_params(&params).label(), "8/0.80/0.40/0.05");
+    }
+
+    #[test]
+    fn a_pairs_list_keeps_the_parameters_it_does_not_name() {
+        let params = parse_params("depth=10").expect("a valid spec");
+        assert_eq!(params.depth, 10);
+        assert_eq!(
+            params.ranking.score_floor,
+            Setting::defaults().params().ranking.score_floor
+        );
+        assert_eq!(
+            parse_params("score_floor=0.02")
+                .map(|params| params.depth)
+                .ok(),
+            Some(Setting::defaults().params().depth)
+        );
+    }
+
+    #[test]
+    fn a_pairs_list_that_names_nothing_or_the_wrong_thing_is_refused() {
+        assert!(parse_params("").is_err());
+        assert!(parse_params("nonsense=1").is_err());
+        assert!(parse_params("depth").is_err());
+        assert!(parse_params("depth=x").is_err());
+        assert!(parse_params("decay=-0.5").is_err());
+        assert!(parse_params("depth=8;decay=0.8").is_err());
+        assert!(parse_params("depth=8,depth=10").is_err());
     }
 
     #[test]
