@@ -8,7 +8,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use blastr_model::{
-    ChangedFile, GraphIndex, RelPath, RevisionGraph, Symbol, SymbolId, SymbolKind, SymbolPath,
+    ChangedFile, GraphIndex, RelPath, RevisionGraph, Symbol, SymbolId, SymbolKind,
     sketch_similarity,
 };
 
@@ -260,19 +260,59 @@ impl<'a> Context<'a> {
 
     /// Step 1: pairs with equal identity, which also covers a file that moved
     /// without its items changing.
+    ///
+    /// A canonical path does not always name one symbol, and its disambiguator
+    /// — the count of equal paths before it — is stable only while every twin
+    /// survives. An inherent method written once per instantiation of a generic
+    /// type is the usual case: `impl Range<f64>` and `impl Range<i64>` each
+    /// declare a `bounds_text`, and the method's path leaves the impl's own self
+    /// type out, so the two differ only by their disambiguator. Removing the
+    /// first shifts the second's disambiguator from 1 to 0, so pairing by the
+    /// whole path paired the removed method with its unchanged twin and reported
+    /// the twin as removed: the impact then named the callers of the method that
+    /// still exists, and the compiler check saw a miss.
+    ///
+    /// So the twins are paired on the path without the disambiguator, and the
+    /// unchanged ones first: an equal signature and an equal body say two symbols
+    /// are the same item, whatever their order. What is left over on a path is
+    /// paired in graph order, as before.
     fn exact(&self, scope: &Scope, matches: &mut Matches) {
-        let mut by_path: HashMap<&SymbolPath, Vec<SymbolId>> = HashMap::new();
+        let mut by_path: HashMap<(&str, SymbolKind), Vec<SymbolId>> = HashMap::new();
         for &id in &scope.head {
+            let path = &self.head_symbol(id).path;
             by_path
-                .entry(&self.head_symbol(id).path)
+                .entry((path.path.as_str(), path.kind))
                 .or_default()
                 .push(id);
         }
+        let candidates = |id: SymbolId| {
+            let path = &self.base_symbol(id).path;
+            by_path
+                .get(&(path.path.as_str(), path.kind))
+                .map(Vec::as_slice)
+                .unwrap_or(&[])
+        };
         for &id in &scope.base {
-            let Some(candidates) = by_path.get(&self.base_symbol(id).path) else {
+            if matches.base_to_head.contains_key(&id) {
                 continue;
-            };
-            let found = candidates
+            }
+            let symbol = self.base_symbol(id);
+            let twin = candidates(id).iter().copied().find(|head| {
+                !matches.head_to_base.contains_key(head) && {
+                    let head = self.head_symbol(*head);
+                    head.signature_hash == symbol.signature_hash
+                        && head.body_hash == symbol.body_hash
+                }
+            });
+            if let Some(head) = twin {
+                matches.pair(id, head);
+            }
+        }
+        for &id in &scope.base {
+            if matches.base_to_head.contains_key(&id) {
+                continue;
+            }
+            let found = candidates(id)
                 .iter()
                 .copied()
                 .find(|head| !matches.head_to_base.contains_key(head));

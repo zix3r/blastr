@@ -1,0 +1,8 @@
+[package]
+name = "i40-duplicate-method-path"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "i40_duplicate_method_path"
+path = "src/lib.rs"

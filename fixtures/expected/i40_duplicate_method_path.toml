@@ -1,0 +1,37 @@
+# Two inherent methods of one generic type share a canonical path.
+#
+# `impl Range<f64>` and `impl Range<i64>` each declare a `bounds_text`, and the
+# path of a method leaves the impl's self type out, so both symbols are called
+# `Range::bounds_text`. Removing the float one must report *that* one as
+# removed: pairing the duplicates by path order alone paired the removed float
+# method with the unchanged integer one, reported the integer one as removed and
+# left the float one as a body change, so the impact named the caller of the
+# method that still exists (`describe_int`) instead of the one that broke
+# (`describe_float`).
+crates = ["i40_duplicate_method_path"]
+exact_changes = true
+exact_impact = true
+
+[[change]]
+kind = "removed"
+symbol = "i40_duplicate_method_path::Range::bounds_text"
+
+[[change]]
+kind = "body"
+symbol = "i40_duplicate_method_path::describe_float"
+
+[[impact]]
+symbol = "i40_duplicate_method_path::describe_float"
+class = "adaptation"
+confidence = "definite"
+reason = "refers-to-removed"
+distance = 1
+tags = ["changed"]
+
+# The integer method and its caller are untouched.
+[[no_impact]]
+symbol = "i40_duplicate_method_path::describe_int"
+
+[[no_change]]
+kind = "body"
+symbol = "i40_duplicate_method_path::Range::bounds_text"
