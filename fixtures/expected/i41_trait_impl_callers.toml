@@ -1,0 +1,37 @@
+# A trait item's signature changes and a caller names the implementation.
+#
+# `dyn_text` calls through the trait object, so its call resolves to the trait
+# item and the C9 row reaches it directly. `card_text` calls the same method on
+# the concrete type, so its call resolves to the implementation: the
+# implementation has to be edited to match the new signature, and the call then
+# reads a different return type, so it has to adapt too. The reach is two steps
+# away and its evidence path starts at the changed trait item.
+crates = ["i41_trait_impl_callers"]
+exact_changes = true
+exact_impact = true
+
+[[change]]
+kind = "trait-item"
+detail = "member-modified"
+symbol = "i41_trait_impl_callers::Rendered::render"
+
+[[impact]]
+symbol = "i41_trait_impl_callers::<impl Rendered for Card>::render"
+class = "adaptation"
+confidence = "definite"
+reason = "must-implement-trait-item"
+distance = 1
+
+[[impact]]
+symbol = "i41_trait_impl_callers::dyn_text"
+class = "adaptation"
+confidence = "definite"
+reason = "uses-changed-trait-item"
+distance = 1
+
+[[impact]]
+symbol = "i41_trait_impl_callers::card_text"
+class = "adaptation"
+confidence = "definite"
+reason = "uses-changed-trait-item"
+distance = 2

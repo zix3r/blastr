@@ -415,6 +415,9 @@ pub fn reason_text(reason: Reason, change: &Change) -> String {
             _ => format!("uses {name} by its old name"),
         },
         Reason::UsesChangedField => format!("uses field {name}"),
+        Reason::ParameterBecomesUnused => {
+            format!("drops the parameter only field {name} used")
+        }
         Reason::ConstructsWithoutField => format!("builds the struct without {name}"),
         Reason::PatternMissesField => format!("pattern does not name {name}"),
         Reason::ExhaustiveMatchMissesVariant => format!("match without a `_` arm misses {name}"),

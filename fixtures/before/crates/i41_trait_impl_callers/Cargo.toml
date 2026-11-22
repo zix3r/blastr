@@ -1,0 +1,8 @@
+[package]
+name = "i41-trait-impl-callers"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "i41_trait_impl_callers"
+path = "src/lib.rs"

@@ -527,6 +527,7 @@ impl<'a> Extractor<'a> {
             in_trait: scope.in_trait,
             in_trait_impl: scope.in_trait_impl,
             from_macro: source.from_macro,
+            sole_parameter_use: false,
         };
         let index = self.push(raw, Some(key));
         self.region(index, Some(key), source.file, source.syntax());
@@ -731,14 +732,25 @@ impl<'a> Extractor<'a> {
             hashes,
             parent,
         );
+        let ty = source.ast().and_then(field_type);
+        let sole_parameter_use = match (source.ast(), ty.as_ref()) {
+            (Some(source), Some(ty)) => {
+                let node = match source {
+                    FieldSource::Named(field) => field.syntax(),
+                    FieldSource::Pos(field) => field.syntax(),
+                };
+                symbols::sole_parameter_use(node, ty)
+            }
+            _ => false,
+        };
         raw.flags = SymbolFlags {
             is_pub_api: self.is_pub_api(visibility, module),
             from_macro: source.from_macro,
             in_trait: scope.in_trait,
             in_trait_impl: scope.in_trait_impl,
+            sole_parameter_use,
             ..SymbolFlags::default()
         };
-        let ty = source.ast().and_then(field_type);
         let index = self.push(raw, Some(key));
         self.region(index, Some(key), source.file, ty.as_ref());
         Ok(())

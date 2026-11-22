@@ -35,6 +35,8 @@ pub enum Reason {
     RefersToRenamed,
     /// Reads, writes or destructures a field that was removed or retyped.
     UsesChangedField,
+    /// Removes the only use of one of its container's generic parameters.
+    ParameterBecomesUnused,
     /// Builds the struct without the new field.
     ConstructsWithoutField,
     /// Destructures the struct without the new field.

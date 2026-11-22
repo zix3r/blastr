@@ -76,10 +76,26 @@ pub(crate) struct Reach {
     pub(crate) certainty: Certainty,
     /// Why the step applies.
     pub(crate) reason: Reason,
+    /// A step that precedes [`Reach::edge`] in the evidence path.
+    pub(crate) via: Option<Via>,
     /// Whether behaviour propagation continues from the reached item.
     pub(crate) continues: bool,
     /// Whether the rule cannot tell exactly who is affected.
     pub(crate) coarse: bool,
+}
+
+/// A step between the changed symbol and the edge that reaches an item.
+///
+/// A group of edges with a [`Source::chained`] group takes two steps: the first
+/// one, next to the change, is kept here so that the evidence path can show how
+/// the item hangs off the change, and the edge that the [`Reach`] carries is the
+/// second one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Via {
+    /// Index of the first step's edge on the reach's side.
+    pub(crate) edge: u32,
+    /// How certain that step is.
+    pub(crate) certainty: Certainty,
 }
 
 /// The changed symbol kinds a rule restricts itself to.
@@ -126,6 +142,7 @@ pub(crate) static RULES: &[Rule] = &[
             certainty: CertaintyRule::Edge,
             reason: Reason::CallsChanged,
             continues: Continue::Always,
+            chained: None,
         }],
     },
     // A body change reaches the code that holds the function as a value.
@@ -147,6 +164,7 @@ pub(crate) static RULES: &[Rule] = &[
             certainty: CertaintyRule::Candidate,
             reason: Reason::TakesChangedAsValue,
             continues: Continue::Always,
+            chained: None,
         }],
     },
     // A body change reaches the code that may dispatch to it.
@@ -168,6 +186,7 @@ pub(crate) static RULES: &[Rule] = &[
             certainty: CertaintyRule::Candidate,
             reason: Reason::DispatchesToChanged,
             continues: Continue::Always,
+            chained: None,
         }],
     },
     // A body change in a function that defines a procedural macro reaches what
@@ -199,6 +218,7 @@ pub(crate) static RULES: &[Rule] = &[
             certainty: CertaintyRule::Candidate,
             reason: Reason::InvokesChangedMacro,
             continues: Continue::Always,
+            chained: None,
         }],
     },
     // A signature change makes the callers and holders adapt. A method that
@@ -223,6 +243,7 @@ pub(crate) static RULES: &[Rule] = &[
                 certainty: CertaintyRule::Edge,
                 reason: Reason::SignatureChanged,
                 continues: Continue::Always,
+                chained: None,
             },
             Source {
                 target: Target::Symbol,
@@ -231,6 +252,7 @@ pub(crate) static RULES: &[Rule] = &[
                 certainty: CertaintyRule::Edge,
                 reason: Reason::SignatureChanged,
                 continues: Continue::Always,
+                chained: None,
             },
         ],
     },
@@ -253,6 +275,7 @@ pub(crate) static RULES: &[Rule] = &[
             certainty: CertaintyRule::Candidate,
             reason: Reason::DispatchesToChanged,
             continues: Continue::Always,
+            chained: None,
         }],
     },
     // A declaration change reaches everything that names the type.
@@ -279,6 +302,7 @@ pub(crate) static RULES: &[Rule] = &[
             certainty: CertaintyRule::Candidate,
             reason: Reason::DeclarationChanged,
             continues: Continue::Never,
+            chained: None,
         }],
     },
     // A narrowed visibility reaches the referrers it no longer covers.
@@ -301,6 +325,7 @@ pub(crate) static RULES: &[Rule] = &[
                 certainty: CertaintyRule::Edge,
                 reason: Reason::NoLongerVisible,
                 continues: Continue::Never,
+                chained: None,
             },
             // A field is also named by the literals of its container, which
             // carry no edge of their own to the field: the literal has to
@@ -314,6 +339,7 @@ pub(crate) static RULES: &[Rule] = &[
                 certainty: CertaintyRule::WithRestIsCandidate,
                 reason: Reason::NoLongerVisible,
                 continues: Continue::Never,
+                chained: None,
             },
         ],
     },
@@ -337,6 +363,7 @@ pub(crate) static RULES: &[Rule] = &[
             certainty: CertaintyRule::Edge,
             reason: Reason::RefersToRemoved,
             continues: Continue::Never,
+            chained: None,
         }],
     },
     // A rename reaches what referred to the previous identity, on the
@@ -359,6 +386,7 @@ pub(crate) static RULES: &[Rule] = &[
             certainty: CertaintyRule::Edge,
             reason: Reason::RefersToRenamed,
             continues: Continue::Never,
+            chained: None,
         }],
     },
     // A removed field reaches the sites that name it: its readers and
@@ -387,6 +415,33 @@ pub(crate) static RULES: &[Rule] = &[
             certainty: CertaintyRule::Edge,
             reason: Reason::UsesChangedField,
             continues: Continue::Never,
+            chained: None,
+        }],
+    },
+    // A removed field that was the only use of one of its container's generic
+    // parameters leaves that parameter unused (`E0392`), so the container's own
+    // declaration has to drop it as well. The step runs from the field to the
+    // `contains` edge of its struct or union, which names the container; the
+    // field's flag decides whether it applies, so no container kind is needed.
+    Rule {
+        applies: Applies {
+            kind: ChangeKind::Field,
+            detail: DetailMatch::Member(Delta::Removed),
+            symbol_kinds: ANY_KIND,
+            has_body: None,
+        },
+        side: Side::Base,
+        class: ImpactClass::Adaptation,
+        coarse: Coarse::Never,
+        container_kinds: ANY_KIND,
+        sources: &[Source {
+            target: Target::Symbol,
+            edges: EdgeSet::Kinds(&[EdgeKind::Contains]),
+            filter: EdgeFilter::SoleParameterUse,
+            certainty: CertaintyRule::Edge,
+            reason: Reason::ParameterBecomesUnused,
+            continues: Continue::Never,
+            chained: None,
         }],
     },
     // the same on the head side, and only a field read
@@ -413,6 +468,7 @@ pub(crate) static RULES: &[Rule] = &[
             certainty: CertaintyRule::Edge,
             reason: Reason::UsesChangedField,
             continues: Continue::Kinds(&[EdgeKind::ReadsField]),
+            chained: None,
         }],
     },
     // A new field reaches the literals that name every field.
@@ -434,6 +490,7 @@ pub(crate) static RULES: &[Rule] = &[
             certainty: CertaintyRule::Edge,
             reason: Reason::ConstructsWithoutField,
             continues: Continue::Never,
+            chained: None,
         }],
     },
     // A new field reaches the struct and variant patterns that name every
@@ -456,6 +513,7 @@ pub(crate) static RULES: &[Rule] = &[
             certainty: CertaintyRule::Edge,
             reason: Reason::PatternMissesField,
             continues: Continue::Never,
+            chained: None,
         }],
     },
     // A new variant reaches the exhaustive matches of the enum.
@@ -477,6 +535,7 @@ pub(crate) static RULES: &[Rule] = &[
             certainty: CertaintyRule::Edge,
             reason: Reason::ExhaustiveMatchMissesVariant,
             continues: Continue::Never,
+            chained: None,
         }],
     },
     // A new variant reaches the matches whose catch-all now catches it.
@@ -498,6 +557,7 @@ pub(crate) static RULES: &[Rule] = &[
             certainty: CertaintyRule::Edge,
             reason: Reason::WildcardCatchesNewVariant,
             continues: Continue::Always,
+            chained: None,
         }],
     },
     // A removed variant reaches everything that used it, on the base
@@ -524,6 +584,7 @@ pub(crate) static RULES: &[Rule] = &[
             certainty: CertaintyRule::Edge,
             reason: Reason::UsesChangedVariant,
             continues: Continue::Never,
+            chained: None,
         }],
     },
     // A required trait item that appeared reaches the implementations
@@ -546,6 +607,7 @@ pub(crate) static RULES: &[Rule] = &[
             certainty: CertaintyRule::Edge,
             reason: Reason::MustImplementTraitItem,
             continues: Continue::Never,
+            chained: None,
         }],
     },
     // A changed trait item reaches the implementations that provide it
@@ -569,6 +631,7 @@ pub(crate) static RULES: &[Rule] = &[
                 certainty: CertaintyRule::Edge,
                 reason: Reason::MustImplementTraitItem,
                 continues: Continue::Never,
+                chained: Some(&IMPLEMENTATION_CALLERS),
             },
             Source {
                 target: Target::Symbol,
@@ -577,6 +640,7 @@ pub(crate) static RULES: &[Rule] = &[
                 certainty: CertaintyRule::Edge,
                 reason: Reason::UsesChangedTraitItem,
                 continues: Continue::Always,
+                chained: None,
             },
         ],
     },
@@ -600,6 +664,7 @@ pub(crate) static RULES: &[Rule] = &[
             certainty: CertaintyRule::Edge,
             reason: Reason::UsesChangedTraitItem,
             continues: Continue::Never,
+            chained: None,
         }],
     },
     // A changed default body reaches the implementations that do not
@@ -622,6 +687,7 @@ pub(crate) static RULES: &[Rule] = &[
             certainty: CertaintyRule::Edge,
             reason: Reason::InheritsChangedDefault,
             continues: Continue::Never,
+            chained: None,
         }],
     },
     // A changed default body reaches its callers, less surely when an
@@ -644,6 +710,7 @@ pub(crate) static RULES: &[Rule] = &[
             certainty: CertaintyRule::OverrideIsCandidate,
             reason: Reason::CallsChanged,
             continues: Continue::Always,
+            chained: None,
         }],
     },
     // A changed default body reaches the code that holds it as a value.
@@ -665,6 +732,7 @@ pub(crate) static RULES: &[Rule] = &[
             certainty: CertaintyRule::Candidate,
             reason: Reason::TakesChangedAsValue,
             continues: Continue::Always,
+            chained: None,
         }],
     },
     // An implementation that appeared changes the resolution of every
@@ -691,6 +759,7 @@ pub(crate) static RULES: &[Rule] = &[
             certainty: CertaintyRule::Edge,
             reason: Reason::ImplResolutionChanged,
             continues: Continue::Always,
+            chained: None,
         }],
     },
     // the same for an implementation that disappeared, read
@@ -717,6 +786,7 @@ pub(crate) static RULES: &[Rule] = &[
             certainty: CertaintyRule::Edge,
             reason: Reason::ImplResolutionChanged,
             continues: Continue::Always,
+            chained: None,
         }],
     },
     // A changed constant value reaches the code that reads it.
@@ -738,6 +808,7 @@ pub(crate) static RULES: &[Rule] = &[
             certainty: CertaintyRule::Edge,
             reason: Reason::UsesChangedValue,
             continues: Continue::Always,
+            chained: None,
         }],
     },
     // A retyped constant makes the code that reads it adapt.
@@ -759,6 +830,7 @@ pub(crate) static RULES: &[Rule] = &[
             certainty: CertaintyRule::Edge,
             reason: Reason::UsesRetypedValue,
             continues: Continue::Always,
+            chained: None,
         }],
     },
     // A changed type alias reaches the code that names it.
@@ -780,6 +852,7 @@ pub(crate) static RULES: &[Rule] = &[
             certainty: CertaintyRule::Candidate,
             reason: Reason::UsesChangedAlias,
             continues: Continue::Never,
+            chained: None,
         }],
     },
     // A changed macro definition reaches the code that invokes it.
@@ -801,6 +874,7 @@ pub(crate) static RULES: &[Rule] = &[
             certainty: CertaintyRule::Candidate,
             reason: Reason::InvokesChangedMacro,
             continues: Continue::Always,
+            chained: None,
         }],
     },
     // A changed attribute on a function reaches what a body change reaches,
@@ -824,6 +898,7 @@ pub(crate) static RULES: &[Rule] = &[
                 certainty: CertaintyRule::Candidate,
                 reason: Reason::AttributeChanged,
                 continues: Continue::Always,
+                chained: None,
             },
             Source {
                 target: Target::Symbol,
@@ -832,6 +907,7 @@ pub(crate) static RULES: &[Rule] = &[
                 certainty: CertaintyRule::Candidate,
                 reason: Reason::AttributeChanged,
                 continues: Continue::Always,
+                chained: None,
             },
             Source {
                 target: Target::Symbol,
@@ -840,10 +916,28 @@ pub(crate) static RULES: &[Rule] = &[
                 certainty: CertaintyRule::Candidate,
                 reason: Reason::AttributeChanged,
                 continues: Continue::Always,
+                chained: None,
             },
         ],
     },
 ];
+
+/// The callers of the methods that implement a changed trait item.
+///
+/// The implementation has to be edited to match the new signature, so a call
+/// that names the implementation (through a concrete type, not a trait object)
+/// sees that signature and must adapt too. The `implements` group of the C9 row
+/// chains this group: the reach is two steps away, and its evidence path still
+/// starts at the changed trait item.
+static IMPLEMENTATION_CALLERS: Source = Source {
+    target: Target::Symbol,
+    edges: EdgeSet::Kinds(&[EdgeKind::Calls, EdgeKind::TakesAsValue]),
+    filter: EdgeFilter::None,
+    certainty: CertaintyRule::Edge,
+    reason: Reason::UsesChangedTraitItem,
+    continues: Continue::Always,
+    chained: None,
+};
 
 /// One row of the matrix: the changes it applies to, the graph it reads, and
 /// the groups of edges it follows.
@@ -947,6 +1041,12 @@ struct Source {
     reason: Reason,
     /// Whether behaviour propagation continues from the reached item.
     continues: Continue,
+    /// A group of edges followed from the items this group reaches, so that one
+    /// row can reach an item two steps away without giving up the evidence path.
+    ///
+    /// The reaches of the chained group carry the chained group's certainty and
+    /// reason, the row's class, and a [`Via`] naming this group's step.
+    chained: Option<&'static Source>,
 }
 
 /// The kinds of edge a group follows.
@@ -991,6 +1091,12 @@ enum EdgeFilter {
     /// Only edges emitted by an implementation that does not override the
     /// changed trait item.
     ImplDoesNotOverride,
+    /// Only a step whose changed symbol is a field whose type is the only use of
+    /// one of its container's generic parameters.
+    ///
+    /// Removing that field leaves the parameter unused, which the compiler
+    /// rejects at the container's declaration.
+    SoleParameterUse,
 }
 
 /// How certain a step is.
@@ -1100,6 +1206,7 @@ pub(crate) fn onward(item: SymbolId, ctx: &Graphs<'_>) -> Vec<Reach> {
             class: ImpactClass::Behaviour,
             certainty,
             reason,
+            via: None,
             continues: true,
             coarse: false,
         });
@@ -1159,11 +1266,43 @@ impl<'a> Scope<'a> {
 
     /// Adds a reach for every edge of `source` that arrives at one of the
     /// source's targets.
+    ///
+    /// A source with a chained group adds the reaches of that group as well:
+    /// they start at the items this group reached, and carry this group's step
+    /// so the evidence path can show both.
     fn follow(&self, source: &Source, out: &mut Vec<Reach>) {
+        let mut first = Vec::new();
+        self.follow_edges(source, &self.targets(source.target), None, &mut first);
+        let mut chained = Vec::new();
+        if let Some(next) = source.chained {
+            let graph = self.ctx.graph(self.rule.side);
+            for reach in &first {
+                let Some(edge) = graph.edges.get(reach.edge as usize) else {
+                    continue;
+                };
+                let via = Via {
+                    edge: reach.edge,
+                    certainty: reach.certainty,
+                };
+                self.follow_edges(next, &[edge.from], Some(via), &mut chained);
+            }
+        }
+        out.extend(chained);
+        out.extend(first);
+    }
+
+    /// Adds a reach for every edge of `source` that arrives at one of `targets`.
+    fn follow_edges(
+        &self,
+        source: &Source,
+        targets: &[SymbolId],
+        via: Option<Via>,
+        out: &mut Vec<Reach>,
+    ) {
         let side = self.rule.side;
         let graph = self.ctx.graph(side);
         let index = self.ctx.index(side);
-        for target in self.targets(source.target) {
+        for &target in targets {
             for &edge in index.edges_to(target) {
                 let Some(reference) = graph.edges.get(edge as usize) else {
                     continue;
@@ -1183,6 +1322,7 @@ impl<'a> Scope<'a> {
                     class: self.rule.class,
                     certainty,
                     reason: source.reason,
+                    via,
                     continues: source.continues.allows(reference.kind),
                     coarse: self.is_coarse(),
                 });
@@ -1245,7 +1385,16 @@ impl<'a> Scope<'a> {
             EdgeFilter::NotInTraitImpl => !self.in_trait_impl(),
             EdgeFilter::FromImpl => self.kind_of(edge.from) == Some(SymbolKind::Impl),
             EdgeFilter::ImplDoesNotOverride => self.impl_does_not_override(edge.from),
+            EdgeFilter::SoleParameterUse => self.sole_parameter_use(),
         }
+    }
+
+    /// Whether the changed symbol is a field whose type is the only use of one
+    /// of its container's generic parameters.
+    fn sole_parameter_use(&self) -> bool {
+        self.symbol
+            .and_then(|id| self.ctx.graph(self.rule.side).symbols.get(id.0 as usize))
+            .is_some_and(|symbol| symbol.flags.sole_parameter_use)
     }
 
     /// Whether the row counts as coarse for this change.
@@ -3127,7 +3276,7 @@ mod tests {
     fn the_table_holds_every_row_that_follows_edges() {
         assert_eq!(
             super::RULES.len(),
-            30,
+            31,
             "one entry for every kind of change that follows edges"
         );
     }

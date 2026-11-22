@@ -1060,6 +1060,11 @@
           "type": "string"
         },
         {
+          "const": "parameter-becomes-unused",
+          "description": "Removes the only use of one of its container's generic parameters.",
+          "type": "string"
+        },
+        {
           "const": "constructs-without-field",
           "description": "Builds the struct without the new field.",
           "type": "string"

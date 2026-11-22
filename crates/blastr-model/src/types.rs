@@ -99,6 +99,14 @@ pub struct SymbolFlags {
     pub in_trait_impl: bool,
     /// Produced by a macro or a derive rather than written out.
     pub from_macro: bool,
+    /// A field whose type is the only use of one of the generic parameters of
+    /// the struct or union that declares it.
+    ///
+    /// Removing such a field leaves the parameter unused, which the compiler
+    /// rejects (`E0392`), so the declaration has to drop the parameter too.
+    /// Only the field types count as a use; a bound or a `where` clause does
+    /// not keep a parameter alive.
+    pub sole_parameter_use: bool,
 }
 
 /// What an `impl` block implements. Present on symbols of kind `Impl` only.

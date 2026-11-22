@@ -1,0 +1,8 @@
+[package]
+name = "i42-sole-parameter-field"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "i42_sole_parameter_field"
+path = "src/lib.rs"

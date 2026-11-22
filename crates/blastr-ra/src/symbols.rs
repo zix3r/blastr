@@ -13,6 +13,7 @@ use ra_ap_hir::{
     Trait, TypeAlias,
 };
 use ra_ap_syntax::ast;
+use ra_ap_syntax::ast::{HasGenericParams, HasName};
 use ra_ap_syntax::{AstNode, SyntaxNode};
 
 use crate::hashing;
@@ -369,6 +370,92 @@ pub(crate) fn field_hashes(node: &SyntaxNode, ty: Option<ast::Type>) -> Hashes {
     }
 }
 
+/// Whether the type of `field` is the only use of one of the generic parameters
+/// of the struct or union that declares it.
+///
+/// Only the field types keep a parameter alive: a bound or a `where` clause does
+/// not, which is why the compiler reports `E0392` for a parameter no field
+/// names. A field of an enum variant is never such a use: the parameter belongs
+/// to the enum, whose declaration is the item that would have to change.
+pub(crate) fn sole_parameter_use(field: &SyntaxNode, ty: &SyntaxNode) -> bool {
+    let Some(list) = field.parent().and_then(ast::FieldList::cast) else {
+        return false;
+    };
+    let Some(params) = generic_parameter_names(list.syntax().parent().as_ref()) else {
+        return false;
+    };
+    let mentioned: Vec<&String> = params
+        .iter()
+        .filter(|name| mentions_parameter(ty, name))
+        .collect();
+    if mentioned.is_empty() {
+        return false;
+    }
+    let others: Vec<SyntaxNode> = field_types(&list)
+        .into_iter()
+        .filter(|other| other != ty)
+        .collect();
+    mentioned
+        .into_iter()
+        .any(|name| !others.iter().any(|other| mentions_parameter(other, name)))
+}
+
+/// The names of the generic parameters of a struct or union declaration, as the
+/// tokens that name them: `T`, `N`, `'a`.
+///
+/// `None` for anything else, including an enum: a field of a variant does not
+/// declare the parameters it uses.
+fn generic_parameter_names(container: Option<&SyntaxNode>) -> Option<Vec<String>> {
+    let container = container?;
+    let list = ast::Struct::cast(container.clone())
+        .and_then(|item| item.generic_param_list())
+        .or_else(|| {
+            ast::Union::cast(container.clone()).and_then(|item| item.generic_param_list())
+        })?;
+    Some(
+        list.generic_params()
+            .filter_map(|param| match param {
+                ast::GenericParam::LifetimeParam(param) => param
+                    .lifetime()
+                    .and_then(|lifetime| lifetime.lifetime_ident_token())
+                    .map(|token| token.text().to_owned()),
+                ast::GenericParam::TypeParam(param) => {
+                    param.name().map(|name| name.text().to_owned())
+                }
+                ast::GenericParam::ConstParam(param) => {
+                    param.name().map(|name| name.text().to_owned())
+                }
+            })
+            .collect(),
+    )
+}
+
+/// The type of every field of a field list, in source order.
+fn field_types(list: &ast::FieldList) -> Vec<SyntaxNode> {
+    match list {
+        ast::FieldList::RecordFieldList(list) => list
+            .fields()
+            .filter_map(|field| field.ty())
+            .map(|ty| ty.syntax().clone())
+            .collect(),
+        ast::FieldList::TupleFieldList(list) => list
+            .fields()
+            .filter_map(|field| field.ty())
+            .map(|ty| ty.syntax().clone())
+            .collect(),
+    }
+}
+
+/// Whether `node` names the generic parameter `name`.
+///
+/// The names are compared token by token, so a parameter `T` is not found in a
+/// type called `Time`.
+fn mentions_parameter(node: &SyntaxNode, name: &str) -> bool {
+    node.descendants_with_tokens()
+        .filter_map(|element| element.into_token())
+        .any(|token| token.text() == name)
+}
+
 /// The hashes of a macro definition: the rules as the body.
 ///
 /// The signature is empty: the name of a macro is the only thing but the rules,
@@ -523,5 +610,58 @@ mod tests {
         let second = field_hashes(second.syntax(), second.ty());
         assert_eq!(first.signature, second.signature);
         assert_ne!(first.signature, 0);
+    }
+
+    /// The lone-use test for the named field of a struct snippet.
+    fn sole(text: &str, name: &str) -> bool {
+        let item = item::<ast::Struct>(text);
+        let Some(ast::FieldList::RecordFieldList(list)) = item.field_list() else {
+            panic!("the snippet holds named fields");
+        };
+        let field = list
+            .fields()
+            .find(|field| {
+                field
+                    .name()
+                    .is_some_and(|field_name| field_name.text() == name)
+            })
+            .expect("the snippet holds the named field");
+        sole_parameter_use(
+            field.syntax(),
+            field.ty().expect("the field has a type").syntax(),
+        )
+    }
+
+    /// The lone-use test for the first field of a tuple struct snippet.
+    fn sole_in_tuple(text: &str) -> bool {
+        let item = item::<ast::Struct>(text);
+        let Some(ast::FieldList::TupleFieldList(list)) = item.field_list() else {
+            panic!("the snippet holds tuple fields");
+        };
+        let field = list.fields().next().expect("the snippet holds a field");
+        sole_parameter_use(
+            field.syntax(),
+            field.ty().expect("the field has a type").syntax(),
+        )
+    }
+
+    #[test]
+    fn a_field_that_keeps_a_parameter_alive_is_recognised() {
+        assert!(sole(
+            "struct S<'a> { lines: Lines<'a>, count: usize }",
+            "lines"
+        ));
+        assert!(sole("struct S<A, B> { first: A, second: B }", "first"));
+        assert!(sole("struct S<T> { value: Vec<T> }", "value"));
+        assert!(sole_in_tuple("struct S<T>(Vec<T>);"));
+    }
+
+    #[test]
+    fn a_field_another_field_also_uses_is_not_a_lone_use() {
+        assert!(!sole("struct S<T> { left: T, right: T }", "left"));
+        assert!(!sole("struct S<'a> { a: &'a str, b: &'a str }", "a"));
+        assert!(!sole("struct S<T> { left: Vec<T>, right: T }", "right"));
+        assert!(!sole("struct S { value: Time }", "value"));
+        assert!(!sole("struct S<T> { value: u8, unused: T }", "value"));
     }
 }

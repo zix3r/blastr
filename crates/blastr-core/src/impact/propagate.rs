@@ -253,37 +253,66 @@ impl<'a> Search<'a> {
         let Some(edge) = graph.edges.get(reach.edge as usize) else {
             return;
         };
-        let (from, to) = (edge.from, edge.to);
-        let Some(target) = graph.symbols.get(to.0 as usize) else {
+        let Some((item, item_path)) = self.head_counterpart(reach.side, edge.from) else {
             return;
         };
-        let target_path = target.path.clone();
+        let mut steps = Vec::with_capacity(usize::from(reach.via.is_some()) + 1);
+        let mut visited = vec![item];
+        let mut product = step_weight(reach.certainty, &self.input.params.ranking);
+        // The symbol the item's own step arrives at: the changed one, or the
+        // intermediate one when the rule takes two steps.
+        let mut before = edge.to;
+        let mut anchors = vec![edge.to];
+        if let Some(via) = reach.via {
+            let Some(step) = graph.edges.get(via.edge as usize) else {
+                return;
+            };
+            let (Some(from), Some(to)) = (
+                graph.symbols.get(step.from.0 as usize),
+                graph.symbols.get(step.to.0 as usize),
+            ) else {
+                return;
+            };
+            steps.push(EvidenceStep {
+                from: from.path.clone(),
+                to: to.path.clone(),
+                edge: step.kind,
+                certainty: via.certainty,
+                detail: step.detail,
+                site: step.site.clone(),
+            });
+            product *= step_weight(via.certainty, &self.input.params.ranking);
+            before = step.from;
+            anchors = vec![step.to, step.from];
+        }
+        let Some(seed) = graph.symbols.get(before.0 as usize) else {
+            return;
+        };
+        let seed_path = seed.path.clone();
         let detail = edge.detail;
         let kind = edge.kind;
         let site = edge.site.clone();
-        let Some((item, item_path)) = self.head_counterpart(reach.side, from) else {
-            return;
-        };
-        let mut visited = vec![item];
-        if let Some((seed, _)) = self.head_counterpart(reach.side, to)
-            && seed != item
-        {
-            visited.push(seed);
+        for anchor in anchors {
+            if let Some((head, _)) = self.head_counterpart(reach.side, anchor)
+                && !visited.contains(&head)
+            {
+                visited.push(head);
+            }
         }
-        let step = EvidenceStep {
+        steps.push(EvidenceStep {
             from: item_path,
-            to: target_path,
+            to: seed_path,
             edge: kind,
             certainty: reach.certainty,
             detail,
             site,
-        };
+        });
         let path = Growing {
             change: index as u32,
             reason: reach.reason,
             class: reach.class,
-            steps: vec![step],
-            product: step_weight(reach.certainty, &self.input.params.ranking),
+            steps,
+            product,
             visited,
         };
         if reach.coarse {

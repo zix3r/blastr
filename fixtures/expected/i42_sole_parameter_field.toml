@@ -1,0 +1,50 @@
+# Removing a field that was the only use of a generic parameter leaves the
+# parameter unused, so the declaration of the struct has to drop it as well.
+#
+# `Source` loses the only field that names `'a`, so its own declaration is an
+# adaptation site. `Pair` loses `left`, but `right: T` still names `T`, so the
+# declaration is untouched and is not listed.
+crates = ["i42_sole_parameter_field"]
+exact_changes = true
+exact_impact = true
+
+[[change]]
+kind = "field"
+detail = "member-removed"
+symbol = "i42_sole_parameter_field::Pair::left"
+
+[[change]]
+kind = "field"
+detail = "member-removed"
+symbol = "i42_sole_parameter_field::Source::text"
+
+# The fields' readers and writers, as before.
+[[impact]]
+symbol = "i42_sole_parameter_field::Source::new"
+class = "adaptation"
+confidence = "definite"
+reason = "uses-changed-field"
+distance = 1
+
+[[impact]]
+symbol = "i42_sole_parameter_field::Pair::new"
+class = "adaptation"
+confidence = "definite"
+reason = "uses-changed-field"
+distance = 1
+
+# The declaration that has to lose the parameter.
+[[impact]]
+symbol = "i42_sole_parameter_field::Source"
+class = "adaptation"
+confidence = "definite"
+reason = "parameter-becomes-unused"
+distance = 1
+
+# The other field still names the parameter.
+[[no_impact]]
+symbol = "i42_sole_parameter_field::Pair"
+
+# A reader of the field that stays.
+[[no_impact]]
+symbol = "i42_sole_parameter_field::count_of"
