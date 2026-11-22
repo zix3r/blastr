@@ -44,6 +44,13 @@ pub struct Diagnostic {
     pub line: u32,
     /// The crate root of the target the compiler reported this in.
     pub root_file: Option<PathBuf>,
+    /// The procedural macro whose output the error lies in, when it lies in one.
+    ///
+    /// `TokenStream` output has no source text of its own: the compiler points
+    /// such an error at the attribute that wrote it, which names no item a
+    /// person can edit. The name is kept so the check can report the error
+    /// rather than guess a symbol for it.
+    pub generated: Option<String>,
 }
 
 /// One target Cargo built.
@@ -252,7 +259,7 @@ fn read_message(
         output.spanless.push(text);
         return;
     };
-    let primary = project_span(primary);
+    let (primary, generated) = project_span(primary);
     let file = primary
         .get("file_name")
         .and_then(|name| name.as_str())
@@ -279,17 +286,28 @@ fn read_message(
         end: number("byte_end"),
         line: number("line_start"),
         root_file,
+        generated,
     });
 }
 
-/// The span of `first` that lies in the project, following the expansion chain
-/// of a macro when the diagnostic points into the macro's own definition.
+/// The span of `first` that a person would edit, and the procedural macro whose
+/// output it lies in, when it lies in one.
 ///
-/// `assert_eq!` and friends are defined in the standard library, and an error
-/// about the comparison itself is reported at the macro's body, in a file
-/// outside the project. Its expansion names the call site, which is the place a
-/// person would edit, so the innermost project span wins.
-fn project_span(first: &serde_json::Value) -> &serde_json::Value {
+/// A diagnostic about the code of a macro expansion is reported at the tokens
+/// the macro wrote, not at the tokens a person typed. `spans[].expansion` walks
+/// from those tokens back out to the invocation, so the chain says where the
+/// code was written:
+///
+/// * A `macro_rules!` body belongs to the macro, but an error that only appears
+///   because of how the macro is invoked (a `return` inside `ensure!` after the
+///   enclosing function's return type changed) is repaired at the invocation:
+///   the outermost project span of the chain wins, not the innermost.
+/// * A procedural macro's output (a derive or an attribute macro) has no text at
+///   all; the chain reaches the attribute that wrote it, and the macro is named
+///   so that the caller does not blame a symbol for code it never wrote.
+fn project_span(first: &serde_json::Value) -> (&serde_json::Value, Option<String>) {
+    let mut outermost = None;
+    let mut generated = None;
     let mut span = first;
     for _ in 0..8 {
         if span
@@ -297,14 +315,27 @@ fn project_span(first: &serde_json::Value) -> &serde_json::Value {
             .and_then(|name| name.as_str())
             .is_some_and(|name| !Path::new(name).is_absolute())
         {
-            return span;
+            outermost = Some(span);
         }
-        let Some(next) = span.get("expansion").and_then(|chain| chain.get("span")) else {
+        let Some(expansion) = span.get("expansion") else {
+            break;
+        };
+        // `#[derive(..)]` and `#[some_attribute]` are how the compiler spells a
+        // procedural macro; `std::format!` or `crate::ensure!` are not.
+        if generated.is_none()
+            && let Some(name) = expansion
+                .get("macro_decl_name")
+                .and_then(|name| name.as_str())
+                .filter(|name| name.starts_with("#["))
+        {
+            generated = Some(name.to_owned());
+        }
+        let Some(next) = expansion.get("span") else {
             break;
         };
         span = next;
     }
-    first
+    (outermost.unwrap_or(first), generated)
 }
 
 /// The package name of a Cargo package id such as
@@ -518,6 +549,38 @@ mod tests {
             parsed.errors[0].file.as_deref(),
             Some(Path::new("/abs/src/lib.rs"))
         );
+        assert_eq!(parsed.errors[0].generated, None);
+    }
+
+    #[test]
+    fn an_error_in_a_workspace_macro_body_is_read_at_the_invocation() {
+        // A `return` inside `macrokit::ensure!` after the caller's return type
+        // changed: the compiler points into `macros.rs`, the expansion chain at
+        // the invocation in `station.rs`, which is what a person edits.
+        let stdout = r#"{"reason":"compiler-message","message":{"level":"error","code":{"code":"E0308"},"message":"mismatched types","spans":[{"is_primary":true,"file_name":"crates/macrokit/src/macros.rs","byte_start":593,"byte_end":628,"line_start":15,"expansion":{"span":{"file_name":"crates/mock/src/lib.rs","byte_start":9200,"byte_end":9352,"line_start":295},"macro_decl_name":"macrokit::ensure!"}}]}}"#;
+        let parsed = parse_check(stdout, Path::new("/project"));
+        let error = &parsed.errors[0];
+        assert_eq!(error.start, 9200);
+        assert_eq!(error.line, 295);
+        assert_eq!(
+            error.file.as_deref(),
+            Some(Path::new("/project/crates/mock/src/lib.rs"))
+        );
+        assert_eq!(
+            error.generated, None,
+            "a `macro_rules!` macro is written text, not generated code"
+        );
+    }
+
+    #[test]
+    fn an_error_in_a_derive_output_names_its_macro() {
+        // The derive wrote `Description::new(..)` for every struct; the error is
+        // reported at the `#[derive(Describe)]` attribute that asked for it.
+        let stdout = r##"{"reason":"compiler-message","message":{"level":"error","code":{"code":"E0061"},"message":"this function takes 2 arguments","spans":[{"is_primary":true,"file_name":"crates/mock/src/lib.rs","byte_start":4950,"byte_end":4958,"line_start":165,"expansion":{"span":{"file_name":"crates/mock/src/lib.rs","byte_start":4950,"byte_end":4958,"line_start":165},"macro_decl_name":"#[derive(Describe)]"}}]}}"##;
+        let parsed = parse_check(stdout, Path::new("/project"));
+        let error = &parsed.errors[0];
+        assert_eq!(error.line, 165);
+        assert_eq!(error.generated.as_deref(), Some("#[derive(Describe)]"));
     }
 
     #[test]
@@ -568,6 +631,7 @@ test result: FAILED. 0 passed; 1 failed;\n";
                 end: 0,
                 line: 1,
                 root_file: None,
+                generated: None,
             },
             Diagnostic {
                 code: "E0308".to_owned(),
@@ -577,6 +641,7 @@ test result: FAILED. 0 passed; 1 failed;\n";
                 end: 0,
                 line: 1,
                 root_file: None,
+                generated: None,
             },
             Diagnostic {
                 code: String::new(),
@@ -586,6 +651,7 @@ test result: FAILED. 0 passed; 1 failed;\n";
                 end: 0,
                 line: 1,
                 root_file: None,
+                generated: None,
             },
         ];
         let counts = error_codes(&errors);

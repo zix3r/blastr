@@ -135,11 +135,54 @@ the same file — and the innermost one is the item that has to be edited.
 An error in a file that is not part of the project (a dependency, the standard
 library) is counted as *outside*, and an error inside a project file but outside
 every symbol as *unmapped*; both are reported per case rather than guessed at.
-An error whose primary span lies in the body of a macro from another crate — a
-comparison in `assert_eq!`, say — is mapped through the macro's expansion chain
-to the call site in the project, which is where a person would edit.
+
 The changed definition itself is excused on both sides: it is allowed to break
 inside its own body, and that is not what the list is for.
+
+### Errors in code a macro wrote
+
+A diagnostic about a macro expansion is reported at the tokens the macro wrote,
+not at the tokens a person typed, so `spans[].expansion` is read as well: it
+walks from those tokens back out to the invocation. What the chain is used for
+depends on what wrote the tokens.
+
+- **`macro_rules!`** written in the project (or in the standard library) has text
+  of its own, and the fix for an error in it is usually at the invocation. A
+  `return` inside `ensure!` after the enclosing function's return type changed is
+  repaired in that function, not in `macros.rs`, so the **outermost** project
+  span of the chain wins: the invocation. When the invocation *is* the changed
+  definition, the error is excused with it — which is right, since the macro's
+  body is text the change did not touch.
+- **A procedural macro's output** — `#[derive(..)]`, an attribute macro — has no
+  text at all. Rustc points such an error at the attribute that asked for the
+  macro, wraps it in `expansion` with `macro_decl_name: "#[derive(Describe)]"`,
+  and no symbol of the graph can be edited to fix it (the tokens exist only in
+  the macro's output). These errors are counted as **unconfirmed** — one per
+  error — and named in the case's notes, not as misses: no list of editable
+  items can be refuted by an error that names none. See
+  [Known limits](#known-limits).
+- **Anything else** — an `include!`, a nested chain, a macro the compiler does
+  not name — is mapped to the outermost project span the chain reaches.
+
+Measured on `macrokit` at `depth=8,decay=0.8,candidate=0.4,floor=0.05`: the
+baseline of 2 534 cases had **87 misses, 38 false alarms and 663 unconfirmed
+items**; the same check after the mapping below and the Blastr fix it found had
+**9 misses, 36 false alarms and 857 unconfirmed items**. Every miss of the
+baseline is in this table, and every row was checked by rerunning its cases with
+`--case`:
+
+| where the error landed | edit kind | cases | misses before | after |
+|---|---|---|---|---|
+| a project `macro_rules!` body (`ensure!`, `E0308`) | `change-return-type` | 127, 202, 255, 297, 336, 340, 344, 348, 383, 684, 712 | 11 | 0 — mapped to the invocation, which is the changed item |
+| `#[command]` output (`E0061`, `E0308`, `E0624`) | `change-return-type`, `remove-function`, `narrow-visibility` | 585, 586, 587 | 24 | 0 — 24 unconfirmed |
+| `#[derive(Describe)]` output (`E0046`, `E0053`, `E0061`, `E0599`) | `add-parameter`, `change-return-type`, `remove-function`, `narrow-visibility`, `add-required-trait-method` | 765-771, 798, 800 | 43 | 5 unconfirmed, 4 misses at the call sites of case `800` (see below) |
+| builtin `#[derive(Default)]` output (`E0665`, `#[default]`) | `remove-variant` | 906, 1590 | 2 | 0 — 2 unconfirmed |
+| a proc-macro crate that failed to build (`E0277`, `E0432`, `E0599`) | `remove-function` | 003 | 5 | 5 misses — a cascade, not measurable |
+| a plain call site, paired with the wrong twin symbol | `remove-function` | 2472 | 2 | 0 — fixed in `diff/matching.rs`, fixture `i40_duplicate_method_path` |
+
+The false alarms fell from 38 to 36 for one reason: case `2472` had two of them,
+and both were symbols of the method that still exists, listed because the diff
+had paired the removed method with its twin. No case gained a false alarm.
 
 ## Performance
 
@@ -287,7 +330,10 @@ Items in targets the compiler never started are not counted as misses or as
 false alarms either: they are counted as **unconfirmed** and left out of both
 sides. So are the items of a target that reported a privacy error: rustc stops
 checking privacy after the first one, so its error list cannot refute the other
-sites Blastr lists in that target (see [Known limits](#known-limits)). A target
+sites Blastr lists in that target (see [Known limits](#known-limits)). And so are
+errors the compiler reported inside a procedural macro's output, which name no
+item with text of its own (see [Errors in code a macro
+wrote](#errors-in-code-a-macro-wrote)). A target
 counts as judged when Cargo reports an artifact for it or a
 diagnostic from it — Cargo labels every diagnostic with the crate root of the
 target it came from. That happens whenever an edit to a library makes its
@@ -372,11 +418,37 @@ or refute what Blastr says about them.
   only through a `uses-type` edge into `CommandSpec` or `Estimate` (case `011`),
   while the call chain the rules can follow is longer than the depth limit.
 - The compiler check maps an error to the innermost project symbol containing
-  its span. An error inside the body of a `macro_rules!` macro of the project,
-  or inside an impl a `#[derive]` generated, therefore maps to the macro-side
-  symbol: the macro definition, or the generated impl at the attribute. Blastr
-  deliberately never lists a macro-generated item as *needs editing* (it has no
-  text of its own) and lists the invokers of a changed macro, not the macro
-  definition of a changed signature of an invoker, so such errors are counted
-  as misses. Measured on `macrokit` with the complete graph: 46 of the 87
-  compiler misses name `macros::ensure` or a derive-generated `Describe` impl.
+  its span, after following `spans[].expansion` out to the invocation (see
+  [Errors in code a macro wrote](#errors-in-code-a-macro-wrote)). Two kinds of
+  error still name no item the list could contain, and both are counted as
+  **unconfirmed** rather than as misses:
+  - **Procedural macro output.** An error inside the code a `#[derive(..)]` or an
+    attribute macro generated is reported at the attribute that asked for it.
+    The tokens exist only in the macro's output, so the place to edit is the
+    macro (or its input, depending on the change), and Blastr deliberately never
+    lists a macro-generated item as *needs editing* — it has no text of its own.
+    Measured on `macrokit` with the complete graph: 69 of the 87 compiler misses
+    of the round-3 baseline were of this kind, naming a derive-generated
+    `Describe` impl, a builtin `#[derive(Default)]` impl behind `#[default]`, or
+    one of the `__command_spec_*` constants a `#[command]` attribute emits
+    (cases `585`-`587`, `765`-`771`, `798`, `800`, `906`, `1590`). Listing the
+    derive input instead would trade them for a false alarm on every
+    `retype-field` case, because the same generated code reads a retyped field
+    and still compiles; the trade is only worth it once
+    `blastr-core/src/impact/propagate.rs` lets the *class* of a path survive the
+    step into generated code, which is where the demotion to `behaviour` lives.
+  - **A trait item whose impls are macro-generated.** Changing
+    `Describe::describe` makes every derive-generated impl stale, and rustc then
+    rejects the *call sites* of the method as well (`E0053` at the impl,
+    `E0599` where it is called). Blastr reaches those call sites only as
+    *may behave differently*, so 4 of the 9 misses of case `800` remain. They are
+    not specific to macros: the C9 row of the rule matrix reaches the impls of a
+    changed trait item, not the callers of the methods they provide.
+  - **A removed procedural macro function.** Removing the function makes the
+    `macrokit-derive` crate unbuildable, so every use of the items its derives
+    had produced reports its own error at a real call site: `E0599` for the
+    method a derive wrote, `E0432` for the `use` of the macro, plus `E0277`.
+    A person fixes the macro crate, which is the changed definition and is
+    excused. Measured on `macrokit`: 5 misses in case `003` (removing
+    `derive_describe`); the case's error list is a cascade, not five independent
+    edits, so it is not measurable by this check.

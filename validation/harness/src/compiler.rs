@@ -13,7 +13,7 @@
 //! not built because a dependency failed, when the run timed out, or when Blastr
 //! itself failed, the case is excluded and counted under its reason.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use blastr_core::{FileEdit, build_id};
@@ -225,8 +225,17 @@ fn run_case(
     let mut expected: BTreeSet<String> = BTreeSet::new();
     let mut outside = 0_u32;
     let mut unmapped = 0_u32;
+    let mut generated: BTreeMap<String, u32> = BTreeMap::new();
     let mut relevant_roots: BTreeSet<RelPath> = BTreeSet::new();
     for error in &check.errors {
+        // An error in a procedural macro's output is written at the attribute
+        // that asked for the macro, in code the macro computed. It names no
+        // item with text of its own, so no list of editable items can contain
+        // it; it is counted as unconfirmed instead of as a miss.
+        if let Some(name) = &error.generated {
+            *generated.entry(name.clone()).or_insert(0) += 1;
+            continue;
+        }
         match place(&span_index, project.copy(), error) {
             Placement::Symbol(path) => {
                 expected.insert(path.path.clone());
@@ -364,6 +373,20 @@ fn run_case(
     }
     result.blastr_items = variant.analysis.items.len() as u32;
     result.reachable = reachable(project.graph(), &variant.head, case);
+
+    let generated_errors: u32 = generated.values().copied().sum();
+    if generated_errors > 0 {
+        result.unconfirmed = result.unconfirmed.saturating_add(generated_errors);
+        let detail: Vec<String> = generated
+            .iter()
+            .map(|(name, count)| format!("{name} x{count}"))
+            .collect();
+        result.notes.push(format!(
+            "{generated_errors} error(s) in the output of a procedural macro ({}): \
+             code that has no text of its own, counted as unconfirmed",
+            detail.join(", ")
+        ));
+    }
 
     if outside > 0 {
         result
@@ -657,6 +680,7 @@ mod tests {
                 end: 0,
                 line: 1,
                 root_file: Some(root.join("tinycore/src/lib.rs")),
+                generated: None,
             }],
             ..CheckOutput::default()
         };
@@ -687,6 +711,7 @@ mod tests {
             end: 0,
             line: 1,
             root_file: Some(root.join(file)),
+            generated: None,
         };
         let check = CheckOutput {
             errors: vec![
