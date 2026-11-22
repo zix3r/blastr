@@ -1,0 +1,8 @@
+[package]
+name = "i39-shorter-weaker-path"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "i39_shorter_weaker_path"
+path = "src/lib.rs"

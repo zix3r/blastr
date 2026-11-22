@@ -3,9 +3,15 @@
 //! limits left out.
 //!
 //! The search is best first on the score of a path, so every item is reached
-//! first by its strongest evidence. An item is expanded once, when the first
-//! path that carries behaviour reaches it; later paths to it are recorded but
-//! not followed. The result never depends on hash order.
+//! first by its strongest evidence. Score and distance are two things to keep,
+//! not one: a weaker path that is also shorter reaches callers the strongest
+//! path cannot reach within the depth limit, so an item is expanded again
+//! whenever a path shorter than every path it was already expanded with arrives,
+//! as long as that path still scores above the floor. Each item therefore keeps
+//! a set of (score, distance) labels — the best-scoring one is what is reported,
+//! the shortest one is what reaches farthest — and the labels of one item are at
+//! most `depth` long, because every re-expansion is strictly shorter than the
+//! last. The result never depends on hash order.
 
 use std::{
     cmp::Ordering,
@@ -91,8 +97,10 @@ struct Node {
     kept: Vec<EvidencePath>,
     /// How many paths reached the item.
     path_count: u32,
-    /// Whether the item's own incoming references were followed.
-    expanded: bool,
+    /// The fewest steps of any path the item was expanded with: the shortest
+    /// label of the item that was followed, and hence the farthest its callers
+    /// were looked for. `None` when it has not been expanded yet.
+    shortest: Option<u32>,
 }
 
 impl Node {
@@ -103,8 +111,24 @@ impl Node {
             best: [None, None],
             kept: Vec::new(),
             path_count: 0,
-            expanded: false,
+            shortest: None,
         }
+    }
+
+    /// Whether a path of `steps` steps says something new about the item's
+    /// reach: it is shorter than every path the item was expanded with, so its
+    /// own callers sit closer to the change than the ones already followed.
+    ///
+    /// Paths arrive from the queue best score first, so a label that is not
+    /// shorter is dominated by an expanded one that scores at least as much and
+    /// reaches at least as far.
+    fn wants_expansion(&self, steps: u32) -> bool {
+        self.shortest.is_none_or(|shortest| steps < shortest)
+    }
+
+    /// Notes that the item was expanded with a path of `steps` steps.
+    fn expanded_with(&mut self, steps: u32) {
+        self.shortest = Some(self.shortest.map_or(steps, |old| old.min(steps)));
     }
 
     /// Records one more path to the item.
@@ -273,8 +297,8 @@ impl<'a> Search<'a> {
         while let Some(entry) = self.heap.pop() {
             cancel.check()?;
             let expanded = match self.nodes.get_mut(entry.item.0 as usize) {
-                Some(Some(node)) if !node.expanded => {
-                    node.expanded = true;
+                Some(Some(node)) if node.wants_expansion(entry.steps) => {
+                    node.expanded_with(entry.steps);
                     true
                 }
                 _ => false,
@@ -328,7 +352,7 @@ impl<'a> Search<'a> {
     }
 
     /// Records a path to `item` and queues it when the limits keep it and the
-    /// item has not been expanded yet.
+    /// path could reach farther than the paths already followed.
     fn add(&mut self, item: SymbolId, path: Growing) {
         let Some(symbol) = self.input.head.symbols.get(item.0 as usize) else {
             return;
@@ -357,7 +381,7 @@ impl<'a> Search<'a> {
         let Some(node) = slot.as_mut() else {
             return;
         };
-        let queue = !node.expanded;
+        let queue = node.wants_expansion(steps);
         node.record(evidence);
         if queue {
             self.heap.push(QueueEntry {
@@ -1024,6 +1048,105 @@ mod tests {
         assert_eq!(middle.paths.len(), 3);
         assert_eq!(middle.distance, 1);
         assert!((middle.score - 0.8).abs() < 1e-5);
+    }
+
+    #[test]
+    fn a_shorter_weaker_path_reaches_the_callers_the_strongest_path_cannot() {
+        // `hub` is reached by a long resolved chain of eight steps, which scores
+        // best, and by a shorter chain of five steps whose last step is a
+        // candidate. The test calls `hub`, so it sits at distance six through the
+        // short chain and at nine through the long one: the depth limit of eight
+        // cuts the long one and keeps the short one.
+        let mut builder = GraphBuilder::new();
+        let module = builder.add("krate", SymbolKind::Module);
+        let callee = builder.child(module, "krate::f", SymbolKind::Function);
+        let long: Vec<SymbolId> = (1..=7)
+            .map(|step| builder.child(module, &format!("krate::long{step}"), SymbolKind::Function))
+            .collect();
+        builder.edge(long[0], callee, EdgeKind::Calls, EdgeDetail::None);
+        for pair in long.windows(2) {
+            builder.edge(pair[1], pair[0], EdgeKind::Calls, EdgeDetail::None);
+        }
+        let short: Vec<SymbolId> = (1..=4)
+            .map(|step| builder.child(module, &format!("krate::short{step}"), SymbolKind::Function))
+            .collect();
+        builder.edge(short[0], callee, EdgeKind::Calls, EdgeDetail::None);
+        for pair in short.windows(2) {
+            builder.edge(pair[1], pair[0], EdgeKind::Calls, EdgeDetail::None);
+        }
+        let hub = builder.child(module, "krate::hub", SymbolKind::Function);
+        builder.edge(hub, long[6], EdgeKind::Calls, EdgeDetail::None);
+        builder.candidate(hub, short[3], EdgeKind::TakesAsValue, EdgeDetail::None);
+        let test = builder.child(module, "krate::test", SymbolKind::Function);
+        builder.symbol(test).flags.is_test = true;
+        builder.edge(test, hub, EdgeKind::Calls, EdgeDetail::None);
+        let head = builder.finish();
+        let changes = vec![change(ChangeKind::Body, "krate::f", SymbolKind::Function)];
+        // The validation parameters: depth 8, decay 0.8, candidate weight 0.4.
+        let params = AnalysisParams {
+            depth: 8,
+            ranking: RankingParams {
+                decay: 0.8,
+                candidate_weight: 0.4,
+                ..RankingParams::default()
+            },
+            ..AnalysisParams::default()
+        };
+
+        let result = run(&nothing(), &head, &changes, &params, &IgnoreSet::empty());
+
+        // The item keeps reporting its best path: eight steps, all resolved.
+        let hub_item = result
+            .items
+            .iter()
+            .find(|item| item.symbol.path == "krate::hub")
+            .expect("the hub is reached");
+        assert_eq!(hub_item.distance, 8);
+        assert!((hub_item.score - 0.8 * 0.8_f32.powi(7)).abs() < 1e-5);
+        assert_eq!(hub_item.confidence, Confidence::Likely);
+        // The test is beyond the depth limit through that best path and inside it
+        // through the shorter, weaker one, so only the shorter one reaches it.
+        let test_item = result
+            .items
+            .iter()
+            .find(|item| item.symbol.path == "krate::test")
+            .expect("the test is reached through the shorter path");
+        assert_eq!(test_item.distance, 6);
+        assert!((test_item.score - 0.8 * 0.4 * 0.8_f32.powi(5)).abs() < 1e-5);
+        assert_eq!(test_item.confidence, Confidence::Possible);
+        assert_eq!(result.limits.beyond_depth, 0);
+        assert_eq!(result.limits.below_floor, 0);
+        assert_eq!(result.limits.candidate_steps, 1);
+    }
+
+    #[test]
+    fn an_item_reached_only_by_a_short_path_is_expanded_once() {
+        // The same shape without the long chain: the hub is only reached by the
+        // short candidate path, so the test is reached at distance six.
+        let mut builder = GraphBuilder::new();
+        let module = builder.add("krate", SymbolKind::Module);
+        let callee = builder.child(module, "krate::f", SymbolKind::Function);
+        let first = builder.child(module, "krate::g", SymbolKind::Function);
+        let second = builder.child(module, "krate::h", SymbolKind::Function);
+        let hub = builder.child(module, "krate::hub", SymbolKind::Function);
+        builder.edge(first, callee, EdgeKind::Calls, EdgeDetail::None);
+        builder.edge(second, first, EdgeKind::Calls, EdgeDetail::None);
+        builder.candidate(hub, second, EdgeKind::TakesAsValue, EdgeDetail::None);
+        let head = builder.finish();
+        let changes = vec![change(ChangeKind::Body, "krate::f", SymbolKind::Function)];
+
+        let result = analyse(&nothing(), &head, &changes);
+
+        let paths: Vec<(&str, u32)> = result
+            .items
+            .iter()
+            .map(|item| (item.symbol.path.as_str(), item.distance))
+            .collect();
+        assert_eq!(
+            paths,
+            vec![("krate::g", 1), ("krate::h", 2), ("krate::hub", 3)]
+        );
+        assert_eq!(result.items[2].path_count, 1);
     }
 
     #[test]

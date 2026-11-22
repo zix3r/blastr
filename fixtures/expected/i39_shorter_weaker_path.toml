@@ -1,0 +1,72 @@
+# Two changes reach the same hub by paths of different length and strength. The
+# strong path is the longer one: `hub` is two resolved calls from the `leaf`
+# change, so the hub reports that path, at distance 2. The weak path is the
+# shorter one: `hub` takes the changed `hook` as a value, one candidate step from
+# that change. Score and distance are two things to keep, not one, so the hub is
+# expanded with both: `caller` and the test are reached by the strong path either
+# way, and the short path adds the evidence that they also depend on `hook`.
+#
+# A longer strong path only wins against a shorter candidate one by a step or so
+# at this suite's default decay (0.6 against a candidate weight of 0.4), which is
+# why the two paths here are two and one steps long rather than nine and six: at
+# the default depth of 6 the callers of a path that is exactly at the limit score
+# at most 0.8 x 0.6^5 x 0.6 = 0.037, below the 0.05 floor, so the depth limit
+# alone cannot separate them. The case that separates them by depth is the unit
+# test in `crates/blastr-core/src/impact/propagate.rs`, which runs with the
+# validation parameters (depth 8, decay 0.8).
+crates = ["i39_shorter_weaker_path"]
+exact_changes = true
+exact_impact = true
+
+[[change]]
+kind = "body"
+symbol = "i39_shorter_weaker_path::leaf"
+
+[[change]]
+kind = "body"
+symbol = "i39_shorter_weaker_path::hook"
+
+[[impact]]
+symbol = "i39_shorter_weaker_path::step1"
+class = "behaviour"
+confidence = "likely"
+reason = "calls-changed"
+distance = 1
+
+# The hub reports its best-scoring path, the two-step one from `leaf`.
+[[impact]]
+symbol = "i39_shorter_weaker_path::hub"
+class = "behaviour"
+confidence = "likely"
+reason = "calls-changed"
+distance = 2
+
+# ... and it was expanded with the one-step candidate path as well.
+[[impact]]
+symbol = "i39_shorter_weaker_path::hub"
+reason = "takes-changed-as-value"
+
+# `caller` is the item the flaw cut: it was reached from the hub's best path, and
+# the hub's shorter path was not followed, so the `hook` evidence never arrived.
+[[impact]]
+symbol = "i39_shorter_weaker_path::caller"
+class = "behaviour"
+confidence = "likely"
+reason = "calls-changed"
+distance = 3
+
+[[impact]]
+symbol = "i39_shorter_weaker_path::caller"
+reason = "takes-changed-as-value"
+
+[[impact]]
+symbol = "i39_shorter_weaker_path::tests::the_caller_adds_both_routes"
+class = "behaviour"
+confidence = "likely"
+reason = "takes-changed-as-value"
+distance = 4
+tags = ["test"]
+
+[[selected_test]]
+symbol = "i39_shorter_weaker_path::tests::the_caller_adds_both_routes"
+reason = "reached"
