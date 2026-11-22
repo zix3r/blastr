@@ -1,0 +1,36 @@
+# A `for` loop and an adaptor call the iterator's own `next`, which neither
+# names. A slice has no iterator implementation of this workspace to reach.
+crates = ["i36_iterator_dispatch"]
+exact_changes = true
+exact_impact = true
+
+[[change]]
+kind = "body"
+symbol = "i36_iterator_dispatch::<impl Iterator for Countdown>::next"
+
+[[impact]]
+symbol = "i36_iterator_dispatch::sum_loop"
+class = "behaviour"
+confidence = "possible"
+reason = "dispatches-to-changed"
+distance = 1
+
+[[impact]]
+symbol = "i36_iterator_dispatch::sum_adaptor"
+class = "behaviour"
+confidence = "possible"
+reason = "dispatches-to-changed"
+distance = 1
+
+[[impact]]
+symbol = "i36_iterator_dispatch::count_adaptor"
+class = "behaviour"
+confidence = "possible"
+reason = "dispatches-to-changed"
+distance = 1
+
+[[no_impact]]
+symbol = "i36_iterator_dispatch::sum_list"
+
+[[no_impact]]
+symbol = "i36_iterator_dispatch::<impl Iterator for Countdown>::size_hint"

@@ -94,7 +94,8 @@ pub(crate) enum Kind {
     Parse,
     /// Adds the `Implements` edges of the impl blocks.
     Implements,
-    /// Adds the edges of a trait-method call to the workspace impls.
+    /// Finds the workspace impls a trait is dispatched to, and the edges of a
+    /// call or a formatting site to them.
     Dispatch,
     /// Finds the definition an identifier pattern names.
     ResolveBinding,

@@ -1,0 +1,34 @@
+# A `Display` implementation reached by a format string and by `to_string`,
+# and not by the sites that format a value of another type.
+crates = ["i34_format_dispatch"]
+exact_changes = true
+exact_impact = true
+
+[[change]]
+kind = "body"
+symbol = "i34_format_dispatch::<impl fmt::Display for Receipt>::fmt"
+
+[[impact]]
+symbol = "i34_format_dispatch::describe"
+class = "behaviour"
+confidence = "possible"
+reason = "dispatches-to-changed"
+distance = 1
+
+[[impact]]
+symbol = "i34_format_dispatch::short"
+class = "behaviour"
+confidence = "possible"
+reason = "dispatches-to-changed"
+distance = 1
+
+# A format string that prints another type cannot run this implementation.
+[[no_impact]]
+symbol = "i34_format_dispatch::title"
+
+# A number has no implementation in the workspace, so it reaches none.
+[[no_impact]]
+symbol = "i34_format_dispatch::count"
+
+[[no_impact]]
+symbol = "i34_format_dispatch::<impl fmt::Display for Label>::fmt"

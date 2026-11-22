@@ -1,0 +1,8 @@
+[package]
+name = "i34-format-dispatch"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "i34_format_dispatch"
+path = "src/lib.rs"

@@ -5,7 +5,7 @@
 //! repository root and 1-based line numbers.
 
 use std::collections::HashMap;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path, PathBuf, Prefix};
 use std::sync::{Arc, Mutex};
 
 use blastr_model::{Location, RelPath, Span};
@@ -199,8 +199,14 @@ fn relative_to(root: &Path, file: &Path) -> Option<RelPath> {
     Some(RelPath::new(text))
 }
 
-/// Removes `.`, applies `..` and drops a trailing separator, without touching
-/// the filesystem.
+/// Removes `.`, applies `..`, drops a trailing separator and drops the
+/// Windows verbatim prefix, without touching the filesystem.
+///
+/// `\\?\C:\dir` and `C:\dir` name the same directory, and a load hands out
+/// both spellings: [`Locator::new`] is given a canonical root, which has the
+/// prefix, while rust-analyzer adds some of the files below it without one.
+/// Comparing the two as text would put those files outside the root, so the
+/// prefix is removed from both sides and they compare equal.
 fn normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {
@@ -209,6 +215,18 @@ fn normalize(path: &Path) -> PathBuf {
             Component::ParentDir => {
                 out.pop();
             }
+            Component::Prefix(prefix) => match prefix.kind() {
+                // `\\?\C:\dir` is `C:\dir`; the drive letter replaces the
+                // prefix, so the rest of the path still appends below it.
+                Prefix::VerbatimDisk(letter) => out.push(format!("{}:\\", letter as char)),
+                // `\\?\UNC\server\share` is `\\server\share`.
+                Prefix::VerbatimUNC(server, share) => out.push(format!(
+                    "\\\\{}\\{}",
+                    server.to_string_lossy(),
+                    share.to_string_lossy()
+                )),
+                _ => out.push(component.as_os_str()),
+            },
             other => out.push(other.as_os_str()),
         }
     }
@@ -220,7 +238,7 @@ fn normalize(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{LineMap, rel_path};
+    use super::{LineMap, lexical_rel_path, rel_path};
     use std::path::{Path, PathBuf};
 
     fn joined(parts: &[&str]) -> PathBuf {
@@ -302,6 +320,26 @@ mod tests {
         assert_eq!(
             rel_path(root, file).map(|it| it.as_str().to_owned()),
             Some("c.rs".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_verbatim_root_and_a_plain_file_are_the_same_directory() {
+        // Windows canonical paths carry a `\\?\` prefix that the paths Cargo
+        // reports for the files below them do not. A load hands out both
+        // spellings, and a file of a crate has to be found below the root
+        // either way.
+        let root = Path::new(r"\\?\C:\work\project");
+        let file = Path::new(r"C:\work\project\crate\src\lib.rs");
+        assert_eq!(
+            lexical_rel_path(root, file).map(|it| it.as_str().to_owned()),
+            Some("crate/src/lib.rs".to_owned())
+        );
+        let plain_root = Path::new(r"C:\work\project");
+        let verbatim_file = Path::new(r"\\?\C:\work\project\crate\src\lib.rs");
+        assert_eq!(
+            lexical_rel_path(plain_root, verbatim_file).map(|it| it.as_str().to_owned()),
+            Some("crate/src/lib.rs".to_owned())
         );
     }
 }

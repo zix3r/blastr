@@ -1,0 +1,8 @@
+[package]
+name = "i36-iterator-dispatch"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "i36_iterator_dispatch"
+path = "src/lib.rs"

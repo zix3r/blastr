@@ -1,0 +1,30 @@
+# A `?` that converts through `From::from`, written without naming it.
+#
+# The change is the display of the low-level failure. The conversion prints it
+# through `to_string`, so the impl is one dispatch away, and the function that
+# converts with `?` is one dispatch away from the impl.
+crates = ["i35_try_conversion"]
+exact_changes = true
+exact_impact = true
+
+[[change]]
+kind = "body"
+symbol = "i35_try_conversion::<impl fmt::Display for BadInput>::fmt"
+
+[[impact]]
+symbol = "i35_try_conversion::<impl From<BadInput> for Failure>::from"
+class = "behaviour"
+confidence = "possible"
+reason = "dispatches-to-changed"
+distance = 1
+
+[[impact]]
+symbol = "i35_try_conversion::attempt"
+class = "behaviour"
+confidence = "possible"
+reason = "dispatches-to-changed"
+distance = 2
+
+# `checked` converts nothing: its `?` already fails with `Failure`.
+[[no_impact]]
+symbol = "i35_try_conversion::checked"

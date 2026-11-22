@@ -41,8 +41,8 @@ use ra_ap_hir::{
     Adt, AsAssocItem, AssocItem, AssocItemContainer, Crate, Field, Function, HirFileId, Impl,
     InFile, Macro, ModuleDef, PathResolution, Semantics, Trait, Variant, db::HirDatabase,
 };
-use ra_ap_ide_db::base_db::Crate as BaseCrate;
-use ra_ap_syntax::ast::{HasArgList, HasAttrs};
+use ra_ap_ide_db::base_db::{Crate as BaseCrate, CrateOrigin};
+use ra_ap_syntax::ast::{HasArgList, HasAttrs, HasLoopBody};
 use ra_ap_syntax::{AstNode, AstToken, SyntaxNode, ast};
 
 use crate::hashing;
@@ -126,6 +126,9 @@ pub(crate) fn collect(input: Input<'_, '_>, measure: bool) -> (Output, Collector
             .map(|container| container.node.clone())
             .collect(),
         impls: Vec::new(),
+        formatting: Vec::new(),
+        conversions: Vec::new(),
+        iterators: Vec::new(),
         invocations: HashMap::new(),
         quiet: false,
         expansion_site: None,
@@ -189,6 +192,64 @@ enum MethodTarget {
     Field(Field),
 }
 
+/// Which impls the value of one expression can reach.
+#[derive(Debug, Clone, Copy)]
+enum ValueType {
+    /// The value is of a data type of the workspace.
+    Data(Adt),
+    /// The type is known and is not a data type: a number, a string slice, a
+    /// tuple. No impl in the workspace can apply to it.
+    Other,
+    /// The type could not be derived, or it is a type parameter or a trait
+    /// object that any impl may apply to.
+    Unknown,
+}
+
+/// One workspace implementation of a formatting trait.
+#[derive(Debug, Clone, Copy)]
+struct FormattingImpl {
+    /// Which trait the impl provides.
+    trait_: FormattingTrait,
+    /// The data type it is implemented for, when the impl names one.
+    ///
+    /// `None` for a self type this pass cannot name, such as a reference or a
+    /// type parameter: any formatted value may reach it.
+    self_ty: Option<Adt>,
+    /// The symbol of the impl's `fmt`.
+    symbol: SymbolId,
+}
+
+/// The standard formatting traits whose methods are invoked implicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FormattingTrait {
+    /// `Display`, which `{}` and `to_string` invoke.
+    Display,
+    /// `Debug`, which `{:?}` invokes.
+    Debug,
+}
+
+/// One workspace implementation of the standard `From`, which `?` invokes.
+#[derive(Debug, Clone, Copy)]
+struct ConversionImpl {
+    /// The error type it converts from, when that type is a data type.
+    ///
+    /// `None` for a source type this pass cannot name, such as a string or an
+    /// error of the standard library: any `?` may reach it.
+    source: Option<Adt>,
+    /// The symbol of the impl's `from`.
+    symbol: SymbolId,
+}
+
+/// One workspace implementation of the standard `Iterator`.
+#[derive(Debug, Clone)]
+struct IteratorImpl {
+    /// The iterator type, when the impl names one.
+    self_ty: Option<Adt>,
+    /// The impl's `next`, and its `size_hint` when it provides one: a `for`
+    /// loop and an adaptor both call them without naming the impl.
+    symbols: Vec<SymbolId>,
+}
+
 /// The state of one dependency pass.
 struct Collector<'a, 'db> {
     /// Everything the pass may read.
@@ -201,6 +262,15 @@ struct Collector<'a, 'db> {
     regions: HashSet<SyntaxNode>,
     /// The impl blocks of the workspace, for trait dispatch and `Implements`.
     impls: Vec<(SymbolId, Impl)>,
+    /// The `fmt` methods of the workspace's `Display` and `Debug` impls, which
+    /// a format string invokes without naming them.
+    formatting: Vec<FormattingImpl>,
+    /// The `from` methods of the workspace's `From` impls, which a `?` invokes
+    /// without naming one.
+    conversions: Vec<ConversionImpl>,
+    /// The workspace's `Iterator` impls, which a `for` loop and an adaptor call
+    /// through the trait.
+    iterators: Vec<IteratorImpl>,
     /// Where a derive or an attribute macro was invoked, and the macro it
     /// resolved to.
     ///
@@ -240,6 +310,18 @@ impl Collector<'_, '_> {
         for index in 0..self.impls.len() {
             let (id, block) = self.impls[index];
             self.implements(id, block);
+        }
+        for index in 0..self.impls.len() {
+            let (_, block) = self.impls[index];
+            if let Some(found) = self.formatting_impl(block) {
+                self.formatting.push(found);
+            }
+            if let Some(found) = self.conversion_impl(block) {
+                self.conversions.push(found);
+            }
+            if let Some(found) = self.iterator_impl(block) {
+                self.iterators.push(found);
+            }
         }
         for container in self.input.containers {
             let edges_before = self.edges.len();
@@ -320,6 +402,361 @@ impl Collector<'_, '_> {
         }
     }
 
+    /// The formatting impl a block provides, if it is one of the standard
+    /// traits.
+    ///
+    /// A `Display` the project defines itself is a trait like any other: its
+    /// methods are called by name, so only the standard library's traits are
+    /// recorded, and only their `fmt` is invoked implicitly.
+    fn formatting_impl(&mut self, block: Impl) -> Option<FormattingImpl> {
+        let db = self.input.db;
+        let trait_ = self.timed(Kind::Dispatch, || block.trait_(db))?;
+        let standard = self.timed(Kind::Dispatch, || {
+            Some(matches!(
+                trait_.module(db).krate(db).origin(db),
+                CrateOrigin::Lang(_)
+            ))
+        })?;
+        if !standard {
+            return None;
+        }
+        let trait_ = self.timed(Kind::Dispatch, || Some(trait_.name(db)))?;
+        let trait_ = match trait_.as_str() {
+            "Display" => FormattingTrait::Display,
+            "Debug" => FormattingTrait::Debug,
+            _ => return None,
+        };
+        let fmt = self.timed(Kind::Dispatch, || {
+            block.items(db).into_iter().find_map(|item| match item {
+                AssocItem::Function(function) if function.name(db).as_str() == "fmt" => {
+                    Some(function)
+                }
+                _ => None,
+            })
+        })?;
+        let symbol = self.input.symbols.assoc_item(AssocItem::Function(fmt))?;
+        let self_ty = self.timed(Kind::InferType, || {
+            block.self_ty(db).strip_references().as_adt()
+        });
+        Some(FormattingImpl {
+            trait_,
+            self_ty,
+            symbol,
+        })
+    }
+
+    /// The conversion impl a block provides, if it implements the standard
+    /// `From`.
+    ///
+    /// A `From` the project defines itself is a trait like any other: its
+    /// methods are called by name, so only the standard library's is invoked by
+    /// `?` without one.
+    fn conversion_impl(&mut self, block: Impl) -> Option<ConversionImpl> {
+        let db = self.input.db;
+        let reference = self.timed(Kind::Dispatch, || block.trait_ref(db))?;
+        let trait_ = self.timed(Kind::Dispatch, || Some(reference.trait_()))?;
+        let standard = self.timed(Kind::Dispatch, || {
+            Some(matches!(
+                trait_.module(db).krate(db).origin(db),
+                CrateOrigin::Lang(_)
+            ))
+        })?;
+        if !standard
+            || self
+                .timed(Kind::Dispatch, || Some(trait_.name(db)))?
+                .as_str()
+                != "From"
+        {
+            return None;
+        }
+        let from = self.timed(Kind::Dispatch, || {
+            block.items(db).into_iter().find_map(|item| match item {
+                AssocItem::Function(function) if function.name(db).as_str() == "from" => {
+                    Some(function)
+                }
+                _ => None,
+            })
+        })?;
+        let symbol = self.input.symbols.assoc_item(AssocItem::Function(from))?;
+        // The first argument of `From<T>` is the `Self` type, so the second is
+        // the error type the conversion takes.
+        let source = self.timed(Kind::InferType, || {
+            reference.get_type_argument(1)?.strip_references().as_adt()
+        });
+        Some(ConversionImpl { source, symbol })
+    }
+
+    /// Adds the dispatch edges of one `?`, which converts its operand's error
+    /// through `From`.
+    ///
+    /// Which impl runs is decided by that error type, which is the second
+    /// argument of the operand's `Result`; a `?` whose type this pass cannot
+    /// read reaches every impl, as a coarse candidate.
+    fn conversion_use(&mut self, from: SymbolId, node: &SyntaxNode, error: ValueType) {
+        let Some(site) = self.site(node) else {
+            return;
+        };
+        let targets: Vec<SymbolId> = self
+            .conversions
+            .iter()
+            .filter(|impl_| match (error, impl_.source) {
+                (ValueType::Data(ty), Some(other)) => ty == other,
+                (ValueType::Data(_) | ValueType::Other, None) => true,
+                (ValueType::Other, Some(_)) => false,
+                (ValueType::Unknown, _) => true,
+            })
+            .map(|impl_| impl_.symbol)
+            .collect();
+        for target in targets {
+            self.push(
+                from,
+                target,
+                EdgeKind::MayDispatchTo,
+                Certainty::Candidate,
+                site.clone(),
+                EdgeDetail::None,
+            );
+        }
+    }
+
+    /// The iterator impl a block provides, if it implements the standard
+    /// `Iterator`.
+    fn iterator_impl(&mut self, block: Impl) -> Option<IteratorImpl> {
+        let db = self.input.db;
+        let reference = self.timed(Kind::Dispatch, || block.trait_ref(db))?;
+        let trait_ = self.timed(Kind::Dispatch, || Some(reference.trait_()))?;
+        let standard = self.timed(Kind::Dispatch, || {
+            Some(matches!(
+                trait_.module(db).krate(db).origin(db),
+                CrateOrigin::Lang(_)
+            ))
+        })?;
+        if !standard
+            || self
+                .timed(Kind::Dispatch, || Some(trait_.name(db)))?
+                .as_str()
+                != "Iterator"
+        {
+            return None;
+        }
+        let mut symbols = Vec::new();
+        for item in self.timed(Kind::Dispatch, || Some(block.items(db)))? {
+            let AssocItem::Function(function) = item else {
+                continue;
+            };
+            let name = self.timed(Kind::Dispatch, || Some(function.name(db)))?;
+            if name.as_str() != "next" && name.as_str() != "size_hint" {
+                continue;
+            }
+            if let Some(id) = self.input.symbols.assoc_item(item) {
+                symbols.push(id);
+            }
+        }
+        if symbols.is_empty() {
+            return None;
+        }
+        let self_ty = self.timed(Kind::InferType, || {
+            block.self_ty(db).strip_references().as_adt()
+        });
+        Some(IteratorImpl { self_ty, symbols })
+    }
+
+    /// Adds the dispatch edges of one use of the iterator protocol.
+    ///
+    /// A `for` loop and every adaptor call `next` (and `size_hint`) through the
+    /// trait, so no reference in the syntax names the impl of the iterator the
+    /// loop was given. The iterator's type decides which impl can run; one this
+    /// pass cannot name reaches every impl, as a coarse candidate.
+    fn iterator_use(&mut self, from: SymbolId, node: &SyntaxNode, iterator: ValueType) {
+        let Some(site) = self.site(node) else {
+            return;
+        };
+        let targets: Vec<SymbolId> = self
+            .iterators
+            .iter()
+            .filter(|impl_| match (iterator, impl_.self_ty) {
+                (ValueType::Data(ty), Some(other)) => ty == other,
+                (ValueType::Data(_) | ValueType::Other, None) => true,
+                (ValueType::Other, Some(_)) => false,
+                (ValueType::Unknown, _) => true,
+            })
+            .flat_map(|impl_| impl_.symbols.iter().copied())
+            .collect();
+        for target in targets {
+            self.push(
+                from,
+                target,
+                EdgeKind::MayDispatchTo,
+                Certainty::Candidate,
+                site.clone(),
+                EdgeDetail::None,
+            );
+        }
+    }
+
+    /// Whether a function is one of the iterator protocol's methods.
+    fn is_iterator_method(&mut self, function: Function) -> bool {
+        let db = self.input.db;
+        self.timed(Kind::Dispatch, || {
+            let container = function.as_assoc_item(db)?.container(db);
+            let trait_ = match container {
+                AssocItemContainer::Trait(trait_) => trait_,
+                AssocItemContainer::Impl(block) => block.trait_(db)?,
+            };
+            Some(
+                trait_.name(db).as_str() == "Iterator"
+                    && matches!(trait_.module(db).krate(db).origin(db), CrateOrigin::Lang(_)),
+            )
+        }) == Some(true)
+    }
+
+    /// Visits a `for` loop, whose iteration calls the iterator's own `next`.
+    fn for_expr(&mut self, expr: &ast::ForExpr, from: SymbolId, depth: u32) {
+        if let Some(iterable) = expr.iterable() {
+            let iterator = self.typed_value(&iterable);
+            self.iterator_use(from, iterable.syntax(), iterator);
+            self.visit(iterable.syntax(), from, depth, false);
+        }
+        if let Some(body) = expr.loop_body() {
+            self.visit(body.syntax(), from, depth, false);
+        }
+    }
+
+    /// The error type of the operand of a `?`.
+    fn error_type(&mut self, expr: &ast::Expr) -> ValueType {
+        let Some(info) = self.timed(Kind::InferType, || self.input.sema.type_of_expr(expr)) else {
+            return ValueType::Unknown;
+        };
+        let ty = info.original.strip_references();
+        let Some((adt, arguments)) = ty.as_adt_with_args() else {
+            return self.value_of_type(ty);
+        };
+        let name = match adt {
+            Adt::Struct(it) => it.name(self.input.db),
+            Adt::Enum(it) => it.name(self.input.db),
+            Adt::Union(it) => it.name(self.input.db),
+        };
+        if name.as_str() != "Result" {
+            return ValueType::Unknown;
+        }
+        match arguments.get(1).cloned().flatten() {
+            Some(error) => self.value_of_type(error),
+            None => ValueType::Unknown,
+        }
+    }
+
+    /// Adds the dispatch edges of one formatting invocation.
+    ///
+    /// A format string calls the `fmt` of the value it prints without naming
+    /// it, so no reference in the syntax resolves to the implementation. The
+    /// value's type decides which impl can run; a value whose type this pass
+    /// cannot name reaches every impl of the trait, as a coarse candidate.
+    fn formatting_use(
+        &mut self,
+        from: SymbolId,
+        site: Location,
+        traits: &[FormattingTrait],
+        value: ValueType,
+    ) {
+        let targets: Vec<SymbolId> = self
+            .formatting
+            .iter()
+            .filter(|impl_| {
+                traits.contains(&impl_.trait_)
+                    && match (value, impl_.self_ty) {
+                        (ValueType::Data(ty), Some(other)) => ty == other,
+                        (ValueType::Data(_) | ValueType::Other, None) => true,
+                        (ValueType::Other, Some(_)) => false,
+                        (ValueType::Unknown, _) => true,
+                    }
+            })
+            .map(|impl_| impl_.symbol)
+            .collect();
+        for target in targets {
+            self.push(
+                from,
+                target,
+                EdgeKind::MayDispatchTo,
+                Certainty::Candidate,
+                site.clone(),
+                EdgeDetail::None,
+            );
+        }
+    }
+
+    /// The same, for a formatting use written at a node.
+    fn formatting_site(
+        &mut self,
+        from: SymbolId,
+        node: &SyntaxNode,
+        traits: &[FormattingTrait],
+        value: ValueType,
+    ) {
+        let Some(site) = self.site(node) else {
+            return;
+        };
+        self.formatting_use(from, site, traits, value);
+    }
+
+    /// Which formatting impls one name of a format string can reach.
+    ///
+    /// A name in a template is not an expression, so it has no syntax node to
+    /// infer: a local's type is read from its binding, a constant's from its
+    /// declaration, and a unit struct or variant is its own type.
+    fn typed_resolution(&mut self, resolution: PathResolution<'_>) -> Option<ValueType> {
+        let db = self.input.db;
+        let ty = match resolution {
+            PathResolution::Local(local) => {
+                Some(self.timed(Kind::InferType, || Some(local.ty(db)))?)
+            }
+            PathResolution::Def(ModuleDef::Const(item)) => {
+                Some(self.timed(Kind::InferType, || Some(item.ty(db)))?)
+            }
+            PathResolution::Def(ModuleDef::Static(item)) => {
+                Some(self.timed(Kind::InferType, || Some(item.ty(db)))?)
+            }
+            PathResolution::Def(ModuleDef::Adt(adt)) => return Some(ValueType::Data(adt)),
+            PathResolution::Def(ModuleDef::EnumVariant(variant)) => {
+                return Some(ValueType::Data(Adt::Enum(
+                    self.timed(Kind::ResolveDef, || Some(variant.parent_enum(db)))?,
+                )));
+            }
+            _ => None,
+        };
+        ty.map(|ty| self.value_of_type(ty))
+    }
+
+    /// Which formatting impls the value of one expression can reach.
+    fn typed_value(&mut self, expr: &ast::Expr) -> ValueType {
+        let Some(info) = self.timed(Kind::InferType, || self.input.sema.type_of_expr(expr)) else {
+            return ValueType::Unknown;
+        };
+        self.value_of_type(info.original)
+    }
+
+    /// Which formatting impls a value of this type can reach.
+    fn value_of_type(&mut self, ty: ra_ap_hir::Type<'_>) -> ValueType {
+        let ty = ty.strip_references();
+        if let Some(adt) = ty.as_adt() {
+            return ValueType::Data(adt);
+        }
+        // An unknown type and a trait object are formatted by an impl this
+        // pass cannot pick; a type parameter is too.
+        if ty.is_unknown() || ty.as_dyn_trait().is_some() {
+            return ValueType::Unknown;
+        }
+        let db = self.input.db;
+        if self
+            .timed(Kind::InferType, || Some(ty.as_type_param(db).is_some()))
+            .unwrap_or(false)
+        {
+            return ValueType::Unknown;
+        }
+        // A type that is known and is not a data type — a number, a string
+        // slice, a tuple — has no impl in the workspace to dispatch to.
+        ValueType::Other
+    }
+
     /// The item of `trait_` that `item` of an impl block implements.
     fn trait_item(&self, trait_: Trait, item: AssocItem) -> Option<AssocItem> {
         let db = self.input.db;
@@ -387,6 +824,14 @@ impl Collector<'_, '_> {
         }
         if let Some(expr) = ast::FormatArgsExpr::cast(node.clone()) {
             self.format_args(&expr, from, depth);
+            return;
+        }
+        if let Some(expr) = ast::TryExpr::cast(node.clone()) {
+            self.try_expr(&expr, from, depth);
+            return;
+        }
+        if let Some(expr) = ast::ForExpr::cast(node.clone()) {
+            self.for_expr(&expr, from, depth);
             return;
         }
         if let Some(expr) = ast::PathExpr::cast(node.clone()) {
@@ -708,6 +1153,15 @@ impl Collector<'_, '_> {
                     match target {
                         MethodTarget::Function(function) => {
                             self.call_to(function, from, name_ref.syntax());
+                            self.dispatch_to_display(function, from, call);
+                            // An adaptor call on an iterator runs the iterator's
+                            // own `next` from inside the standard library.
+                            if self.is_iterator_method(function)
+                                && let Some(receiver) = call.receiver()
+                            {
+                                let iterator = self.typed_value(&receiver);
+                                self.iterator_use(from, name_ref.syntax(), iterator);
+                            }
                         }
                         MethodTarget::Field(field) => {
                             if let Some(id) = self.input.symbols.get(DefKey::Field(field)) {
@@ -738,6 +1192,47 @@ impl Collector<'_, '_> {
         {
             self.visit(list.syntax(), from, depth, false);
         }
+    }
+
+    /// Adds the dispatch edges of a `to_string` call.
+    ///
+    /// `ToString::to_string` is implemented in the standard library and calls
+    /// `Display::fmt` of the receiver, so the workspace impl that can run is
+    /// reached through the receiver's type and not through a reference.
+    fn dispatch_to_display(
+        &mut self,
+        function: Function,
+        from: SymbolId,
+        call: &ast::MethodCallExpr,
+    ) {
+        if !self.is_to_string(function) {
+            return;
+        }
+        let Some(receiver) = call.receiver() else {
+            return;
+        };
+        let value = self.typed_value(&receiver);
+        self.formatting_site(from, receiver.syntax(), &[FormattingTrait::Display], value);
+    }
+
+    /// Whether a function is `ToString::to_string`, which calls the `Display`
+    /// implementation of whatever it is given.
+    fn is_to_string(&mut self, function: Function) -> bool {
+        let db = self.input.db;
+        self.timed(Kind::Dispatch, || {
+            let container = function.as_assoc_item(db)?.container(db);
+            // `to_string` comes from the trait's declaration or from the
+            // blanket implementation the standard library provides for it.
+            let trait_ = match container {
+                AssocItemContainer::Trait(trait_) => trait_,
+                AssocItemContainer::Impl(block) => block.trait_(db)?,
+            };
+            Some(
+                function.name(db).as_str() == "to_string"
+                    && trait_.name(db).as_str() == "ToString"
+                    && matches!(trait_.module(db).krate(db).origin(db), CrateOrigin::Lang(_)),
+            )
+        }) == Some(true)
     }
 
     /// Adds the edge of a call to `function`.
@@ -1028,6 +1523,19 @@ impl Collector<'_, '_> {
                         EdgeDetail::None,
                     );
                 }
+                // `map(ToString::to_string)` hands the formatting trait to a
+                // caller instead of calling it, so the value it formats is not
+                // named where it is formatted.
+                if let ModuleDef::Function(function) = def
+                    && self.is_to_string(function)
+                {
+                    self.formatting_site(
+                        from,
+                        path.syntax(),
+                        &[FormattingTrait::Display],
+                        ValueType::Unknown,
+                    );
+                }
             }
             Some(_) => {}
             None => self.record_unresolved_path(&path),
@@ -1042,12 +1550,13 @@ impl Collector<'_, '_> {
     /// resolves the names of the literal, and each of them is a value reference
     /// like a path would be.
     fn format_args(&mut self, expr: &ast::FormatArgsExpr, from: SymbolId, depth: u32) {
-        if let Some(string) = expr
+        let template = expr
             .syntax()
             .descendants_with_tokens()
             .filter_map(|child| child.into_token())
-            .find_map(ast::String::cast)
-        {
+            .find_map(ast::String::cast);
+        let traits = format_traits(&template);
+        if let Some(string) = template.clone() {
             let file = string.syntax().parent().and_then(|node| {
                 self.timed(Kind::Site, || Some(self.input.sema.hir_file_for(&node)))
             });
@@ -1057,15 +1566,9 @@ impl Collector<'_, '_> {
                 })
             {
                 for (range, resolution) in parts {
-                    let Some(PathResolution::Def(def)) =
+                    let Some(resolution) =
                         resolution.and_then(|part| part.either(Some, |_asm_operand| None))
                     else {
-                        continue;
-                    };
-                    let Some((key, kind)) = value_target(def) else {
-                        continue;
-                    };
-                    let Some(id) = self.input.symbols.get(key) else {
                         continue;
                     };
                     let Some(site) =
@@ -1073,13 +1576,62 @@ impl Collector<'_, '_> {
                     else {
                         continue;
                     };
-                    self.push(from, id, kind, Certainty::Resolved, site, EdgeDetail::None);
+                    // A part that names an item is a value reference.
+                    if let PathResolution::Def(def) = resolution
+                        && let Some((key, kind)) = value_target(def)
+                        && let Some(id) = self.input.symbols.get(key)
+                    {
+                        self.push(
+                            from,
+                            id,
+                            kind,
+                            Certainty::Resolved,
+                            site.clone(),
+                            EdgeDetail::None,
+                        );
+                    }
+                    // The part may also print a value, which runs the `fmt` of
+                    // the value's formatting trait without naming it.
+                    if !traits.is_empty()
+                        && let Some(value) = self.typed_resolution(resolution)
+                    {
+                        self.formatting_use(from, site, &traits, value);
+                    }
                 }
+            }
+        }
+        // The values the template prints are handed to `fmt` of the formatting
+        // traits it names, which is a dispatch no reference in the syntax
+        // resolves.
+        if !traits.is_empty() {
+            for argument in expr
+                .syntax()
+                .children()
+                .filter_map(ast::FormatArgsArg::cast)
+            {
+                let Some(argument) = argument.expr() else {
+                    continue;
+                };
+                let value = self.typed_value(&argument);
+                self.formatting_site(from, argument.syntax(), &traits, value);
             }
         }
         // The explicit arguments are expressions of the expansion.
         for child in expr.syntax().children() {
             self.visit(&child, from, depth, false);
+        }
+    }
+
+    /// Visits a `?`, which converts its operand's error to the error of the
+    /// function it is written in.
+    fn try_expr(&mut self, expr: &ast::TryExpr, from: SymbolId, depth: u32) {
+        let operand = expr.expr();
+        if let Some(operand) = &operand {
+            // A `?` runs `From::from` on the error type of its operand: a
+            // conversion no reference in the syntax names.
+            let error = self.error_type(operand);
+            self.conversion_use(from, expr.syntax(), error);
+            self.visit(operand.syntax(), from, depth, false);
         }
     }
 
@@ -1534,6 +2086,52 @@ fn value_target(def: ModuleDef) -> Option<(DefKey, EdgeKind)> {
         ModuleDef::Adt(item) => (DefKey::Adt(item), EdgeKind::Constructs),
         _ => return None,
     })
+}
+
+/// Which formatting traits a format string invokes.
+///
+/// `{}` prints its value with `Display` and `{:?}` (and `{:#?}`) with `Debug`,
+/// so the placeholders of the template decide what a site may call. A template
+/// that prints both is reported as both; one without a placeholder prints
+/// nothing and reaches nothing.
+fn format_traits(template: &Option<ast::String>) -> Vec<FormattingTrait> {
+    let Some(string) = template else {
+        return Vec::new();
+    };
+    let text = string.syntax().text().to_string();
+    let mut traits: Vec<FormattingTrait> = Vec::new();
+    let mut placeholder = false;
+    let mut spec = false;
+    let mut debug = false;
+    let mut chars = text.chars().peekable();
+    while let Some(character) = chars.next() {
+        match character {
+            // `{{` and `}}` print a brace instead of starting a placeholder.
+            '{' if chars.peek() == Some(&'{') => {
+                chars.next();
+            }
+            '{' => {
+                placeholder = true;
+                spec = false;
+                debug = false;
+            }
+            ':' if placeholder => spec = true,
+            '?' if placeholder && spec => debug = true,
+            '}' if placeholder => {
+                placeholder = false;
+                let found = if debug {
+                    FormattingTrait::Debug
+                } else {
+                    FormattingTrait::Display
+                };
+                if !traits.contains(&found) {
+                    traits.push(found);
+                }
+            }
+            _ => {}
+        }
+    }
+    traits
 }
 
 /// Whether two items of a trait and of its implementation are of the same kind.

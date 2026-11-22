@@ -1,0 +1,8 @@
+[package]
+name = "i35-try-conversion"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "i35_try_conversion"
+path = "src/lib.rs"
