@@ -5,3 +5,4 @@
 /validation/harness/target
 /validation/harness/testdata/*/target
 /validation/harness/testdata/*/Cargo.lock
+/validation/results/*.json
