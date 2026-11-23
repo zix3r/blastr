@@ -120,9 +120,6 @@ pub(crate) enum DefKey {
     Macro(Macro),
 }
 
-/// Constructors for the dependency pass, which sees definitions as
-/// `ModuleDef`s and as `AssocItem`s rather than as concrete hir types.
-#[allow(dead_code)]
 impl DefKey {
     /// The key of a definition that can appear in a module's declarations.
     ///
@@ -141,81 +138,6 @@ impl DefKey {
             ModuleDef::BuiltinType(_) => return None,
         })
     }
-
-    /// The key of an item declared inside a trait or an impl block.
-    pub(crate) fn from_assoc_item(item: AssocItem) -> DefKey {
-        match item {
-            AssocItem::Function(it) => DefKey::Function(it),
-            AssocItem::Const(it) => DefKey::Const(it),
-            AssocItem::TypeAlias(it) => DefKey::TypeAlias(it),
-        }
-    }
-}
-
-impl From<Module> for DefKey {
-    fn from(it: Module) -> Self {
-        DefKey::Module(it)
-    }
-}
-
-impl From<Function> for DefKey {
-    fn from(it: Function) -> Self {
-        DefKey::Function(it)
-    }
-}
-
-impl From<Adt> for DefKey {
-    fn from(it: Adt) -> Self {
-        DefKey::Adt(it)
-    }
-}
-
-impl From<EnumVariant> for DefKey {
-    fn from(it: EnumVariant) -> Self {
-        DefKey::Variant(it)
-    }
-}
-
-impl From<Field> for DefKey {
-    fn from(it: Field) -> Self {
-        DefKey::Field(it)
-    }
-}
-
-impl From<Trait> for DefKey {
-    fn from(it: Trait) -> Self {
-        DefKey::Trait(it)
-    }
-}
-
-impl From<Impl> for DefKey {
-    fn from(it: Impl) -> Self {
-        DefKey::Impl(it)
-    }
-}
-
-impl From<Const> for DefKey {
-    fn from(it: Const) -> Self {
-        DefKey::Const(it)
-    }
-}
-
-impl From<Static> for DefKey {
-    fn from(it: Static) -> Self {
-        DefKey::Static(it)
-    }
-}
-
-impl From<TypeAlias> for DefKey {
-    fn from(it: TypeAlias) -> Self {
-        DefKey::TypeAlias(it)
-    }
-}
-
-impl From<Macro> for DefKey {
-    fn from(it: Macro) -> Self {
-        DefKey::Macro(it)
-    }
 }
 
 /// The id of every symbol of the graph, by definition.
@@ -228,26 +150,19 @@ pub(crate) struct SymbolTable {
     by_def: HashMap<DefKey, SymbolId>,
 }
 
-/// The lookup the dependency pass uses.
-///
-/// The dependency edges are part of the next stage, so some of this is not
-/// called yet; it is kept here because it is the only way to go from a
-/// definition back to the symbol the extraction assigned to it.
-#[allow(dead_code)]
 impl SymbolTable {
     /// The symbol of `key`, if that definition produced one.
     pub(crate) fn get(&self, key: DefKey) -> Option<SymbolId> {
         self.by_def.get(&key).copied()
     }
 
-    /// The symbol of a definition found in a module's declarations.
-    pub(crate) fn module_def(&self, def: ModuleDef) -> Option<SymbolId> {
-        DefKey::from_module_def(def).and_then(|key| self.get(key))
-    }
-
     /// The symbol of an item declared inside a trait or an impl block.
     pub(crate) fn assoc_item(&self, item: AssocItem) -> Option<SymbolId> {
-        self.get(DefKey::from_assoc_item(item))
+        self.get(match item {
+            AssocItem::Function(it) => DefKey::Function(it),
+            AssocItem::Const(it) => DefKey::Const(it),
+            AssocItem::TypeAlias(it) => DefKey::TypeAlias(it),
+        })
     }
 
     /// Records the symbol of `key`.
@@ -287,11 +202,6 @@ impl Hashes {
     }
 }
 
-/// The hashes of a module, which has none.
-pub(crate) fn module_hashes() -> Hashes {
-    Hashes::none()
-}
-
 /// The hashes of an impl block: the header, without the items it contains.
 ///
 /// `None` for an impl block that has no source of its own, which happens for
@@ -303,20 +213,13 @@ pub(crate) fn impl_hashes(item: &ast::Impl) -> Hashes {
 
 /// The hashes of a struct, enum or union: the header, without the fields, the
 /// variants or the items they contain.
-pub(crate) fn adt_hashes(kind: SymbolKind, node: &SyntaxNode) -> Hashes {
-    let list = match kind {
-        SymbolKind::Struct => ast::Struct::cast(node.clone())
-            .and_then(|it| it.field_list())
-            .map(|it| it.syntax().clone()),
-        SymbolKind::Union => ast::Union::cast(node.clone())
-            .and_then(|it| it.record_field_list())
-            .map(|it| it.syntax().clone()),
-        SymbolKind::Enum => ast::Enum::cast(node.clone())
-            .and_then(|it| it.variant_list())
-            .map(|it| it.syntax().clone()),
-        _ => None,
+pub(crate) fn adt_hashes(item: &ast::Adt) -> Hashes {
+    let list = match item {
+        ast::Adt::Struct(it) => it.field_list().map(|it| it.syntax().clone()),
+        ast::Adt::Union(it) => it.record_field_list().map(|it| it.syntax().clone()),
+        ast::Adt::Enum(it) => it.variant_list().map(|it| it.syntax().clone()),
     };
-    header_hashes(node, list.as_ref())
+    header_hashes(item.syntax(), list.as_ref())
 }
 
 /// The hashes of a trait: generics, supertraits and where clause.
@@ -456,6 +359,19 @@ fn mentions_parameter(node: &SyntaxNode, name: &str) -> bool {
         .any(|token| token.text() == name)
 }
 
+/// The hashes of the source of a macro, which is either the macro itself or,
+/// for a procedural macro, the function that implements it.
+pub(crate) fn macro_source_hashes<A: AstNode>(source: &A) -> Hashes {
+    let node = source.syntax().clone();
+    if let Some(item) = ast::Macro::cast(node.clone()) {
+        macro_hashes(&item)
+    } else if let Some(item) = ast::Fn::cast(node) {
+        function_hashes(&item)
+    } else {
+        Hashes::none()
+    }
+}
+
 /// The hashes of a macro definition: the rules as the body.
 ///
 /// The signature is empty: the name of a macro is the only thing but the rules,
@@ -572,14 +488,8 @@ mod tests {
 
     #[test]
     fn a_struct_header_ignores_the_name() {
-        let first = adt_hashes(
-            SymbolKind::Struct,
-            item::<ast::Struct>("struct First { value: u8 }").syntax(),
-        );
-        let second = adt_hashes(
-            SymbolKind::Struct,
-            item::<ast::Struct>("struct Second { value: u8 }").syntax(),
-        );
+        let first = adt_hashes(&item("struct First { value: u8 }"));
+        let second = adt_hashes(&item("struct Second { value: u8 }"));
         assert_eq!(first.signature, second.signature);
     }
 

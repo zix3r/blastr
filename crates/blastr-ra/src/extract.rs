@@ -21,7 +21,7 @@ use blastr_model::{
 };
 use ra_ap_hir::{
     Adt, AssocItem, Crate, EnumVariant, Field, FieldSource, Function, HasSource, HasVisibility,
-    HirFileId, Impl, InFile, MacroKind, Module, ModuleDef, Semantics, Trait,
+    HirFileId, Impl, InFile, Macro, MacroKind, Module, ModuleDef, Name, Semantics, Trait,
     Visibility as HirVisibility, attach_db, db::HirDatabase,
 };
 use ra_ap_ide_db::RootDatabase;
@@ -137,6 +137,29 @@ struct Scope {
     in_trait: bool,
     /// The definition is declared inside an impl block for a trait.
     in_trait_impl: bool,
+}
+
+/// Where a definition is declared.
+#[derive(Debug, Clone, Copy)]
+struct Place<'p> {
+    /// The path of the enclosing symbol, which the definition's path extends.
+    path: &'p str,
+    /// The enclosing symbol, as an index into [`Extractor::raws`].
+    parent: Option<usize>,
+    /// The block around the definition.
+    scope: Scope,
+}
+
+impl Place<'_> {
+    /// The place of the definitions inside the symbol at `index`, whose path
+    /// is `path`.
+    fn child(self, path: &str, index: usize) -> Place<'_> {
+        Place {
+            path,
+            parent: Some(index),
+            scope: self.scope,
+        }
+    }
 }
 
 /// A definition together with the syntax of its body in the file it came from.
@@ -301,704 +324,341 @@ impl<'a> Extractor<'a> {
             self.krate,
             location,
             ModelVisibility::Public,
-            symbols::module_hashes(),
+            Hashes::none(),
             None,
         );
         let index = self.push(raw, Some(DefKey::Module(root)));
-        self.walk_module(root, crate_name, Some(index), Scope::default())
+        let place = Place {
+            path: crate_name,
+            parent: Some(index),
+            scope: Scope::default(),
+        };
+        self.walk_module(root, place)
     }
 
     /// Adds the items of one module, and of its impl blocks.
-    fn walk_module(
-        &mut self,
-        module: Module,
-        path: &str,
-        parent: Option<usize>,
-        scope: Scope,
-    ) -> Result<(), Error> {
+    fn walk_module(&mut self, module: Module, place: Place<'_>) -> Result<(), Error> {
         check_cancel(self.cancel)?;
-        self.note_module(module);
-        let declarations = self
-            .guarded(|| Some(module.declarations(self.db)))
-            .unwrap_or_default();
-        for def in declarations {
-            self.add_def(def, path, parent, scope)?;
+        // The inactive ranges of the module are read after the walk.
+        self.modules.push(module);
+        for def in self.all(|| module.declarations(self.db)) {
+            self.add_def(def, place)?;
         }
         // A `macro_rules!` macro without `#[macro_export]` is textually scoped
         // and not among the declarations. The legacy scope also holds the
         // macros inherited from enclosing modules and from `#[macro_use]`
         // crates, so only the ones defined in this module are taken.
-        let macros = self
-            .guarded(|| Some(module.legacy_macros(self.db)))
-            .unwrap_or_default();
-        for item in macros {
+        for item in self.all(|| module.legacy_macros(self.db)) {
             if item.module(self.db) == module {
-                self.add_macro(item, path, parent, scope)?;
+                self.add_macro(item, place);
             }
         }
-        let impls = self
-            .guarded(|| Some(module.impl_defs(self.db)))
-            .unwrap_or_default();
-        for block in impls {
-            self.add_impl(block, path, parent)?;
+        for block in self.all(|| module.impl_defs(self.db)) {
+            self.add_impl(block, place)?;
         }
         Ok(())
     }
 
     /// Adds one definition that can appear in a module's declarations.
-    fn add_def(
-        &mut self,
-        def: ModuleDef,
-        path: &str,
-        parent: Option<usize>,
-        scope: Scope,
-    ) -> Result<(), Error> {
-        self.add_def_inner(def, path, parent, scope)
-    }
-
-    /// Adds one definition that can appear in a module's declarations.
-    fn add_def_inner(
-        &mut self,
-        def: ModuleDef,
-        path: &str,
-        parent: Option<usize>,
-        scope: Scope,
-    ) -> Result<(), Error> {
+    fn add_def(&mut self, def: ModuleDef, place: Place<'_>) -> Result<(), Error> {
         match def {
-            ModuleDef::Module(module) => self.add_module(module, path, parent, scope),
-            ModuleDef::Function(function) => self.add_function(function, path, parent, scope),
-            ModuleDef::Adt(adt) => self.add_adt(adt, path, parent, scope),
-            ModuleDef::Const(item) => self.add_const(item, path, parent, scope),
-            ModuleDef::Static(item) => self.add_static(item, path, parent, scope),
-            ModuleDef::Trait(item) => self.add_trait(item, path, parent, scope),
-            ModuleDef::TypeAlias(item) => self.add_type_alias(item, path, parent, scope),
-            ModuleDef::Macro(item) => self.add_macro(item, path, parent, scope),
+            ModuleDef::Module(module) => self.add_module(module, place),
+            ModuleDef::Function(function) => self.add_function(function, place),
+            ModuleDef::Adt(adt) => self.add_adt(adt, place),
+            ModuleDef::Trait(item) => self.add_trait(item, place),
+            ModuleDef::Macro(item) => {
+                self.add_macro(item, place);
+                Ok(())
+            }
+            ModuleDef::Const(item) => {
+                self.add_item(item, SymbolKind::Const, symbols::const_hashes, place);
+                Ok(())
+            }
+            ModuleDef::Static(item) => {
+                self.add_item(item, SymbolKind::Static, symbols::static_hashes, place);
+                Ok(())
+            }
+            ModuleDef::TypeAlias(item) => {
+                let hashes = symbols::type_alias_hashes;
+                self.add_item(item, SymbolKind::TypeAlias, hashes, place);
+                Ok(())
+            }
             // Enum variants are reached through their enum, and builtin types
             // are not written anywhere.
             ModuleDef::EnumVariant(_) | ModuleDef::BuiltinType(_) => Ok(()),
         }
     }
 
-    /// Adds an item declared inside a trait or an impl block.
-    fn add_assoc_item(
+    /// Adds a definition whose region is its whole source, and nothing below
+    /// it, and returns its index and path.
+    fn add_item<D>(
         &mut self,
-        item: AssocItem,
-        path: &str,
-        parent: Option<usize>,
-        scope: Scope,
-    ) -> Result<(), Error> {
-        match item {
-            AssocItem::Function(function) => self.add_function(function, path, parent, scope),
-            AssocItem::Const(item) => self.add_const(item, path, parent, scope),
-            AssocItem::TypeAlias(item) => self.add_type_alias(item, path, parent, scope),
-        }
+        def: D,
+        kind: SymbolKind,
+        hashes: fn(&D::Ast) -> Hashes,
+        place: Place<'_>,
+    ) -> Option<(usize, String, Source<D::Ast>)>
+    where
+        D: HasSource + Into<ModuleDef> + Copy,
+    {
+        let (key, raw, source) = self.symbol(def, kind, hashes, place)?;
+        let path = raw.path.clone();
+        let index = self.push(raw, Some(key));
+        self.region(index, Some(key), source.file, source.syntax());
+        Some((index, path, source))
     }
 
-    fn add_module(
-        &mut self,
-        module: Module,
-        path: &str,
-        parent: Option<usize>,
-        scope: Scope,
-    ) -> Result<(), Error> {
+    /// Adds an item declared inside a trait or an impl block.
+    fn add_assoc_item(&mut self, item: AssocItem, place: Place<'_>) -> Result<(), Error> {
+        let def = match item {
+            AssocItem::Function(it) => ModuleDef::Function(it),
+            AssocItem::Const(it) => ModuleDef::Const(it),
+            AssocItem::TypeAlias(it) => ModuleDef::TypeAlias(it),
+        };
+        self.add_def(def, place)
+    }
+
+    /// Builds the symbol of a definition, which the caller pushes.
+    ///
+    /// `None` when the definition was added already, has no name, or has no
+    /// source in the workspace. `hashes` hashes the source of the kind.
+    fn symbol<D>(
+        &self,
+        def: D,
+        kind: SymbolKind,
+        hashes: fn(&D::Ast) -> Hashes,
+        place: Place<'_>,
+    ) -> Option<(DefKey, Raw, Source<D::Ast>)>
+    where
+        D: HasSource + Into<ModuleDef> + Copy,
+    {
+        let db = self.db;
+        let module_def: ModuleDef = def.into();
+        let key = DefKey::from_module_def(module_def)?;
+        if self.defs.contains_key(&key) {
+            return None;
+        }
+        let name = module_def.name(db).filter(|name| !name.is_missing())?;
+        let module = module_def.module(db)?;
+        let visibility = module_def.visibility(db);
+        let source = self.source(def)?;
+        let hashes = source.ast().map(hashes).unwrap_or_else(Hashes::none);
+        let function = matches!(kind, SymbolKind::Function | SymbolKind::Method);
+        let flags = SymbolFlags {
+            is_test: function && hashes.is_test,
+            has_body: (function || matches!(kind, SymbolKind::Const | SymbolKind::Static))
+                && hashes.has_body,
+            is_pub_api: self.is_pub_api(visibility, module),
+            in_trait: place.scope.in_trait,
+            in_trait_impl: place.scope.in_trait_impl,
+            from_macro: source.from_macro,
+            ..SymbolFlags::default()
+        };
+        let mut raw = Raw::new(
+            kind,
+            paths::child(place.path, name.as_str()),
+            self.krate,
+            source.location.clone(),
+            self.model_visibility(visibility, module),
+            hashes,
+            place.parent,
+        );
+        raw.flags = flags;
+        Some((key, raw, source))
+    }
+
+    /// The source of a definition, with its location.
+    fn source<D: HasSource>(&self, def: D) -> Option<Source<D::Ast>> {
+        let source = self.guarded(|| def.source_with_range(self.db))?;
+        self.resolve_source(source)
+    }
+
+    fn add_module(&mut self, module: Module, place: Place<'_>) -> Result<(), Error> {
         let key = DefKey::Module(module);
         if self.defs.contains_key(&key) {
             return Ok(());
         }
-        let Some(name) = module.name(self.db) else {
+        let Some(name) = module.name(self.db).filter(|name| !name.is_missing()) else {
             return Ok(());
         };
-        if name.is_missing() {
-            return Ok(());
-        }
         let Some(location) = self.module_location(module) else {
             return Ok(());
         };
-        let path = paths::child(path, name.as_str());
+        let path = paths::child(place.path, name.as_str());
         let raw = Raw::new(
             SymbolKind::Module,
             path.clone(),
             self.krate,
             location,
             self.model_visibility(module.visibility(self.db), module),
-            symbols::module_hashes(),
-            parent,
+            Hashes::none(),
+            place.parent,
         );
         let index = self.push(raw, Some(key));
-        self.walk_module(module, &path, Some(index), scope)
+        self.walk_module(module, place.child(&path, index))
     }
 
-    fn add_function(
-        &mut self,
-        function: Function,
-        path: &str,
-        parent: Option<usize>,
-        scope: Scope,
-    ) -> Result<(), Error> {
-        let key = DefKey::Function(function);
-        if self.defs.contains_key(&key) {
-            return Ok(());
-        }
-        let Some(source) = self
-            .guarded(|| function.source_with_range(self.db))
-            .and_then(|source| self.resolve_source(source))
-        else {
-            return Ok(());
-        };
-        let name = function.name(self.db);
-        if name.is_missing() {
-            return Ok(());
-        }
-        let has_self = function.has_self_param(self.db);
-        let kind = if has_self {
+    fn add_function(&mut self, function: Function, place: Place<'_>) -> Result<(), Error> {
+        let kind = if function.has_self_param(self.db) {
             SymbolKind::Method
         } else {
             SymbolKind::Function
         };
-        let hashes = source
-            .ast()
-            .map(symbols::function_hashes)
-            .unwrap_or_else(Hashes::none);
-        let is_test = hashes.is_test;
-        let has_body = hashes.has_body;
-        let path = paths::child(path, name.as_str());
-        let visibility = function.visibility(self.db);
-        let module = function.module(self.db);
-        let visibility = self.model_visibility(visibility, module);
-        let pub_api = self.is_pub_api(function.visibility(self.db), module);
-        let mut raw = Raw::new(
-            kind,
-            path.clone(),
-            self.krate,
-            source.location.clone(),
-            visibility,
-            hashes,
-            parent,
-        );
-        raw.flags = SymbolFlags {
-            is_test,
-            is_main: self.is_main(name.as_str(), kind, parent),
-            is_pub_api: pub_api,
-            has_body,
-            in_trait: scope.in_trait,
-            in_trait_impl: scope.in_trait_impl,
-            from_macro: source.from_macro,
-            sole_parameter_use: false,
+        let Some((index, path, source)) =
+            self.add_item(function, kind, symbols::function_hashes, place)
+        else {
+            return Ok(());
         };
-        let index = self.push(raw, Some(key));
-        self.region(index, Some(key), source.file, source.syntax());
+        let name = function.name(self.db);
+        self.raws[index].flags.is_main = self.is_main(name.as_str(), kind, place.parent);
         if let Some(body) = source.ast().and_then(|item| item.body()) {
-            self.walk_nested(source.file, body.syntax(), &path, index, scope)?;
+            self.walk_nested(source.file, body.syntax(), place.child(&path, index))?;
         }
         Ok(())
     }
 
-    fn add_adt(
-        &mut self,
-        adt: Adt,
-        path: &str,
-        parent: Option<usize>,
-        scope: Scope,
-    ) -> Result<(), Error> {
-        let key = DefKey::Adt(adt);
-        if self.defs.contains_key(&key) {
-            return Ok(());
-        }
-        let (kind, name, module, visibility) = match adt {
-            Adt::Struct(it) => (
-                SymbolKind::Struct,
-                it.name(self.db),
-                it.module(self.db),
-                it.visibility(self.db),
-            ),
-            Adt::Enum(it) => (
-                SymbolKind::Enum,
-                it.name(self.db),
-                it.module(self.db),
-                it.visibility(self.db),
-            ),
-            Adt::Union(it) => (
-                SymbolKind::Union,
-                it.name(self.db),
-                it.module(self.db),
-                it.visibility(self.db),
-            ),
+    fn add_adt(&mut self, adt: Adt, place: Place<'_>) -> Result<(), Error> {
+        let kind = match adt {
+            Adt::Struct(_) => SymbolKind::Struct,
+            Adt::Enum(_) => SymbolKind::Enum,
+            Adt::Union(_) => SymbolKind::Union,
         };
-        if name.is_missing() {
-            return Ok(());
-        }
-        let Some(source) = self
-            .guarded(|| adt.source(self.db))
-            .map(with_range)
-            .and_then(|source| self.resolve_source(source))
-        else {
+        let Some((index, path, _)) = self.add_item(adt, kind, symbols::adt_hashes, place) else {
             return Ok(());
         };
-        let hashes = source
-            .syntax()
-            .map(|node| symbols::adt_hashes(kind, node))
-            .unwrap_or_else(Hashes::none);
-        let path = paths::child(path, name.as_str());
-        let mut raw = Raw::new(
-            kind,
-            path.clone(),
-            self.krate,
-            source.location.clone(),
-            self.model_visibility(visibility, module),
-            hashes,
-            parent,
-        );
-        raw.flags = SymbolFlags {
-            is_pub_api: self.is_pub_api(visibility, module),
-            from_macro: source.from_macro,
-            in_trait: scope.in_trait,
-            in_trait_impl: scope.in_trait_impl,
-            ..SymbolFlags::default()
-        };
-        let index = self.push(raw, Some(key));
-        self.region(index, Some(key), source.file, source.syntax());
+        let inner = place.child(&path, index);
+        let module = adt.module(self.db);
         match adt {
-            Adt::Struct(it) => {
-                let fields = self
-                    .guarded(|| Some(it.fields(self.db)))
-                    .unwrap_or_default();
-                for field in fields {
-                    self.add_field(field, module, &path, Some(index), scope)?;
-                }
-            }
-            Adt::Union(it) => {
-                let fields = self
-                    .guarded(|| Some(it.fields(self.db)))
-                    .unwrap_or_default();
-                for field in fields {
-                    self.add_field(field, module, &path, Some(index), scope)?;
-                }
-            }
+            Adt::Struct(it) => self.add_fields(self.all(|| it.fields(self.db)), module, inner),
+            Adt::Union(it) => self.add_fields(self.all(|| it.fields(self.db)), module, inner),
             Adt::Enum(it) => {
-                let variants = self
-                    .guarded(|| Some(it.variants(self.db)))
-                    .unwrap_or_default();
-                for variant in variants {
-                    self.add_variant(variant, &path, Some(index), scope)?;
+                for variant in self.all(|| it.variants(self.db)) {
+                    self.add_variant(variant, inner)?;
                 }
+                Ok(())
             }
         }
-        Ok(())
     }
 
-    fn add_variant(
-        &mut self,
-        variant: EnumVariant,
-        path: &str,
-        parent: Option<usize>,
-        scope: Scope,
-    ) -> Result<(), Error> {
-        let key = DefKey::Variant(variant);
-        if self.defs.contains_key(&key) {
-            return Ok(());
-        }
-        let name = variant.name(self.db);
-        if name.is_missing() {
-            return Ok(());
-        }
-        let module = variant.module(self.db);
-        let visibility = variant.visibility(self.db);
-        let Some(source) = self
-            .guarded(|| variant.source(self.db))
-            .map(with_range)
-            .and_then(|source| self.resolve_source(source))
-        else {
+    fn add_variant(&mut self, variant: EnumVariant, place: Place<'_>) -> Result<(), Error> {
+        let hashes = symbols::variant_hashes;
+        let Some((key, raw, _)) = self.symbol(variant, SymbolKind::Variant, hashes, place) else {
             return Ok(());
         };
-        let hashes = source
-            .ast()
-            .map(symbols::variant_hashes)
-            .unwrap_or_else(Hashes::none);
-        let path = paths::child(path, name.as_str());
-        let mut raw = Raw::new(
-            SymbolKind::Variant,
-            path.clone(),
-            self.krate,
-            source.location.clone(),
-            self.model_visibility(visibility, module),
-            hashes,
-            parent,
-        );
-        raw.flags = SymbolFlags {
-            is_pub_api: self.is_pub_api(visibility, module),
-            from_macro: source.from_macro,
-            in_trait: scope.in_trait,
-            in_trait_impl: scope.in_trait_impl,
-            ..SymbolFlags::default()
-        };
+        let path = raw.path.clone();
         let index = self.push(raw, Some(key));
-        let fields = self
-            .guarded(|| Some(variant.fields(self.db)))
-            .unwrap_or_default();
+        let module = variant.module(self.db);
+        self.add_fields(
+            self.all(|| variant.fields(self.db)),
+            module,
+            place.child(&path, index),
+        )
+    }
+
+    /// Adds the fields of a struct, a union or a variant declared in `module`.
+    fn add_fields(
+        &mut self,
+        fields: Vec<Field>,
+        module: Module,
+        place: Place<'_>,
+    ) -> Result<(), Error> {
         for field in fields {
-            self.add_field(field, module, &path, Some(index), scope)?;
+            self.add_field(field, module, place);
         }
         Ok(())
     }
 
-    fn add_field(
-        &mut self,
-        field: Field,
-        module: Module,
-        path: &str,
-        parent: Option<usize>,
-        scope: Scope,
-    ) -> Result<(), Error> {
+    fn add_field(&mut self, field: Field, module: Module, place: Place<'_>) {
         let key = DefKey::Field(field);
         if self.defs.contains_key(&key) {
-            return Ok(());
+            return;
         }
-        let Some(source) = self
-            .guarded(|| field.source(self.db))
-            .map(with_range)
-            .and_then(|source| self.resolve_source(source))
-        else {
-            return Ok(());
+        let Some(source) = self.source(field) else {
+            return;
         };
-        let hashes = source.ast().map(source_hashes).unwrap_or_else(Hashes::none);
         let name = field.name(self.db);
         let name = if name.is_missing() {
             field.index().to_string()
         } else {
             name.as_str().to_owned()
         };
-        let path = paths::child(path, &name);
+        let (node, ty) = match source.ast() {
+            Some(FieldSource::Named(field)) => (Some(field.syntax()), field.ty()),
+            Some(FieldSource::Pos(field)) => (Some(field.syntax()), field.ty()),
+            None => (None, None),
+        };
+        let hashes = node.map_or_else(Hashes::none, |node| symbols::field_hashes(node, ty.clone()));
+        let ty = ty.map(|ty| ty.syntax().clone());
         let visibility = field.visibility(self.db);
         let mut raw = Raw::new(
             SymbolKind::Field,
-            path,
+            paths::child(place.path, &name),
             self.krate,
             source.location.clone(),
             self.model_visibility(visibility, module),
             hashes,
-            parent,
+            place.parent,
         );
-        let ty = source.ast().and_then(field_type);
-        let sole_parameter_use = match (source.ast(), ty.as_ref()) {
-            (Some(source), Some(ty)) => {
-                let node = match source {
-                    FieldSource::Named(field) => field.syntax(),
-                    FieldSource::Pos(field) => field.syntax(),
-                };
-                symbols::sole_parameter_use(node, ty)
-            }
-            _ => false,
-        };
         raw.flags = SymbolFlags {
             is_pub_api: self.is_pub_api(visibility, module),
             from_macro: source.from_macro,
-            in_trait: scope.in_trait,
-            in_trait_impl: scope.in_trait_impl,
-            sole_parameter_use,
+            in_trait: place.scope.in_trait,
+            in_trait_impl: place.scope.in_trait_impl,
+            sole_parameter_use: node
+                .zip(ty.as_ref())
+                .is_some_and(|(node, ty)| symbols::sole_parameter_use(node, ty)),
             ..SymbolFlags::default()
         };
         let index = self.push(raw, Some(key));
         self.region(index, Some(key), source.file, ty.as_ref());
-        Ok(())
     }
 
-    fn add_const(
-        &mut self,
-        item: ra_ap_hir::Const,
-        path: &str,
-        parent: Option<usize>,
-        scope: Scope,
-    ) -> Result<(), Error> {
-        let key = DefKey::Const(item);
-        if self.defs.contains_key(&key) {
-            return Ok(());
-        }
-        let Some(name) = item.name(self.db) else {
+    fn add_trait(&mut self, item: Trait, place: Place<'_>) -> Result<(), Error> {
+        let hashes = symbols::trait_hashes;
+        let Some((index, path, _)) = self.add_item(item, SymbolKind::Trait, hashes, place) else {
             return Ok(());
         };
-        if name.is_missing() {
-            return Ok(());
-        }
-        let module = item.module(self.db);
-        let visibility = item.visibility(self.db);
-        let Some(source) = self
-            .guarded(|| item.source(self.db))
-            .map(with_range)
-            .and_then(|source| self.resolve_source(source))
-        else {
-            return Ok(());
-        };
-        let hashes = source
-            .ast()
-            .map(symbols::const_hashes)
-            .unwrap_or_else(Hashes::none);
-        let has_body = hashes.has_body;
-        let path = paths::child(path, name.as_str());
-        let mut raw = Raw::new(
-            SymbolKind::Const,
-            path,
-            self.krate,
-            source.location.clone(),
-            self.model_visibility(visibility, module),
-            hashes,
-            parent,
-        );
-        raw.flags = SymbolFlags {
-            is_pub_api: self.is_pub_api(visibility, module),
-            has_body,
-            in_trait: scope.in_trait,
-            in_trait_impl: scope.in_trait_impl,
-            from_macro: source.from_macro,
-            ..SymbolFlags::default()
-        };
-        let index = self.push(raw, Some(key));
-        self.region(index, Some(key), source.file, source.syntax());
-        Ok(())
-    }
-
-    fn add_static(
-        &mut self,
-        item: ra_ap_hir::Static,
-        path: &str,
-        parent: Option<usize>,
-        scope: Scope,
-    ) -> Result<(), Error> {
-        let key = DefKey::Static(item);
-        if self.defs.contains_key(&key) {
-            return Ok(());
-        }
-        let name = item.name(self.db);
-        if name.is_missing() {
-            return Ok(());
-        }
-        let module = item.module(self.db);
-        let visibility = item.visibility(self.db);
-        let Some(source) = self
-            .guarded(|| item.source(self.db))
-            .map(with_range)
-            .and_then(|source| self.resolve_source(source))
-        else {
-            return Ok(());
-        };
-        let hashes = source
-            .ast()
-            .map(symbols::static_hashes)
-            .unwrap_or_else(Hashes::none);
-        let has_body = hashes.has_body;
-        let path = paths::child(path, name.as_str());
-        let mut raw = Raw::new(
-            SymbolKind::Static,
-            path,
-            self.krate,
-            source.location.clone(),
-            self.model_visibility(visibility, module),
-            hashes,
-            parent,
-        );
-        raw.flags = SymbolFlags {
-            is_pub_api: self.is_pub_api(visibility, module),
-            has_body,
-            in_trait: scope.in_trait,
-            in_trait_impl: scope.in_trait_impl,
-            from_macro: source.from_macro,
-            ..SymbolFlags::default()
-        };
-        let index = self.push(raw, Some(key));
-        self.region(index, Some(key), source.file, source.syntax());
-        Ok(())
-    }
-
-    fn add_type_alias(
-        &mut self,
-        item: ra_ap_hir::TypeAlias,
-        path: &str,
-        parent: Option<usize>,
-        scope: Scope,
-    ) -> Result<(), Error> {
-        let key = DefKey::TypeAlias(item);
-        if self.defs.contains_key(&key) {
-            return Ok(());
-        }
-        let name = item.name(self.db);
-        if name.is_missing() {
-            return Ok(());
-        }
-        let module = item.module(self.db);
-        let visibility = item.visibility(self.db);
-        let Some(source) = self
-            .guarded(|| item.source(self.db))
-            .map(with_range)
-            .and_then(|source| self.resolve_source(source))
-        else {
-            return Ok(());
-        };
-        let hashes = source
-            .ast()
-            .map(symbols::type_alias_hashes)
-            .unwrap_or_else(Hashes::none);
-        let path = paths::child(path, name.as_str());
-        let mut raw = Raw::new(
-            SymbolKind::TypeAlias,
-            path,
-            self.krate,
-            source.location.clone(),
-            self.model_visibility(visibility, module),
-            hashes,
-            parent,
-        );
-        raw.flags = SymbolFlags {
-            is_pub_api: self.is_pub_api(visibility, module),
-            in_trait: scope.in_trait,
-            in_trait_impl: scope.in_trait_impl,
-            from_macro: source.from_macro,
-            ..SymbolFlags::default()
-        };
-        let index = self.push(raw, Some(key));
-        self.region(index, Some(key), source.file, source.syntax());
-        Ok(())
-    }
-
-    fn add_trait(
-        &mut self,
-        item: Trait,
-        path: &str,
-        parent: Option<usize>,
-        scope: Scope,
-    ) -> Result<(), Error> {
-        let key = DefKey::Trait(item);
-        if self.defs.contains_key(&key) {
-            return Ok(());
-        }
-        let name = item.name(self.db);
-        if name.is_missing() {
-            return Ok(());
-        }
-        let module = item.module(self.db);
-        let visibility = item.visibility(self.db);
-        let Some(source) = self
-            .guarded(|| item.source(self.db))
-            .map(with_range)
-            .and_then(|source| self.resolve_source(source))
-        else {
-            return Ok(());
-        };
-        let hashes = source
-            .ast()
-            .map(symbols::trait_hashes)
-            .unwrap_or_else(Hashes::none);
-        let path = paths::child(path, name.as_str());
-        let mut raw = Raw::new(
-            SymbolKind::Trait,
-            path.clone(),
-            self.krate,
-            source.location.clone(),
-            self.model_visibility(visibility, module),
-            hashes,
-            parent,
-        );
-        raw.flags = SymbolFlags {
-            is_pub_api: self.is_pub_api(visibility, module),
-            in_trait: scope.in_trait,
-            in_trait_impl: scope.in_trait_impl,
-            from_macro: source.from_macro,
-            ..SymbolFlags::default()
-        };
-        let index = self.push(raw, Some(key));
-        self.region(index, Some(key), source.file, source.syntax());
-        let inner = Scope {
-            in_trait: true,
-            in_trait_impl: scope.in_trait_impl,
-        };
-        let items = self
-            .guarded(|| Some(item.items(self.db)))
-            .unwrap_or_default();
-        for item in items {
-            self.add_assoc_item(item, &path, Some(index), inner)?;
+        let mut inner = place.child(&path, index);
+        inner.scope.in_trait = true;
+        for item in self.all(|| item.items(self.db)) {
+            self.add_assoc_item(item, inner)?;
         }
         Ok(())
     }
 
-    fn add_macro(
-        &mut self,
-        item: ra_ap_hir::Macro,
-        path: &str,
-        parent: Option<usize>,
-        scope: Scope,
-    ) -> Result<(), Error> {
-        let key = DefKey::Macro(item);
-        if self.defs.contains_key(&key) {
-            return Ok(());
-        }
-        let name = item.name(self.db);
-        if name.is_missing() {
-            return Ok(());
-        }
-        let module = item.module(self.db);
-        let visibility = item.visibility(self.db);
-        let Some(source) = self
-            .guarded(|| item.source(self.db))
-            .map(with_range)
-            .and_then(|source| self.resolve_source(source))
-        else {
-            return Ok(());
-        };
-        let hashes = macro_source_hashes(&source);
-        let path = paths::child(path, name.as_str());
-        let mut raw = Raw::new(
-            SymbolKind::Macro,
-            path,
-            self.krate,
-            source.location.clone(),
-            self.model_visibility(visibility, module),
-            hashes,
-            parent,
-        );
-        raw.flags = SymbolFlags {
-            is_pub_api: self.is_pub_api(visibility, module),
-            in_trait: scope.in_trait,
-            in_trait_impl: scope.in_trait_impl,
-            from_macro: source.from_macro,
-            ..SymbolFlags::default()
+    fn add_macro(&mut self, item: Macro, place: Place<'_>) {
+        let hashes = symbols::macro_source_hashes;
+        let Some((key, raw, source)) = self.symbol(item, SymbolKind::Macro, hashes, place) else {
+            return;
         };
         // A procedural macro is implemented by a function of the crate, which
         // is walked as a function of its own; the two are one item.
-        if let Some(function) = self.implementing_function(&source) {
+        if let Some(function) = source.syntax().cloned().and_then(ast::Fn::cast)
+            && let Some(function) =
+                self.guarded(|| self.sema.to_def2(InFile::new(source.file, &function)))
+        {
             self.aliases.push(MacroAlias {
                 key,
                 function: DefKey::Function(function),
                 fallback: raw,
             });
-            return Ok(());
+            return;
         }
         self.push(raw, Some(key));
-        Ok(())
-    }
-
-    /// The function that implements a procedural macro, if `source` is one.
-    ///
-    /// The source of a `macro_rules!` or of a `macro` 2.0 item is the item
-    /// itself; the source of a procedural macro is the `fn` that the compiler
-    /// calls, which is a definition of the same module.
-    fn implementing_function<A: AstNode>(&self, source: &Source<A>) -> Option<Function> {
-        let node = source.syntax()?;
-        let function = ast::Fn::cast(node.clone())?;
-        self.guarded(|| self.sema.to_def2(InFile::new(source.file, &function)))
     }
 
     /// Adds an impl block and the items it defines.
-    fn add_impl(&mut self, block: Impl, path: &str, parent: Option<usize>) -> Result<(), Error> {
+    fn add_impl(&mut self, block: Impl, place: Place<'_>) -> Result<(), Error> {
         check_cancel(self.cancel)?;
         let key = DefKey::Impl(block);
         if self.defs.contains_key(&key) {
             return Ok(());
         }
-        let Some(source) = self
-            .guarded(|| block.source_with_range(self.db))
-            .and_then(|source| self.resolve_source(source))
-        else {
+        let Some(source) = self.source(block) else {
             return Ok(());
         };
         let trait_def = block.trait_(self.db);
+        let self_ty = block.self_ty(self.db).as_adt();
         let (trait_text, self_text) = match source.ast() {
             Some(node) => (
                 node.trait_()
@@ -1006,19 +666,22 @@ impl<'a> Extractor<'a> {
                 node.self_ty()
                     .map(|it| hashing::text_without_ws(it.syntax())),
             ),
+            // A derive-generated impl has no text to copy its self type from.
             None => (
                 trait_def.map(|it| it.name(self.db).as_str().to_owned()),
-                self.type_name(block.self_ty(self.db)),
+                self_ty.map(|adt| adt.name(self.db).as_str().to_owned()),
             ),
         };
         let Some(self_text) = self_text else {
             return Ok(());
         };
         let segment = paths::impl_segment(trait_text.as_deref(), &self_text);
-        let path = paths::child(path, &segment);
+        let path = paths::child(place.path, &segment);
         let info = ImplInfo {
-            trait_path: trait_def.map(|it| self.trait_path(it)),
-            self_path: self.adt_path(block.self_ty(self.db).as_adt()),
+            trait_path: trait_def
+                .map(|it| self.definition_path(it.module(self.db), it.name(self.db))),
+            self_path: self_ty
+                .map(|adt| self.definition_path(adt.module(self.db), adt.name(self.db))),
         };
         let hashes = source
             .ast()
@@ -1031,7 +694,7 @@ impl<'a> Extractor<'a> {
             source.location.clone(),
             ModelVisibility::Public,
             hashes,
-            parent,
+            place.parent,
         );
         raw.flags = SymbolFlags {
             in_trait_impl: trait_def.is_some(),
@@ -1041,20 +704,17 @@ impl<'a> Extractor<'a> {
         raw.impl_info = Some(info.clone());
         let index = self.push(raw, Some(key));
         self.region(index, Some(key), source.file, source.syntax());
-        let item_path = if trait_def.is_some() {
-            path
-        } else {
-            info.self_path.unwrap_or(path)
+        let item_path = match (trait_def, info.self_path) {
+            (None, Some(self_path)) => self_path,
+            _ => path,
         };
-        let inner = Scope {
+        let mut inner = place.child(&item_path, index);
+        inner.scope = Scope {
             in_trait: false,
             in_trait_impl: trait_def.is_some(),
         };
-        let items = self
-            .guarded(|| Some(block.items(self.db)))
-            .unwrap_or_default();
-        for item in items {
-            self.add_assoc_item(item, &item_path, Some(index), inner)?;
+        for item in self.all(|| block.items(self.db)) {
+            self.add_assoc_item(item, inner)?;
         }
         Ok(())
     }
@@ -1068,9 +728,7 @@ impl<'a> Extractor<'a> {
         &mut self,
         file: HirFileId,
         body: &SyntaxNode,
-        path: &str,
-        parent: usize,
-        scope: Scope,
+        place: Place<'_>,
     ) -> Result<(), Error> {
         let mut nodes = Vec::new();
         item_nodes(body, &mut nodes);
@@ -1079,16 +737,14 @@ impl<'a> Extractor<'a> {
             let Some(item) = ast::Item::cast(node) else {
                 continue;
             };
-            let block = match &item {
-                ast::Item::Impl(it) => self.guarded(|| self.sema.to_def2(InFile::new(file, it))),
-                _ => None,
-            };
-            if let Some(block) = block {
-                self.add_impl(block, path, Some(parent))?;
+            if let ast::Item::Impl(it) = &item {
+                if let Some(block) = self.guarded(|| self.sema.to_def2(InFile::new(file, it))) {
+                    self.add_impl(block, place)?;
+                }
                 continue;
             }
             if let Some(def) = self.nested_def(file, &item) {
-                self.add_def(def, path, Some(parent), scope)?;
+                self.add_def(def, place)?;
             }
         }
         Ok(())
@@ -1096,86 +752,35 @@ impl<'a> Extractor<'a> {
 
     /// Resolves the syntax of an item in a block to its definition.
     fn nested_def(&self, file: HirFileId, item: &ast::Item) -> Option<ModuleDef> {
-        match item {
-            ast::Item::Fn(it) => self
-                .guarded(|| self.sema.to_def2(InFile::new(file, it)))
-                .map(ModuleDef::Function),
-            ast::Item::Struct(it) => self
-                .guarded(|| self.sema.to_def2(InFile::new(file, it)))
-                .map(|it| ModuleDef::Adt(Adt::Struct(it))),
-            ast::Item::Enum(it) => self
-                .guarded(|| self.sema.to_def2(InFile::new(file, it)))
-                .map(|it| ModuleDef::Adt(Adt::Enum(it))),
-            ast::Item::Union(it) => self
-                .guarded(|| self.sema.to_def2(InFile::new(file, it)))
-                .map(|it| ModuleDef::Adt(Adt::Union(it))),
-            ast::Item::Trait(it) => self
-                .guarded(|| self.sema.to_def2(InFile::new(file, it)))
-                .map(ModuleDef::Trait),
-            ast::Item::Const(it) => self
-                .guarded(|| self.sema.to_def2(InFile::new(file, it)))
-                .map(ModuleDef::Const),
-            ast::Item::Static(it) => self
-                .guarded(|| self.sema.to_def2(InFile::new(file, it)))
-                .map(ModuleDef::Static),
-            ast::Item::TypeAlias(it) => self
-                .guarded(|| self.sema.to_def2(InFile::new(file, it)))
-                .map(ModuleDef::TypeAlias),
-            ast::Item::Module(it) => self
-                .guarded(|| self.sema.to_def2(InFile::new(file, it)))
-                .map(ModuleDef::Module),
-            ast::Item::MacroRules(it) => {
-                let item = ast::Macro::MacroRules(it.clone());
-                self.guarded(|| self.sema.to_def2(InFile::new(file, &item)))
-                    .map(ModuleDef::Macro)
+        let sema = &self.sema;
+        let syntax = item.syntax().clone();
+        self.guarded(|| match item {
+            ast::Item::Fn(it) => sema.to_def2(InFile::new(file, it)).map(ModuleDef::from),
+            ast::Item::Trait(it) => sema.to_def2(InFile::new(file, it)).map(ModuleDef::from),
+            ast::Item::Const(it) => sema.to_def2(InFile::new(file, it)).map(ModuleDef::from),
+            ast::Item::Static(it) => sema.to_def2(InFile::new(file, it)).map(ModuleDef::from),
+            ast::Item::TypeAlias(it) => sema.to_def2(InFile::new(file, it)).map(ModuleDef::from),
+            ast::Item::Module(it) => sema.to_def2(InFile::new(file, it)).map(ModuleDef::from),
+            ast::Item::Struct(_) | ast::Item::Enum(_) | ast::Item::Union(_) => {
+                let adt = ast::Adt::cast(syntax)?;
+                sema.to_def2(InFile::new(file, &adt)).map(ModuleDef::from)
             }
-            ast::Item::MacroDef(it) => {
-                let item = ast::Macro::MacroDef(it.clone());
-                self.guarded(|| self.sema.to_def2(InFile::new(file, &item)))
-                    .map(ModuleDef::Macro)
+            ast::Item::MacroRules(_) | ast::Item::MacroDef(_) => {
+                let item = ast::Macro::cast(syntax)?;
+                sema.to_def2(InFile::new(file, &item)).map(ModuleDef::from)
             }
             _ => None,
-        }
-    }
-
-    /// The canonical path of a trait, in a member crate or outside the project.
-    fn trait_path(&self, item: Trait) -> String {
-        let module = item.module(self.db);
-        let name = item.name(self.db);
-        self.definition_path(module.krate(self.db), module, name.as_str())
-    }
-
-    /// The canonical path of a type, when it is a struct, enum or union.
-    fn adt_path(&self, adt: Option<Adt>) -> Option<String> {
-        let adt = adt?;
-        let (module, name) = match adt {
-            Adt::Struct(it) => (it.module(self.db), it.name(self.db)),
-            Adt::Enum(it) => (it.module(self.db), it.name(self.db)),
-            Adt::Union(it) => (it.module(self.db), it.name(self.db)),
-        };
-        Some(self.definition_path(module.krate(self.db), module, name.as_str()))
-    }
-
-    /// The name of a type, used when a derive-generated impl has no source text
-    /// to copy its self type from.
-    fn type_name(&self, ty: ra_ap_hir::Type<'_>) -> Option<String> {
-        let adt = ty.as_adt()?;
-        let name = match adt {
-            Adt::Struct(it) => it.name(self.db),
-            Adt::Enum(it) => it.name(self.db),
-            Adt::Union(it) => it.name(self.db),
-        };
-        Some(name.as_str().to_owned())
+        })
     }
 
     /// The canonical path of a definition, built from its crate and module
     /// instead of from the walk, so that it does not depend on the walk order.
-    fn definition_path(&self, krate: Crate, module: Module, name: &str) -> String {
-        let mut path = self.crate_name(krate);
+    fn definition_path(&self, module: Module, name: Name) -> String {
+        let mut path = self.crate_name(module.krate(self.db));
         for segment in module.path_segments(self.db) {
             path = paths::child(&path, segment.as_str());
         }
-        paths::child(&path, name)
+        paths::child(&path, name.as_str())
     }
 
     /// The name a crate goes by in paths.
@@ -1273,16 +878,6 @@ impl<'a> Extractor<'a> {
             .location_in_file(krate.root_file(self.db), start)
     }
 
-    /// Records the ranges of the code of `module` that is inactive under the
-    /// analysed configuration.
-    ///
-    /// The ranges are read after the whole walk, because their query infers the
-    /// types of every body of the module and is best run next to the other
-    /// crates.
-    fn note_module(&mut self, module: Module) {
-        self.modules.push(module);
-    }
-
     /// Maps a range that may live in a macro expansion back to the real file.
     fn locate(&self, file: HirFileId, range: TextRange) -> Option<Location> {
         self.guarded(|| self.locator.location(file, range))
@@ -1296,6 +891,11 @@ impl<'a> Extractor<'a> {
     /// the answer, so a panic becomes `None`.
     fn guarded<T>(&self, query: impl FnOnce() -> Option<T>) -> Option<T> {
         catch_unwind(AssertUnwindSafe(query)).ok().flatten()
+    }
+
+    /// The definitions a listing query returns, or none when it panics.
+    fn all<T>(&self, query: impl FnOnce() -> Vec<T>) -> Vec<T> {
+        self.guarded(|| Some(query())).unwrap_or_default()
     }
 
     /// Turns the syntax of a definition into its source, with a location.
@@ -1573,44 +1173,6 @@ fn sort_locations(locations: &mut Vec<Location>) {
         left_key.cmp(&right_key)
     });
     locations.dedup_by(|left, right| left == right);
-}
-
-/// The range a definition reports, together with the syntax it may have.
-fn with_range<A: AstNode>(source: InFile<A>) -> InFile<(TextRange, Option<A>)> {
-    source.map(|node| (node.syntax().text_range(), Some(node)))
-}
-
-/// The hashes of a struct, union or variant field.
-fn source_hashes(source: &FieldSource) -> Hashes {
-    let (node, ty) = match source {
-        FieldSource::Named(field) => (field.syntax(), field.ty()),
-        FieldSource::Pos(field) => (field.syntax(), field.ty()),
-    };
-    symbols::field_hashes(node, ty)
-}
-
-/// The type of a field, whose references belong to the field.
-fn field_type(source: &FieldSource) -> Option<SyntaxNode> {
-    let ty = match source {
-        FieldSource::Named(field) => field.ty(),
-        FieldSource::Pos(field) => field.ty(),
-    };
-    ty.map(|ty| ty.syntax().clone())
-}
-
-/// The hashes of a macro definition, which is either the macro itself or, for a
-/// procedural macro, the function that implements it.
-fn macro_source_hashes<A: AstNode>(source: &Source<A>) -> Hashes {
-    let Some(node) = source.syntax() else {
-        return Hashes::none();
-    };
-    if let Some(item) = ast::Macro::cast(node.clone()) {
-        symbols::macro_hashes(&item)
-    } else if let Some(item) = ast::Fn::cast(node.clone()) {
-        symbols::function_hashes(&item)
-    } else {
-        Hashes::none()
-    }
 }
 
 /// Collects the items declared directly in `node`, without descending into the
