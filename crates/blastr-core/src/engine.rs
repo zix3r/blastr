@@ -16,7 +16,7 @@ use blastr_git::Repo;
 use blastr_model::{
     Analysis, AnalysisKey, AnalysisOptions, AnalysisParams, Assume, CancelToken, Change,
     ChangedFile, Comparison, DiffResult, ExecMode, FileStatus, Limit, Progress, RelPath, RevSpec,
-    RevisionGraph, Source,
+    RevisionGraph, Source, SymbolPath,
 };
 
 use crate::codec::{decode_graph, encode_graph};
@@ -367,7 +367,7 @@ impl Engine {
     pub fn what_if(
         &self,
         repo_root: &Path,
-        symbol: &str,
+        symbol: &SymbolPath,
         assume: Assume,
         options: &AnalysisOptions,
         params: &AnalysisParams,

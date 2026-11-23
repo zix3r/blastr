@@ -9,35 +9,33 @@ use blastr_model::{
     Visibility,
 };
 
-use super::lookup::{self, LookupError};
-
-/// What `--assume body` needs.
+/// What assuming `body` needs.
 const BODY_EXPECTED: &str = "a function, a method, a const, a static or a macro";
-/// What `--assume signature` needs.
+/// What assuming `signature` needs.
 const SIGNATURE_EXPECTED: &str = "a function, a method, a type or a type alias";
 /// What the field assumptions need.
 const FIELD_EXPECTED: &str = "a field";
-/// What `--assume field-added` needs.
+/// What assuming `field-added` needs.
 const OWNER_EXPECTED: &str = "a struct or a variant";
-/// What `--assume variant-added` needs.
+/// What assuming `variant-added` needs.
 const ENUM_EXPECTED: &str = "an enum";
-/// What `--assume variant-removed` needs.
+/// What assuming `variant-removed` needs.
 const VARIANT_EXPECTED: &str = "a variant";
 
 /// Why a what-if query cannot be turned into a change.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum WhatIfError {
-    /// The query does not name exactly one symbol.
-    #[error(transparent)]
-    Lookup(#[from] LookupError),
+    /// The working tree has no symbol with the given path.
+    #[error("`{0}` is not in the working tree")]
+    NotFound(String),
     /// The symbol exists but cannot undergo the assumed change.
-    #[error("`{symbol}` is a {kind}; `--assume {assume}` needs {expected}")]
+    #[error("`{symbol}` is a {kind}; assuming `{assume}` needs {expected}")]
     WrongKind {
         /// The symbol's path text.
         symbol: String,
         /// What the symbol is.
         kind: SymbolKind,
-        /// The assumed change, as its flag value.
+        /// The assumed change, as its kebab-case name.
         assume: &'static str,
         /// What the assumed change applies to.
         expected: &'static str,
@@ -92,17 +90,11 @@ pub fn assumable(kind: SymbolKind) -> &'static [Assume] {
 /// The change to propagate for a what-if query on `graph`.
 pub fn assumed_change(
     graph: &RevisionGraph,
-    query: &str,
+    target: &SymbolPath,
     assume: Assume,
 ) -> Result<Change, WhatIfError> {
-    let paths: Vec<&SymbolPath> = graph.symbols.iter().map(|symbol| &symbol.path).collect();
-    let index = lookup::resolve(&paths, query)?;
-    // `paths` has one entry per symbol, so a resolved index always exists.
-    let Some(symbol) = graph.symbols.get(index) else {
-        return Err(WhatIfError::Lookup(LookupError::NotFound {
-            query: query.trim().to_owned(),
-            suggestions: Vec::new(),
-        }));
+    let Some(symbol) = graph.symbols.iter().find(|symbol| symbol.path == *target) else {
+        return Err(WhatIfError::NotFound(target.path.clone()));
     };
 
     let (kind, detail) = match assume {
@@ -242,19 +234,22 @@ mod tests {
     /// The change assumed for a symbol outside a trait.
     fn check(path: &str, kind: SymbolKind, assume: Assume) -> Change {
         let graph = graph_with(path, kind, false);
-        assumed_change(&graph, path, assume).expect("the assumption applies")
+        assumed_change(&graph, &SymbolPath::new(path, kind), assume)
+            .expect("the assumption applies")
     }
 
     /// The change assumed for a symbol declared in a trait.
     fn check_in_trait(path: &str, kind: SymbolKind, assume: Assume) -> Change {
         let graph = graph_with(path, kind, true);
-        assumed_change(&graph, path, assume).expect("the assumption applies")
+        assumed_change(&graph, &SymbolPath::new(path, kind), assume)
+            .expect("the assumption applies")
     }
 
     /// The message for an assumption that does not apply.
     fn rejected(path: &str, kind: SymbolKind, assume: Assume) -> String {
         let graph = graph_with(path, kind, false);
-        let error = assumed_change(&graph, path, assume).expect_err("the assumption is rejected");
+        let error = assumed_change(&graph, &SymbolPath::new(path, kind), assume)
+            .expect_err("the assumption is rejected");
         error.to_string()
     }
 
@@ -266,7 +261,7 @@ mod tests {
             for &assume in offered {
                 let graph = graph_with("krate::item", kind, false);
                 assert!(
-                    assumed_change(&graph, "krate::item", assume).is_ok(),
+                    assumed_change(&graph, &SymbolPath::new("krate::item", kind), assume).is_ok(),
                     "{kind} does not accept {}",
                     assume.as_str()
                 );
@@ -434,7 +429,7 @@ mod tests {
     fn body_of_a_struct_is_rejected() {
         assert_eq!(
             rejected("krate::Point", SymbolKind::Struct, Assume::Body),
-            format!("`krate::Point` is a struct; `--assume body` needs {BODY_EXPECTED}")
+            format!("`krate::Point` is a struct; assuming `body` needs {BODY_EXPECTED}")
         );
     }
 
@@ -443,7 +438,7 @@ mod tests {
         assert_eq!(
             rejected("krate::Point::x", SymbolKind::Field, Assume::Signature),
             format!(
-                "`krate::Point::x` is a field; `--assume signature` needs {SIGNATURE_EXPECTED}"
+                "`krate::Point::x` is a field; assuming `signature` needs {SIGNATURE_EXPECTED}"
             )
         );
     }
@@ -453,18 +448,26 @@ mod tests {
         assert_eq!(
             rejected("krate::Point", SymbolKind::Struct, Assume::VariantRemoved),
             format!(
-                "`krate::Point` is a struct; `--assume variant-removed` needs {VARIANT_EXPECTED}"
+                "`krate::Point` is a struct; assuming `variant-removed` needs {VARIANT_EXPECTED}"
             )
         );
     }
 
     #[test]
-    fn an_unknown_symbol_reports_the_lookup_error() {
+    fn an_unknown_symbol_is_not_found() {
         let graph = graph_with("krate::Point", SymbolKind::Struct, false);
-        let error = assumed_change(&graph, "Missing", Assume::Body).expect_err("no symbol");
-        assert!(matches!(
-            error,
-            WhatIfError::Lookup(LookupError::NotFound { .. })
-        ));
+        let missing = SymbolPath::new("krate::Missing", SymbolKind::Struct);
+        let error = assumed_change(&graph, &missing, Assume::Body).expect_err("no symbol");
+        assert_eq!(error, WhatIfError::NotFound("krate::Missing".to_owned()));
+    }
+
+    #[test]
+    fn the_path_must_match_exactly() {
+        // A shorter path or another kind names a different symbol; nothing is guessed.
+        let graph = graph_with("krate::Point", SymbolKind::Struct, false);
+        let short = SymbolPath::new("Point", SymbolKind::Struct);
+        assert!(assumed_change(&graph, &short, Assume::Body).is_err());
+        let other_kind = SymbolPath::new("krate::Point", SymbolKind::Enum);
+        assert!(assumed_change(&graph, &other_kind, Assume::Signature).is_err());
     }
 }

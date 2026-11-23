@@ -24,9 +24,6 @@ pub enum Error {
     /// An ignore pattern is not a usable glob.
     #[error(transparent)]
     Ignore(#[from] crate::config::PatternError),
-    /// A symbol the user named could not be found.
-    #[error(transparent)]
-    Lookup(#[from] crate::impact::lookup::LookupError),
     /// A what-if query does not fit the symbol it names.
     #[error(transparent)]
     WhatIf(#[from] crate::impact::whatif::WhatIfError),
@@ -48,9 +45,8 @@ impl Error {
     pub fn hint(&self) -> Option<String> {
         let hint = match self {
             Error::Ignore(error) => return error.hint(),
-            Error::Lookup(error)
-            | Error::WhatIf(crate::impact::whatif::WhatIfError::Lookup(error)) => {
-                return lookup_hint(error);
+            Error::WhatIf(crate::impact::whatif::WhatIfError::NotFound(_)) => {
+                "the working tree changed since the symbol was listed; compare again"
             }
             Error::WhatIf(crate::impact::whatif::WhatIfError::WrongKind { .. }) => {
                 "assume a kind of change that fits the symbol, such as a body or signature change"
@@ -99,22 +95,6 @@ impl Error {
             }
         };
         Some(hint.to_owned())
-    }
-}
-
-/// What to try after a symbol lookup failed.
-fn lookup_hint(error: &crate::impact::lookup::LookupError) -> Option<String> {
-    use crate::impact::lookup::LookupError;
-    match error {
-        LookupError::NotFound { suggestions, .. } if suggestions.is_empty() => Some(
-            "write the path as the result shows it, such as `my_crate::module::item`".to_owned(),
-        ),
-        LookupError::NotFound { suggestions, .. } => {
-            Some(format!("did you mean {}?", suggestions.join(", ")))
-        }
-        LookupError::Ambiguous { candidates, .. } => {
-            Some(format!("use a longer path: {}", candidates.join(", ")))
-        }
     }
 }
 

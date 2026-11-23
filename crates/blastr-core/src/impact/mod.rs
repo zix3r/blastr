@@ -1,7 +1,6 @@
 //! Impact analysis: from the structural changes between two graphs to the
 //! items they can affect, ranked, with the evidence for each.
 
-pub mod lookup;
 mod propagate;
 mod rules;
 mod select;

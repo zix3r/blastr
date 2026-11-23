@@ -581,7 +581,7 @@ impl<W: Write + Send> Server<W> {
         let started = Instant::now();
         match engine.what_if(
             repo_root,
-            &symbol.path,
+            symbol,
             assume,
             options,
             params,
