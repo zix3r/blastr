@@ -16,12 +16,12 @@ use blastr_model::{
     DiffResult, FileStatus, Progress, RevSpec, RevisionGraph, Source,
 };
 
-use crate::config::IgnoreSet;
 use crate::engine::{
     Engine, GraphRequest, macros_limit, manifest_changes_of_repo, toolchain_version, union_of,
 };
 use crate::error::{Error, Result};
 use crate::impact::ImpactInput;
+use blastr_model::IgnoreSet;
 
 /// What a refresh found.
 #[derive(Debug, Clone, PartialEq)]

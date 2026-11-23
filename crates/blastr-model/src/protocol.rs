@@ -12,14 +12,13 @@
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 
-use blastr_model::{
-    Analysis, AnalysisOptions, AnalysisParams, Assume, DiffResult, RevSpec, RevisionGraph,
-    SymbolPath,
-};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::engine::CacheStatus;
+use crate::{
+    Analysis, AnalysisOptions, AnalysisParams, Assume, DiffResult, RevSpec, RevisionGraph,
+    SymbolPath,
+};
 
 /// Version of the message protocol.
 ///
@@ -148,13 +147,27 @@ impl Failure {
     }
 }
 
-impl From<&crate::Error> for Failure {
-    fn from(error: &crate::Error) -> Failure {
-        Failure {
-            message: error.to_string(),
-            hint: error.hint(),
-        }
-    }
+/// What the cache holds and where it lives: revision graphs, the analyses
+/// computed from them and materialised snapshots.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CacheStatus {
+    /// Number of cached graphs.
+    pub graphs: u64,
+    /// Total size of the cached graphs, in bytes.
+    pub graph_bytes: u64,
+    /// Number of cached analyses: comparisons whose impact analysis is
+    /// stored and reused instead of computed again.
+    pub results: u64,
+    /// Total size of the cached analyses, in bytes.
+    pub result_bytes: u64,
+    /// Number of materialised snapshots.
+    pub snapshots: u64,
+    /// Total size of the snapshots on disk, in bytes.
+    pub snapshot_bytes: u64,
+    /// The cache directory.
+    pub cache_dir: PathBuf,
+    /// Directory holding materialised snapshots.
+    pub snapshots_dir: PathBuf,
 }
 
 /// A commit the window names in its title bar.
@@ -386,7 +399,7 @@ fn invalid_input(message: impl Into<String>) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use blastr_model::{AnalysisOptions, ExecMode, RevSpec};
+    use crate::{AnalysisOptions, ExecMode, RevSpec};
 
     use super::*;
 
@@ -429,9 +442,9 @@ mod tests {
                     generation: 3,
                 },
                 repo: PathBuf::from("/tmp/project"),
-                symbol: blastr_model::SymbolPath {
+                symbol: crate::SymbolPath {
                     path: "app::total".to_owned(),
-                    kind: blastr_model::SymbolKind::Function,
+                    kind: crate::SymbolKind::Function,
                     disambiguator: 1,
                 },
                 assume: Assume::VariantRemoved,

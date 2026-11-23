@@ -10,7 +10,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::Duration;
 
 use blastr_core::Engine;
-use blastr_core::service::protocol::{self, Failure, JobId, JobKind, Request, Response};
+use blastr_model::protocol::{self, Failure, JobId, JobKind, Request, Response};
 use blastr_model::{Analysis, AnalysisOptions, AnalysisParams, CancelToken, NoProgress, RevSpec};
 
 /// The library of the crate before the change.

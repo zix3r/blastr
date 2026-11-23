@@ -5,7 +5,7 @@
 //! reason, a limit or a test target is called, and where an item is.
 //! Everything is a pure function of the data it is given.
 
-use blastr_model::{
+use crate::{
     Analysis, AnalysisOptions, Certainty, Change, ChangeDetail, ChangeKind, Delta, EdgeKind,
     EvidencePath, EvidenceStep, ImpactClass, ImpactItem, ImpactTags, Limit, Location, Reason,
     TargetKind, TestCommand, TestReason, Visibility,
@@ -638,7 +638,7 @@ mod short_name_tests {
 
 #[cfg(test)]
 mod tests {
-    use blastr_model::{RelPath, Span, SymbolKind, SymbolPath};
+    use crate::{RelPath, Span, SymbolKind, SymbolPath};
 
     use super::*;
 

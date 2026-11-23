@@ -19,12 +19,14 @@ use blastr_model::{
     RevSpec, RevisionGraph, Source, SymbolPath,
 };
 
+use blastr_model::protocol::CacheStatus;
+
 use crate::cache::{Cache, Kind};
 use crate::codec;
-use crate::config::IgnoreSet;
 use crate::error::{Error, Result};
 use crate::hunks::{changed_lines, overlaps};
 use crate::impact::ImpactInput;
+use blastr_model::IgnoreSet;
 
 /// The toolchain recorded in an analysis key when `rustc --version` cannot be run.
 const UNKNOWN_TOOLCHAIN: &str = "unknown";
@@ -1075,29 +1077,6 @@ pub struct DiffOutput {
     pub base: Arc<RevisionGraph>,
     /// The graph of the head directory.
     pub head: Arc<RevisionGraph>,
-}
-
-/// What the cache holds and where it lives: revision graphs, the analyses
-/// computed from them and materialised snapshots.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct CacheStatus {
-    /// Number of cached graphs.
-    pub graphs: u64,
-    /// Total size of the cached graphs, in bytes.
-    pub graph_bytes: u64,
-    /// Number of cached analyses: comparisons whose impact analysis is
-    /// stored and reused instead of computed again.
-    pub results: u64,
-    /// Total size of the cached analyses, in bytes.
-    pub result_bytes: u64,
-    /// Number of materialised snapshots.
-    pub snapshots: u64,
-    /// Total size of the snapshots on disk, in bytes.
-    pub snapshot_bytes: u64,
-    /// The cache directory.
-    pub cache_dir: PathBuf,
-    /// Directory holding materialised snapshots.
-    pub snapshots_dir: PathBuf,
 }
 
 /// The cache key of an analysis: BLAKE3, as lowercase hexadecimal, of a fixed

@@ -6,7 +6,7 @@
 
 use gpui_kit::prelude::*;
 
-use blastr_core::wording;
+use blastr_model::wording;
 use blastr_model::{
     Change, ChangeDetail, ChangeKind, Confidence, FileStatus, ImpactClass, RelPath, SymbolKind,
     TestCommand,

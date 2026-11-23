@@ -652,13 +652,10 @@ fn candidate_step(step: &EvidenceStep) -> StepKey {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        config::IgnoreSet,
-        impact::rules::testkit::{GraphBuilder, change, detailed, member},
-    };
+    use crate::impact::rules::testkit::{GraphBuilder, change, detailed, member};
     use blastr_model::{
-        AnalysisParams, ChangeDetail, ChangeKind, Delta, EdgeDetail, EdgeKind, RevisionGraph,
-        SymbolKind, SymbolPath, Visibility,
+        AnalysisParams, ChangeDetail, ChangeKind, Delta, EdgeDetail, EdgeKind, IgnoreSet,
+        RevisionGraph, SymbolKind, SymbolPath, Visibility,
     };
 
     /// An empty graph, for changes that read one side only.

@@ -6,7 +6,7 @@
 //! file: this module only compiles the patterns and answers whether a path
 //! matches one of them.
 
-use blastr_model::RelPath;
+use crate::RelPath;
 
 /// What can go wrong while compiling an ignore pattern.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]

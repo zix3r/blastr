@@ -12,7 +12,7 @@
 
 use std::path::{Path, PathBuf};
 
-use blastr_core::config::IgnoreSet;
+use blastr_model::IgnoreSet;
 use blastr_model::{AnalysisOptions, AnalysisParams, Confidence, ExecMode, RankingParams};
 use serde::{Deserialize, Serialize};
 

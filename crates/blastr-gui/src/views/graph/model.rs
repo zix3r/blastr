@@ -14,7 +14,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use blastr_core::wording;
+use blastr_model::wording;
 use blastr_model::{
     Analysis, Certainty, Change, ChangeDetail, ChangeKind, Confidence, Delta, ImpactClass,
     RevisionGraph, SymbolKind, SymbolPath,

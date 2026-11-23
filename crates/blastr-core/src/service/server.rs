@@ -25,11 +25,12 @@ use blastr_model::{
     RevisionGraph, SymbolPath,
 };
 
-use super::protocol::{
-    self, Commit, Failure, JobId, OpenedRepository, Report, Repository, Request, Response,
-};
-use crate::engine::{CacheStatus, Engine, build_id};
+use crate::engine::{Engine, build_id};
 use crate::session::{Session, SessionRequest};
+use blastr_model::protocol::{
+    self, CacheStatus, Commit, Failure, JobId, OpenedRepository, Report, Repository, Request,
+    Response,
+};
 
 /// How often a watching session asks whether anything changed.
 const WATCH_INTERVAL: Duration = Duration::from_millis(250);

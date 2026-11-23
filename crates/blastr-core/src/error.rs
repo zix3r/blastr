@@ -23,7 +23,7 @@ pub enum Error {
     Cancelled,
     /// An ignore pattern is not a usable glob.
     #[error(transparent)]
-    Ignore(#[from] crate::config::PatternError),
+    Ignore(#[from] blastr_model::PatternError),
     /// A what-if query does not fit the symbol it names.
     #[error(transparent)]
     WhatIf(#[from] crate::impact::whatif::WhatIfError),
@@ -99,6 +99,15 @@ impl From<blastr_model::Cancelled> for Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+impl From<&Error> for blastr_model::protocol::Failure {
+    fn from(error: &Error) -> Self {
+        blastr_model::protocol::Failure {
+            message: error.to_string(),
+            hint: error.hint(),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

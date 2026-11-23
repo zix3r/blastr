@@ -22,8 +22,8 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use blastr_core::Progress as _;
-use blastr_core::service::protocol::{self, JobId, JobKind, Request, Response};
+use blastr_model::Progress as _;
+use blastr_model::protocol::{self, JobId, JobKind, Request, Response};
 use blastr_model::{
     Analysis, AnalysisOptions, AnalysisParams, Assume, CancelToken, CommitInfo, DiffResult,
     RevSpec, RevisionGraph, SymbolPath,
@@ -765,11 +765,11 @@ fn mismatch(protocol: u32, build: &str) -> Option<String> {
         ));
     }
     let version = build.split('+').next().unwrap_or(build);
-    if version != blastr_core::VERSION {
+    if version != blastr_model::VERSION {
         return Some(format!(
             "it is version {version} while this window is version {}; \
              install both programs from the same build of Blastr",
-            blastr_core::VERSION
+            blastr_model::VERSION
         ));
     }
     None
@@ -838,7 +838,7 @@ fn read_commits(root: &Path, skip: usize, limit: usize) -> Result<Vec<CommitInfo
 
 #[cfg(test)]
 mod tests {
-    use blastr_core::service::protocol::{Failure as WireFailure, JobKind, Report};
+    use blastr_model::protocol::{Failure as WireFailure, JobKind, Report};
 
     use super::*;
 
@@ -1001,7 +1001,7 @@ mod tests {
 
     #[test]
     fn an_engine_of_another_build_is_refused() {
-        let this_build = format!("{}+abcd1234", blastr_core::VERSION);
+        let this_build = format!("{}+abcd1234", blastr_model::VERSION);
         assert!(mismatch(protocol::PROTOCOL_VERSION, &this_build).is_none());
         let wrong_protocol =
             mismatch(protocol::PROTOCOL_VERSION + 1, &this_build).expect("a mismatched protocol");

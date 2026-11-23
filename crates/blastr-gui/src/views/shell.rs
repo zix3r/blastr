@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use blastr_core::wording;
+use blastr_model::wording;
 use blastr_model::{Analysis, Assume, Change, ImpactItem, Location, Source, SymbolPath};
 use gpui_kit::Focusable as _;
 use gpui_kit::component::Disableable as _;

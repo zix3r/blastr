@@ -662,7 +662,6 @@ dependencies = [
 name = "blastr-gui"
 version = "0.1.1"
 dependencies = [
- "blastr-core",
  "blastr-git",
  "blastr-model",
  "gpui-kit",
@@ -678,6 +677,7 @@ version = "0.1.1"
 dependencies = [
  "blake3",
  "directories",
+ "postcard",
  "serde",
  "serde_json",
  "thiserror 2.0.21",

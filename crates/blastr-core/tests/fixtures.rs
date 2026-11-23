@@ -15,8 +15,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use blastr_core::Engine;
-use blastr_core::config::IgnoreSet;
 use blastr_core::impact::{ImpactInput, ImpactOutput, analyze};
+use blastr_model::IgnoreSet;
 use blastr_model::{
     AnalysisOptions, AnalysisParams, CancelToken, Certainty, Change, ChangeDetail, ChangeKind,
     Confidence, Delta, Edge, EdgeDetail, EdgeKind, GraphIndex, ImpactClass, ImpactItem, NoProgress,

@@ -15,7 +15,7 @@ use gpui_kit::prelude::*;
 use std::ops::Range;
 use std::sync::Arc;
 
-use blastr_core::wording;
+use blastr_model::wording;
 use gpui_kit::component::scroll::ScrollbarAxis;
 use gpui_kit::component::{Icon, IconName, h_flex, v_flex};
 use gpui_kit::{

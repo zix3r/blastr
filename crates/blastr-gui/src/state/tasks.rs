@@ -7,7 +7,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use blastr_core::CancelToken;
+use blastr_model::CancelToken;
 
 use super::loadable::Progress;
 
@@ -106,7 +106,7 @@ impl ProgressCell {
     }
 }
 
-impl blastr_core::Progress for ProgressCell {
+impl blastr_model::Progress for ProgressCell {
     fn report(&self, phase: &str, done: u64, total: Option<u64>) {
         if let Ok(mut guard) = self.inner.lock() {
             guard.0 += 1;
@@ -121,7 +121,7 @@ impl blastr_core::Progress for ProgressCell {
 
 #[cfg(test)]
 mod tests {
-    use blastr_core::Progress as _;
+    use blastr_model::Progress as _;
 
     use super::*;
 

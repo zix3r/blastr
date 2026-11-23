@@ -78,15 +78,6 @@ impl Failure {
     }
 }
 
-impl From<&blastr_core::Error> for Failure {
-    fn from(error: &blastr_core::Error) -> Failure {
-        Failure {
-            message: error.to_string(),
-            hint: error.hint(),
-        }
-    }
-}
-
 /// A value a background task produces.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum Loadable<T> {

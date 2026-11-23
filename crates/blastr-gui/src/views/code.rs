@@ -28,7 +28,7 @@ use gpui_kit::{
     Window, div, point, px,
 };
 
-use blastr_core::wording;
+use blastr_model::wording;
 use blastr_model::{Location, RelPath, Source};
 
 use super::shell::{Shell, Tab};

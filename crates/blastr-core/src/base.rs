@@ -23,11 +23,11 @@ use blastr_model::{
     FileStatus, Progress, RelPath, RevisionGraph, Source,
 };
 
-use crate::config::IgnoreSet;
 use crate::engine::{Engine, collect_limits};
 use crate::error::{Error, Result};
 use crate::hunks::changed_lines;
 use crate::impact::ImpactInput;
+use blastr_model::IgnoreSet;
 
 /// An edit of one file of a project: new content, or none to remove it.
 pub use blastr_ra::FileEdit;

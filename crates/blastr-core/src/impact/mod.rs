@@ -11,7 +11,7 @@ use blastr_model::{
     TestSelection,
 };
 
-use crate::config::IgnoreSet;
+use blastr_model::IgnoreSet;
 
 /// Everything an impact analysis reads.
 #[derive(Debug, Clone, Copy)]

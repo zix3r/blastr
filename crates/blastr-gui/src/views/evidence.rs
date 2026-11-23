@@ -9,7 +9,7 @@ use gpui_kit::prelude::*;
 
 use std::ops::Range;
 
-use blastr_core::wording;
+use blastr_model::wording;
 use blastr_model::{
     Analysis, Change, ChangeDetail, ChangeKind, Confidence, Delta, ImpactClass, ImpactItem,
 };
