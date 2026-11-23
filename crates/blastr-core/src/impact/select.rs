@@ -3,7 +3,7 @@
 //!
 //! A test is a head-side symbol flagged as a test. It is selected when a
 //! change touches it, when an added or renamed item contains it, or when
-//! impact analysis reaches it. Selected tests are grouped by their Cargo
+//! impact analysis reaches it at any depth. Selected tests are grouped by their Cargo
 //! target and narrowed to module filters, because running a whole target is
 //! wasteful once only a few of its tests are affected. A selection that would
 //! need many filters, or that covers most of a target, runs the whole target
@@ -12,8 +12,8 @@
 use std::collections::{BTreeMap, HashSet};
 
 use blastr_model::{
-    Change, ChangeKind, ImpactItem, RevisionGraph, SelectedTest, Symbol, SymbolId, SymbolPath,
-    TargetKind, TestCommand, TestReason, TestSelection,
+    Change, ChangeKind, RevisionGraph, SelectedTest, Symbol, SymbolId, SymbolPath, TargetKind,
+    TestCommand, TestReason, TestSelection,
 };
 
 /// The most filters a command carries before it runs its whole target instead.
@@ -27,7 +27,7 @@ const WHOLE_TARGET_SHARE: u64 = 60;
 pub(crate) fn select_tests(
     head: &RevisionGraph,
     changes: &[Change],
-    items: &[ImpactItem],
+    reached: &HashSet<SymbolId>,
 ) -> TestSelection {
     // Changes that touch a test directly. A removed item is gone from the head
     // side, so it cannot name a head test; formatting and manifest changes say
@@ -48,14 +48,13 @@ pub(crate) fn select_tests(
         .filter(|change| matches!(change.kind, ChangeKind::Added | ChangeKind::Renamed))
         .map(|change| &change.symbol)
         .collect();
-    let reached: HashSet<&SymbolPath> = items.iter().map(|item| &item.symbol).collect();
 
     let mut total = 0_u32;
     let mut selected: Vec<SelectedTest> = Vec::new();
     let mut targets: BTreeMap<(String, u8, String), (TargetKind, Vec<TargetTest>)> =
         BTreeMap::new();
 
-    for symbol in &head.symbols {
+    for (index, symbol) in head.symbols.iter().enumerate() {
         if !symbol.flags.is_test {
             continue;
         }
@@ -65,7 +64,7 @@ pub(crate) fn select_tests(
             || has_introduced_ancestor(&head.symbols, symbol, &introduced)
         {
             Some(TestReason::Changed)
-        } else if reached.contains(&symbol.path) {
+        } else if reached.contains(&SymbolId(index as u32)) {
             Some(TestReason::Reached)
         } else {
             None
@@ -255,8 +254,8 @@ fn target_rank(kind: TargetKind) -> u8 {
 mod tests {
     use super::*;
     use blastr_model::{
-        ChangeDetail, Confidence, CrateId, CrateInfo, ImpactClass, ImpactTags, Location, RelPath,
-        Span, SymbolFlags, SymbolKind, Visibility,
+        ChangeDetail, CrateId, CrateInfo, Location, RelPath, Span, SymbolFlags, SymbolKind,
+        Visibility,
     };
 
     /// The location every symbol of a test graph shares.
@@ -345,19 +344,21 @@ mod tests {
         )
     }
 
-    /// An affected item for the function at `path`.
-    fn item(path: &str) -> ImpactItem {
-        ImpactItem {
-            symbol: SymbolPath::new(path, SymbolKind::Function),
-            location: location(),
-            class: ImpactClass::Behaviour,
-            confidence: Confidence::Definite,
-            score: 1.0,
-            distance: 1,
-            paths: Vec::new(),
-            path_count: 1,
-            tags: ImpactTags::default(),
-        }
+    /// A reached item: the function at `path`.
+    fn item(path: &str) -> String {
+        path.to_owned()
+    }
+
+    /// Selects the tests of `head` with the items at `reached` reached.
+    fn select(head: &RevisionGraph, changes: &[Change], reached: &[String]) -> TestSelection {
+        let reached = head
+            .symbols
+            .iter()
+            .enumerate()
+            .filter(|(_, symbol)| reached.contains(&symbol.path.path))
+            .map(|(index, _)| SymbolId(index as u32))
+            .collect();
+        select_tests(head, changes, &reached)
     }
 
     /// A change of `kind` to the symbol at `path`.
@@ -374,7 +375,7 @@ mod tests {
     /// A head graph of `billing` with `count` tests at the crate root, named
     /// `t01`, `t02`, …, which no module prefix shortens, and an affected item
     /// for each of the first `selected` of them.
-    fn root_tests(count: usize, selected: usize) -> (RevisionGraph, Vec<ImpactItem>) {
+    fn root_tests(count: usize, selected: usize) -> (RevisionGraph, Vec<String>) {
         let mut names: Vec<String> = vec!["billing".to_owned()];
         names.extend((1..=count).map(|index| format!("billing::t{index:02}!")));
         let specs: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -416,7 +417,7 @@ mod tests {
             ),
         ];
         let items = [item("billing::tax::rounds"), item("billing::tax::totals")];
-        let selection = select_tests(&head, &changes, &items);
+        let selection = select(&head, &changes, &items);
 
         assert_eq!(selection.total, 3, "the helper is not a test");
         let reasons: Vec<(&str, TestReason)> = selection
@@ -458,7 +459,7 @@ mod tests {
             change(ChangeKind::Added, "billing::fresh", SymbolKind::Module),
             renamed,
         ];
-        let selection = select_tests(&head, &changes, &[]);
+        let selection = select(&head, &changes, &[]);
 
         assert_eq!(selection.selected.len(), 2);
         assert!(
@@ -480,7 +481,7 @@ mod tests {
             item("billing::tax::rounds"),
             item("billing::invoice::totals"),
         ];
-        let selection = select_tests(&head, &[], &items);
+        let selection = select(&head, &[], &items);
 
         assert_eq!(selection.selected.len(), 2);
         assert_eq!(filters(&selection), vec![Vec::<String>::new()]);
@@ -491,7 +492,7 @@ mod tests {
     #[test]
     fn more_filters_than_the_limit_run_the_whole_target() {
         let (head, items) = root_tests(29, 9);
-        let selection = select_tests(&head, &[], &items);
+        let selection = select(&head, &[], &items);
 
         assert_eq!(selection.commands.len(), 1);
         let command = &selection.commands[0];
@@ -507,7 +508,7 @@ mod tests {
     #[test]
     fn the_limit_itself_still_names_every_selected_test() {
         let (head, items) = root_tests(28, 8);
-        let selection = select_tests(&head, &[], &items);
+        let selection = select(&head, &[], &items);
 
         let expected: Vec<String> = (1..=8).map(|index| format!("t{index:02}")).collect();
         assert_eq!(filters(&selection), vec![expected]);
@@ -518,7 +519,7 @@ mod tests {
     #[test]
     fn a_selection_covering_most_of_a_target_runs_the_whole_target() {
         let (head, items) = root_tests(10, 6);
-        let selection = select_tests(&head, &[], &items);
+        let selection = select(&head, &[], &items);
 
         assert_eq!(filters(&selection), vec![Vec::<String>::new()]);
         assert_eq!(selection.commands[0].tests, 6);
@@ -528,7 +529,7 @@ mod tests {
     #[test]
     fn a_selection_just_under_the_share_keeps_its_filters() {
         let (head, items) = root_tests(10, 5);
-        let selection = select_tests(&head, &[], &items);
+        let selection = select(&head, &[], &items);
 
         let expected: Vec<String> = (1..=5).map(|index| format!("t{index:02}")).collect();
         assert_eq!(filters(&selection), vec![expected]);
@@ -542,7 +543,7 @@ mod tests {
             &[("billing", "billing@1.2.0", TargetKind::Lib, "billing")],
             &["billing", "billing::tax::rounds!"],
         );
-        let selection = select_tests(&head, &[], &[item("billing::tax::rounds")]);
+        let selection = select(&head, &[], &[item("billing::tax::rounds")]);
 
         assert_eq!(selection.commands.len(), 1);
         assert_eq!(selection.commands[0].package, "billing@1.2.0");
@@ -565,7 +566,7 @@ mod tests {
             item("billing::tax::tests::rounds"),
             item("billing::tax::tests::totals"),
         ];
-        let selection = select_tests(&head, &[], &items);
+        let selection = select(&head, &[], &items);
 
         assert_eq!(filters(&selection), vec![vec!["tax::tests::".to_owned()]]);
         assert_eq!(selection.commands[0].tests, 2);
@@ -578,7 +579,7 @@ mod tests {
             "billing::tax::tests::rounds!",
             "billing::invoice::tests::totals!",
         ]);
-        let selection = select_tests(&head, &[], &[item("billing::tax::tests::rounds")]);
+        let selection = select(&head, &[], &[item("billing::tax::tests::rounds")]);
 
         assert_eq!(filters(&selection), vec![vec!["tax::".to_owned()]]);
     }
@@ -590,7 +591,7 @@ mod tests {
             "billing::tax::tests::rounds!",
             "billing::ratings::tax::tests::slow!",
         ]);
-        let selection = select_tests(&head, &[], &[item("billing::tax::tests::rounds")]);
+        let selection = select(&head, &[], &[item("billing::tax::tests::rounds")]);
 
         assert_eq!(
             filters(&selection),
@@ -625,7 +626,7 @@ mod tests {
             item("alpha::a_check"),
             item("alpha_tests::two"),
         ];
-        let selection = select_tests(&head, &[], &items);
+        let selection = select(&head, &[], &items);
 
         let paths: Vec<&str> = selection
             .selected

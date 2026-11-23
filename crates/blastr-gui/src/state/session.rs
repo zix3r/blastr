@@ -642,7 +642,6 @@ mod tests {
             },
             class,
             confidence: blastr_model::Confidence::Likely,
-            score: 0.5,
             distance: 1,
             paths: Vec::new(),
             path_count: 0,

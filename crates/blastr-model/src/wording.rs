@@ -354,17 +354,6 @@ pub fn limit_parts(analysis: &Analysis) -> Vec<String> {
         let noun = count_noun(count, "coarse rule", "coarse rules");
         parts.push(format!("{count} {noun}"));
     }
-    if limits.beyond_depth > 0 {
-        let count = limits.beyond_depth;
-        let depth = analysis.params.depth;
-        let noun = count_noun(count, "item", "items");
-        parts.push(format!("{count} {noun} beyond depth {depth}"));
-    }
-    if limits.below_floor > 0 {
-        let count = limits.below_floor;
-        let noun = count_noun(count, "item", "items");
-        parts.push(format!("{count} {noun} below the score floor"));
-    }
     if limits.below_confidence > 0 {
         let count = limits.below_confidence;
         let level = analysis.params.min_confidence;

@@ -1570,10 +1570,6 @@ mod tests {
         let mut ignored = params.clone();
         ignored.ignore.push("vendor/**".to_owned());
         assert_ne!(key, result_key(&base, &head, &ignored).unwrap());
-
-        let mut lighter = params.clone();
-        lighter.ranking.decay = 0.5;
-        assert_ne!(key, result_key(&base, &head, &lighter).unwrap());
     }
 
     #[test]

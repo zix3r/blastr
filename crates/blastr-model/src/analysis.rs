@@ -90,14 +90,12 @@ pub struct EvidencePath {
     pub change: u32,
     /// Why the first step applies.
     pub reason: Reason,
-    /// The class this path gives the item: the rule's class when the path
-    /// has one step, `Behaviour` when it has more.
+    /// The class this path gives the item: the class of the change's first
+    /// step when the path is that step alone, `Behaviour` when it goes on.
     pub class: ImpactClass,
     /// The steps, starting next to the change: `steps[0].to` is the changed
     /// symbol (or its container) and the last step's `from` is the item.
     pub steps: Vec<EvidenceStep>,
-    /// The score of this path.
-    pub score: f32,
 }
 
 /// Facts about an affected item worth showing next to it.
@@ -123,15 +121,15 @@ pub struct ImpactItem {
     pub location: Location,
     /// `Adaptation` when any of its paths is one, else `Behaviour`.
     pub class: ImpactClass,
-    /// The confidence of the best path of that class.
+    /// The confidence of the best path.
     pub confidence: Confidence,
-    /// The highest score among the paths of that class.
-    pub score: f32,
-    /// Number of steps of the best path of that class.
+    /// Number of steps of the best path.
     pub distance: u32,
-    /// The best paths, at most three, highest score first.
+    /// The best paths, at most three, best first: highest class, then highest
+    /// certainty, then fewest steps.
     pub paths: Vec<EvidencePath>,
-    /// How many distinct paths reached the item, including the ones not kept.
+    /// How many ways a path arrives at the item within the depth, including
+    /// the ones not kept.
     pub path_count: u32,
     /// Facts about the item.
     pub tags: ImpactTags,
@@ -202,37 +200,17 @@ pub struct ImpactLimits {
     pub candidate_steps: u32,
     /// First steps taken by a rule that cannot tell exactly who is affected.
     pub coarse_rules: u32,
-    /// Items that exist only beyond the depth limit.
-    pub beyond_depth: u32,
-    /// Items dropped because their score is below the floor.
-    pub below_floor: u32,
     /// Items dropped because their confidence is below the requested minimum.
     pub below_confidence: u32,
     /// Items dropped because their file matches an `ignore` pattern.
     pub ignored: u32,
 }
 
-/// The weights used to score evidence paths.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct RankingParams {
-    /// Multiplier applied for each step after the first.
-    pub decay: f32,
-    /// Weight of a candidate step; a resolved step weighs 1.
-    pub candidate_weight: f32,
-    /// Weight of the `Adaptation` class.
-    pub adaptation_weight: f32,
-    /// Weight of the `Behaviour` class.
-    pub behaviour_weight: f32,
-    /// Items scoring below this are counted, not listed.
-    pub score_floor: f32,
-}
-
 /// Everything that shapes an impact result besides the code itself.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AnalysisParams {
-    /// Scoring weights.
-    pub ranking: RankingParams,
-    /// Longest evidence path followed.
+    /// Most steps an item's path may take for the item to be listed. Test
+    /// selection is not limited by it.
     pub depth: u32,
     /// Lowest confidence listed.
     pub min_confidence: Confidence,
@@ -245,8 +223,8 @@ pub struct AnalysisParams {
 pub struct Analysis {
     /// What was compared and what changed structurally.
     pub diff: DiffResult,
-    /// The affected items, best first: by score descending, then distance,
-    /// then path.
+    /// The affected items, best first: adaptations before behaviour, then by
+    /// confidence descending, distance and path.
     pub items: Vec<ImpactItem>,
     /// The affected tests.
     pub tests: TestSelection,
@@ -297,22 +275,9 @@ impl Assume {
     }
 }
 
-impl Default for RankingParams {
-    fn default() -> Self {
-        RankingParams {
-            decay: 0.8,
-            candidate_weight: 0.5,
-            adaptation_weight: 1.0,
-            behaviour_weight: 0.8,
-            score_floor: 0.05,
-        }
-    }
-}
-
 impl Default for AnalysisParams {
     fn default() -> Self {
         AnalysisParams {
-            ranking: RankingParams::default(),
             depth: 8,
             min_confidence: Confidence::Possible,
             ignore: Vec::new(),
@@ -380,12 +345,10 @@ mod tests {
     }
 
     #[test]
-    fn defaults_are_the_tuned_ones() {
+    fn defaults_list_eight_steps_at_any_confidence() {
         let params = AnalysisParams::default();
         assert_eq!(params.depth, 8);
         assert_eq!(params.min_confidence, Confidence::Possible);
-        assert_eq!(params.ranking.decay, 0.8);
-        assert_eq!(params.ranking.candidate_weight, 0.5);
-        assert_eq!(params.ranking.score_floor, 0.05);
+        assert!(params.ignore.is_empty());
     }
 }

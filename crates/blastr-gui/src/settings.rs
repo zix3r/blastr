@@ -13,7 +13,7 @@
 use std::path::{Path, PathBuf};
 
 use blastr_model::IgnoreSet;
-use blastr_model::{AnalysisOptions, AnalysisParams, Confidence, ExecMode, RankingParams};
+use blastr_model::{AnalysisOptions, AnalysisParams, Confidence, ExecMode};
 use serde::{Deserialize, Serialize};
 
 use crate::editor::Editor;
@@ -577,7 +577,6 @@ impl Settings {
             },
         };
         let params = AnalysisParams {
-            ranking: RankingParams::default(),
             depth: analysis.depth,
             min_confidence: analysis.min_confidence,
             ignore: root
@@ -927,7 +926,6 @@ mod tests {
         assert_eq!(params.depth, 8);
         assert_eq!(params.min_confidence, Confidence::Likely);
         assert!(params.ignore.is_empty());
-        assert_eq!(params.ranking, RankingParams::default());
         assert!(settings.repositories.is_empty(), "nothing was written");
     }
 
