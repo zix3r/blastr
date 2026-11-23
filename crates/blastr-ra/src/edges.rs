@@ -623,15 +623,8 @@ impl<'db> Collector<'_, 'db> {
             return;
         }
         self.implicit(node, from);
-        // The pattern of a `for` loop binds the items, it names nothing the
-        // loop depends on.
-        let skipped = ast::ForExpr::cast(node.clone())
-            .and_then(|expr| expr.pat())
-            .map(|pat| pat.syntax().clone());
         for child in node.children() {
-            if skipped.as_ref() != Some(&child) {
-                self.visit(&child, from, depth, false);
-            }
+            self.visit(&child, from, depth, false);
         }
     }
 
