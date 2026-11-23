@@ -1,8 +1,3 @@
 /target
 /fixtures/*/target
 /fixtures/*/Cargo.lock
-/validation/projects/*/target
-/validation/harness/target
-/validation/harness/testdata/*/target
-/validation/harness/testdata/*/Cargo.lock
-/validation/results/*.json

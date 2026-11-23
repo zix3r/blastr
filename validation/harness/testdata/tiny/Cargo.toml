@@ -1,5 +1,0 @@
-# Test data: a two-crate workspace the harness's own tests run its checks on.
-# Not part of Blastr's workspace and not part of the harness's workspace.
-[workspace]
-resolver = "3"
-members = ["app", "geometry"]
