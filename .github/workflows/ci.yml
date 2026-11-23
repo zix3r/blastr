@@ -58,10 +58,7 @@ jobs:
             clang \
             lld \
             pkg-config \
-            libssl-dev \
             libzstd-dev \
-            libsqlite3-dev \
-            libgit2-dev \
             libglib2.0-dev \
             libfontconfig-dev \
             libwayland-dev \
@@ -100,10 +97,7 @@ jobs:
             clang \
             lld \
             pkg-config \
-            libssl-dev \
             libzstd-dev \
-            libsqlite3-dev \
-            libgit2-dev \
             libglib2.0-dev \
             libfontconfig-dev \
             libwayland-dev \

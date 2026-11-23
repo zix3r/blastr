@@ -91,9 +91,9 @@ Both programs land in `target/release`.
 <summary>Linux: system packages</summary>
 
 ```sh
-sudo apt-get install -y build-essential cmake clang lld pkg-config libssl-dev libzstd-dev \
-  libsqlite3-dev libgit2-dev libglib2.0-dev libfontconfig-dev libwayland-dev libx11-xcb-dev \
-  libxkbcommon-dev libxkbcommon-x11-dev libvulkan1 libvulkan-dev libasound2-dev
+sudo apt-get install -y build-essential cmake clang lld pkg-config libzstd-dev libglib2.0-dev \
+  libfontconfig-dev libwayland-dev libx11-xcb-dev libxkbcommon-dev libxkbcommon-x11-dev \
+  libvulkan1 libvulkan-dev libasound2-dev
 ```
 </details>
 

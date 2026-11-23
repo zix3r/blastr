@@ -74,7 +74,7 @@ jobs:
       - name: Install system packages
         run: |
           pacman -Syu --noconfirm --needed \
-            base-devel git rustup cmake clang lld pkgconf openssl zstd sqlite libgit2 \
+            base-devel git rustup cmake clang lld pkgconf zstd \
             glib2 fontconfig wayland libxkbcommon libxkbcommon-x11 libx11 libxcb \
             vulkan-icd-loader vulkan-headers alsa-lib
 
@@ -123,8 +123,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential cmake clang lld pkg-config libssl-dev libzstd-dev libsqlite3-dev \
-            libgit2-dev libglib2.0-dev libfontconfig-dev libwayland-dev libx11-xcb-dev \
+            build-essential cmake clang lld pkg-config libzstd-dev \
+            libglib2.0-dev libfontconfig-dev libwayland-dev libx11-xcb-dev \
             libxkbcommon-dev libxkbcommon-x11-dev libvulkan1 libvulkan-dev libasound2-dev
 
       - name: Show pinned Rust toolchain
