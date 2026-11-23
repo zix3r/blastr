@@ -111,8 +111,6 @@ pub(crate) struct FetchedGraph {
     pub(crate) graph: Arc<RevisionGraph>,
     /// The cache key it belongs to; `None` when the source has no content id.
     pub(crate) key: Option<AnalysisKey>,
-    /// Whether the graph came from the cache.
-    pub(crate) from_cache: bool,
     /// The procedural-macro crates the graph may be missing knowledge of,
     /// sorted and without duplicates.
     pub(crate) missing_macros: Vec<String>,
@@ -202,39 +200,13 @@ impl Engine {
         &self.paths.config_dir
     }
 
-    /// Compares two sides of the repository at `repo_root`.
-    pub fn diff(
-        &self,
-        repo_root: &Path,
-        spec: &RevSpec,
-        options: &AnalysisOptions,
-        progress: &dyn Progress,
-        cancel: &CancelToken,
-    ) -> Result<DiffResult> {
-        cancel.check()?;
-        let root = blastr_git::discover(repo_root)?;
-        let repo = Repo::open(&root)?;
-        let comparison = repo.resolve(spec)?;
-        let toolchain = toolchain_version(repo.root());
-
-        let compared = self.compare(CompareRequest {
-            repo: &repo,
-            comparison: &comparison,
-            options,
-            toolchain: Some(toolchain.as_str()),
-            progress,
-            cancel,
-        })?;
-        Ok(compared.diff)
-    }
-
     /// Full impact analysis of a comparison in the repository at `repo_root`.
     /// Served from the result cache when possible.
     ///
     /// A comparison whose two graphs were analysed before with the same
     /// parameters is answered from the result cache without a snapshot or a
-    /// project load. Otherwise progress reports the phases of
-    /// [`Engine::diff`] followed by `impact`.
+    /// project load. Otherwise progress reports the phases of the structural
+    /// comparison followed by `impact`.
     pub fn analyze(
         &self,
         repo_root: &Path,
@@ -471,8 +443,7 @@ impl Engine {
     /// The structural comparison of both sides of `request`, together with the
     /// two graphs it was computed from.
     ///
-    /// Both [`Engine::diff`] and [`Engine::analyze`] start here; only the
-    /// impact step of the latter needs the graphs as well as the result.
+    /// [`Engine::analyze`] starts here.
     fn compare(&self, request: CompareRequest<'_>) -> Result<Compared> {
         let CompareRequest {
             repo,
@@ -645,57 +616,6 @@ impl Engine {
         })
     }
 
-    /// Builds (or fetches from the cache) the graph of one revision;
-    /// `rev` `None` means `HEAD`.
-    pub fn index(
-        &self,
-        repo_root: &Path,
-        rev: Option<&str>,
-        options: &AnalysisOptions,
-        progress: &dyn Progress,
-        cancel: &CancelToken,
-    ) -> Result<IndexReport> {
-        cancel.check()?;
-        let root = blastr_git::discover(repo_root)?;
-        let repo = Repo::open(&root)?;
-        let spec = RevSpec {
-            rev: Some(rev.unwrap_or("HEAD").to_owned()),
-            ..RevSpec::default()
-        };
-        // A root commit has nothing to compare against, and there is no other
-        // way to reach its graph, so the error is passed on as it is.
-        let comparison = repo.resolve(&spec)?;
-        let toolchain = toolchain_version(repo.root());
-
-        let fetched = self.graph_for(
-            Some(&repo),
-            &comparison.head,
-            GraphRequest {
-                options,
-                phase: "head",
-                toolchain: Some(toolchain.as_str()),
-                progress,
-                cancel,
-            },
-        )?;
-        let Some(key) = fetched.key else {
-            // Every source `Repo::resolve` produces has a content id, so the
-            // graph of a revision always has a key.
-            return Err(Error::Ra(blastr_ra::Error::Internal(
-                "the indexed revision has no content identifier".to_owned(),
-            )));
-        };
-        let graph = fetched.graph;
-
-        Ok(IndexReport {
-            key,
-            from_cache: fetched.from_cache,
-            symbols: graph.symbols.len(),
-            edges: graph.edges.len(),
-            unresolved: graph.unresolved.len(),
-        })
-    }
-
     /// The graph of one side of a comparison, from the cache when the same
     /// content was analysed before.
     ///
@@ -761,7 +681,7 @@ impl Engine {
     ///
     /// The returned graph, its analysis key (`None` when the source has no
     /// content id, which is the case for a plain directory and for a working
-    /// tree without a repository), whether it came from the cache and the
+    /// tree without a repository) and the
     /// procedural-macro crates it may be missing.
     ///
     /// A graph made from a project whose macros did not all load is not stored:
@@ -793,7 +713,6 @@ impl Engine {
             return Ok(FetchedGraph {
                 graph: Arc::new(graph),
                 key: Some(key.clone()),
-                from_cache: true,
                 // An incomplete graph is never stored, so what came back is
                 // complete whatever the machine that produced it could build.
                 missing_macros: Vec::new(),
@@ -830,7 +749,6 @@ impl Engine {
         Ok(FetchedGraph {
             graph: Arc::new(graph),
             key,
-            from_cache: false,
             missing_macros,
         })
     }
@@ -989,7 +907,7 @@ impl Engine {
     /// The graph of both sides of a directory comparison, the head reached by
     /// applying the changed files to the base side instead of loading it again.
     ///
-    /// This is the code path [`Engine::diff`] takes when both sides are the same
+    /// This is the code path [`Engine::analyze`] takes when both sides are the same
     /// project, exposed so that the tests can compare it with the two full loads
     /// of [`Engine::diff_dirs`]. `Ok(None)` when the directories do not share
     /// their `Cargo.toml` and `Cargo.lock`.
@@ -1186,21 +1104,6 @@ pub struct DiffOutput {
     pub base: Arc<RevisionGraph>,
     /// The graph of the head directory.
     pub head: Arc<RevisionGraph>,
-}
-
-/// What building the graph of one revision produced.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IndexReport {
-    /// The identity of the analysis.
-    pub key: AnalysisKey,
-    /// Whether the graph came from the cache.
-    pub from_cache: bool,
-    /// Number of symbols in the graph.
-    pub symbols: usize,
-    /// Number of edges in the graph.
-    pub edges: usize,
-    /// Number of unresolved references in the graph.
-    pub unresolved: usize,
 }
 
 /// What the cache holds and where it lives: revision graphs, the analyses

@@ -9,7 +9,7 @@
 //!
 //! `blastr_git` cannot create commits, so the two revisions are two directories
 //! written into a temporary directory: the overlay side goes through
-//! [`Engine::overlay_dirs`], which is the code path [`Engine::diff`] uses for a
+//! [`Engine::overlay_dirs`], which is the code path [`Engine::analyze`] uses for a
 //! repository, and the full side through [`Engine::diff_dirs`].
 
 use std::fs;

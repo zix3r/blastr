@@ -503,20 +503,6 @@ pub fn target_label(command: &TestCommand) -> String {
     }
 }
 
-/// The sentence naming the change a path starts at.
-pub fn origin_text(analysis: &Analysis, path: &EvidencePath) -> String {
-    match analysis.diff.changes.get(path.change as usize) {
-        Some(change) => format!(
-            "starts at the {} change of {}",
-            change.kind, change.symbol.path
-        ),
-        None => {
-            let symbol = path.steps.first().map_or("", |step| step.to.path.as_str());
-            format!("starts at a change of {symbol}")
-        }
-    }
-}
-
 /// What one step of an evidence path does, in a few words.
 ///
 /// The first step spells out the rule that reached it; later steps name the
@@ -577,14 +563,6 @@ pub fn test_reason_text(reason: TestReason) -> &'static str {
         TestReason::Changed => "changed",
         TestReason::Reached => "reached",
     }
-}
-
-/// `file:line` of the reference that makes an item affected: the last step of
-/// its best path. Empty when the item has no path.
-pub fn item_site(item: &ImpactItem) -> String {
-    best_path(item)
-        .and_then(|path| path.steps.last())
-        .map_or(String::new(), |step| site_text(&step.site))
 }
 
 /// `file:line` of a location.

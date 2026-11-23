@@ -41,9 +41,6 @@ pub enum Error {
         /// What the system reported for it.
         message: String,
     },
-    /// The feature exists in the interface but is not implemented yet.
-    #[error("`{0}` is not implemented yet")]
-    NotImplemented(&'static str),
 }
 
 impl Error {
@@ -61,7 +58,7 @@ impl Error {
             Error::SessionNotWatching(_) => {
                 "only the working tree can be followed, so compare a revision with it"
             }
-            Error::Cancelled | Error::NotImplemented(_) => {
+            Error::Cancelled => {
                 return None;
             }
             Error::Git(blastr_git::Error::NotARepository { .. }) => {
@@ -174,22 +171,13 @@ mod tests {
     }
 
     #[test]
-    fn no_hint_for_cancelled_and_unimplemented() {
+    fn no_hint_for_cancelled() {
         assert_eq!(Error::Cancelled.hint(), None);
-        assert_eq!(Error::NotImplemented("diff").hint(), None);
     }
 
     #[test]
     fn no_hint_for_other_git_and_store_errors() {
         assert_eq!(Error::Git(blastr_git::Error::Git("x".into())).hint(), None);
         assert_eq!(Error::Store(blastr_store::Error::NoUserDirs).hint(), None);
-    }
-
-    #[test]
-    fn not_implemented_display() {
-        assert_eq!(
-            Error::NotImplemented("diff").to_string(),
-            "`diff` is not implemented yet"
-        );
     }
 }
