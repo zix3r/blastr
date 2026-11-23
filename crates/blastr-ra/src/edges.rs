@@ -859,23 +859,26 @@ impl<'db> Collector<'_, 'db> {
         }
     }
 
-    /// Adds the edge of a name a pattern binds, when it is the shorthand of a
-    /// field (`Point { x }`), which matches the field.
+    /// Adds the edge of a name a pattern binds: the field of a shorthand
+    /// (`Point { x }`), or the constant or unit variant a bare name matches
+    /// (`MAX`, or `Idle` after `use State::*`).
     fn name(&mut self, name: &ast::Name, from: SymbolId) {
-        let Some(field) = name
-            .syntax()
-            .parent()
-            .filter(|parent| ast::IdentPat::can_cast(parent.kind()))
-            .and_then(|pat| pat.parent())
-            .and_then(ast::RecordPatField::cast)
-            .filter(|field| field.name_ref().is_none())
-        else {
+        let Some(pat) = name.syntax().parent().and_then(ast::IdentPat::cast) else {
             return;
         };
-        if let Some(NameClass::PatFieldShorthand { field_ref, .. }) =
-            self.guard(|| NameClass::classify(self.input.sema, name))
-        {
-            self.pattern_field(field_ref, field.syntax(), from);
+        match self.guard(|| NameClass::classify(self.input.sema, name)) {
+            Some(NameClass::PatFieldShorthand { field_ref, .. }) => {
+                if let Some(field) = pat.syntax().parent() {
+                    self.pattern_field(field_ref, &field, from);
+                }
+            }
+            Some(NameClass::ConstReference(
+                def @ (Definition::Adt(_) | Definition::EnumVariant(_) | Definition::Const(_)),
+            )) => {
+                let detail = self.match_detail(pat.syntax());
+                self.edge_to(def, from, EdgeKind::Matches, pat.syntax(), detail);
+            }
+            _ => {}
         }
     }
 
