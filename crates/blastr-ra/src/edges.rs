@@ -56,7 +56,8 @@ use crate::symbols::{DefKey, SymbolTable};
 /// an impl of one of these traits produces an edge. The list is also the
 /// pruning set: an operator whose traits have no implementation in the
 /// workspace cannot reach one, and asking rust-analyzer would force the type
-/// inference of the whole body for nothing.
+/// inference of the whole body for nothing. Only the standard library's traits count: a trait
+/// of the project that is merely named `Add` is not what `+` calls.
 const OPERATOR_TRAITS: &[&str] = &[
     "Add",
     "Sub",
@@ -342,7 +343,7 @@ impl<'db> Collector<'_, 'db> {
         let standard = self.is_std(trait_);
         if let Some(operator) = OPERATOR_TRAITS
             .iter()
-            .find(|known| **known == name.as_str())
+            .find(|known| standard && **known == name.as_str())
         {
             self.operators.insert(operator);
         }
