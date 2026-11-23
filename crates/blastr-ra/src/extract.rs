@@ -24,6 +24,7 @@ use ra_ap_hir::{
     HirFileId, Impl, InFile, MacroKind, Module, ModuleDef, Semantics, Trait,
     Visibility as HirVisibility, attach_db, db::HirDatabase,
 };
+use ra_ap_ide_db::RootDatabase;
 use ra_ap_ide_db::base_db::SourceDatabase;
 use ra_ap_syntax::ast;
 use ra_ap_syntax::{AstNode, SyntaxNode, TextRange, TextSize};
@@ -102,7 +103,7 @@ impl Workspace {
                 .iter()
                 .map(|member| member.resolved.krate.base())
                 .collect();
-            let assembler = Assembler::merge(walks, db, &locator, self, workspace_crates);
+            let assembler = Assembler::merge(walks, database, &locator, self, workspace_crates);
             Ok(assembler.finish(inactive))
         })
     }
@@ -1385,7 +1386,7 @@ impl<'a> Extractor<'a> {
 /// The walks of all member crates, joined into one graph.
 struct Assembler<'a> {
     /// The database, attached to the current thread.
-    db: &'a dyn HirDatabase,
+    db: &'a RootDatabase,
     /// The crates of the workspace members, as the database names them.
     workspace_crates: HashSet<BaseCrate>,
     /// Maps file ids and ranges to locations.
@@ -1404,7 +1405,7 @@ impl<'a> Assembler<'a> {
     /// Joins the walks of the member crates, in the order of the crates.
     fn merge(
         walks: Vec<Extractor<'a>>,
-        db: &'a dyn HirDatabase,
+        db: &'a RootDatabase,
         locator: &'a Locator<'a>,
         workspace: &'a Workspace,
         workspace_crates: HashSet<BaseCrate>,
@@ -1520,7 +1521,7 @@ impl<'a> Assembler<'a> {
             restricted: self.workspace.restricted,
         };
 
-        let sema = Semantics::new_dyn(self.db);
+        let sema = Semantics::new(self.db);
         let output = edges::collect(EdgeInput {
             db: self.db,
             sema: &sema,

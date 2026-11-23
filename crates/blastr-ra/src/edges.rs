@@ -38,10 +38,12 @@ use blastr_model::{
 };
 use ra_ap_hir::{
     Adt, AsAssocItem, AssocItem, AssocItemContainer, Crate, Field, Function, HirFileId, Impl,
-    InFile, Macro, ModuleDef, PathResolution, Semantics, Trait, Variant, db::HirDatabase,
+    InFile, Macro, ModuleDef, PathResolution, Semantics, Trait, db::HirDatabase,
 };
+use ra_ap_ide_db::RootDatabase;
 use ra_ap_ide_db::base_db::{Crate as BaseCrate, CrateOrigin};
-use ra_ap_syntax::ast::{HasArgList, HasAttrs, HasLoopBody};
+use ra_ap_ide_db::defs::{Definition, NameClass, NameRefClass};
+use ra_ap_syntax::ast::{HasArgList, HasAttrs};
 use ra_ap_syntax::{AstNode, AstToken, SyntaxNode, ast};
 
 use crate::hashing;
@@ -126,7 +128,7 @@ pub(crate) struct Input<'a, 'db> {
     /// The database, attached to the current thread for the duration of the call.
     pub(crate) db: &'db dyn HirDatabase,
     /// The name resolution of the same database.
-    pub(crate) sema: &'a Semantics<'db, dyn HirDatabase>,
+    pub(crate) sema: &'a Semantics<'db, RootDatabase>,
     /// The definition-to-symbol lookup.
     pub(crate) symbols: &'a SymbolTable,
     /// The file and range to location conversion.
@@ -176,15 +178,6 @@ pub(crate) fn collect(input: Input<'_, '_>) -> Output {
         edges: collector.edges,
         unresolved: collector.unresolved,
     }
-}
-
-/// What one method call resolved to.
-#[derive(Debug, Clone, Copy)]
-enum MethodTarget {
-    /// A method or an associated function.
-    Function(Function),
-    /// A field holding a function, which the call goes through.
-    Field(Field),
 }
 
 /// Which impls the value of one expression can reach.
@@ -326,7 +319,7 @@ struct Collector<'a, 'db> {
     expansion_site: Option<Location>,
 }
 
-impl Collector<'_, '_> {
+impl<'db> Collector<'_, 'db> {
     /// Walks every region and adds the edges that do not come from a region.
     fn run(&mut self) {
         for container in self.input.containers {
@@ -676,18 +669,6 @@ impl Collector<'_, '_> {
         }) == Some(true)
     }
 
-    /// Visits a `for` loop, whose iteration calls the iterator's own `next`.
-    fn for_expr(&mut self, expr: &ast::ForExpr, from: SymbolId, depth: u32) {
-        if let Some(iterable) = expr.iterable() {
-            let iterator = self.typed_value(&iterable);
-            self.iterator_use(from, iterable.syntax(), iterator);
-            self.visit(iterable.syntax(), from, depth, false);
-        }
-        if let Some(body) = expr.loop_body() {
-            self.visit(body.syntax(), from, depth, false);
-        }
-    }
-
     /// The error type of the operand of a `?`.
     fn error_type(&mut self, expr: &ast::Expr) -> ValueType {
         let Some(info) = self.guard(|| self.input.sema.type_of_expr(expr)) else {
@@ -761,21 +742,20 @@ impl Collector<'_, '_> {
     /// A name in a template is not an expression, so it has no syntax node to
     /// infer: a local's type is read from its binding, a constant's from its
     /// declaration, and a unit struct or variant is its own type.
-    fn typed_resolution(&mut self, resolution: PathResolution<'_>) -> Option<ValueType> {
+    fn typed_definition(&mut self, def: Definition<'_>) -> Option<ValueType> {
         let db = self.input.db;
-        let ty = match resolution {
-            PathResolution::Local(local) => Some(self.guard(|| Some(local.ty(db)))?),
-            PathResolution::Def(ModuleDef::Const(item)) => Some(self.guard(|| Some(item.ty(db)))?),
-            PathResolution::Def(ModuleDef::Static(item)) => Some(self.guard(|| Some(item.ty(db)))?),
-            PathResolution::Def(ModuleDef::Adt(adt)) => return Some(ValueType::Data(adt)),
-            PathResolution::Def(ModuleDef::EnumVariant(variant)) => {
-                return Some(ValueType::Data(Adt::Enum(
-                    self.guard(|| Some(variant.parent_enum(db)))?,
-                )));
+        let ty = match def {
+            Definition::Local(local) => self.guard(|| Some(local.ty(db)))?,
+            Definition::Const(item) => self.guard(|| Some(item.ty(db)))?,
+            Definition::Static(item) => self.guard(|| Some(item.ty(db)))?,
+            Definition::Adt(adt) => return Some(ValueType::Data(adt)),
+            Definition::EnumVariant(variant) => {
+                let parent = self.guard(|| Some(variant.parent_enum(db)))?;
+                return Some(ValueType::Data(Adt::Enum(parent)));
             }
-            _ => None,
+            _ => return None,
         };
-        ty.map(|ty| self.value_of_type(ty))
+        Some(self.value_of_type(ty))
     }
 
     /// Which formatting impls the value of one expression can reach.
@@ -823,6 +803,12 @@ impl Collector<'_, '_> {
     ///
     /// `root` is true for the node the region was made from, which is in
     /// [`Collector::regions`] like every nested region and must still be walked.
+    ///
+    /// A reference is a [`ast::NameRef`] or a [`ast::Path`], which rust-analyzer
+    /// classifies the way find-references does; the syntax around it decides
+    /// what kind of edge it is. The calls nothing in the syntax names (an
+    /// operator, a `?`, a `for` loop, a format string) are added by
+    /// [`Collector::implicit`].
     fn visit(&mut self, node: &SyntaxNode, from: SymbolId, depth: u32, root: bool) {
         if !root && self.regions.contains(node) {
             return;
@@ -837,70 +823,582 @@ impl Collector<'_, '_> {
             self.macro_call(&call, from, depth);
             return;
         }
-        if let Some(call) = ast::CallExpr::cast(node.clone()) {
-            self.call_expr(&call, from, depth);
+        if let Some(path) = ast::Path::cast(node.clone()) {
+            self.path(&path, from, depth);
             return;
         }
-        if let Some(call) = ast::MethodCallExpr::cast(node.clone()) {
-            self.method_call(&call, from, depth);
+        if let Some(name_ref) = ast::NameRef::cast(node.clone()) {
+            self.name_ref(&name_ref, from);
             return;
         }
-        if let Some(field) = ast::FieldExpr::cast(node.clone()) {
-            self.field_expr(&field, from, depth);
+        if let Some(name) = ast::Name::cast(node.clone()) {
+            self.name(&name, from);
             return;
         }
-        if let Some(expr) = ast::RecordExpr::cast(node.clone()) {
-            self.record_expr(&expr, from, depth);
-            return;
-        }
-        if let Some(expr) = ast::MatchExpr::cast(node.clone()) {
-            self.match_expr(&expr, from, depth);
-            return;
-        }
-        if let Some(pat) = ast::RecordPat::cast(node.clone()) {
-            self.record_pat(&pat, from, depth);
-            return;
-        }
-        if let Some(pat) = ast::TupleStructPat::cast(node.clone()) {
-            self.pattern_path(pat.path(), pat.syntax(), from, tuple_struct_has_rest(&pat));
-            self.tuple_pattern_fields(&pat, from);
-            for field in pat.fields() {
-                self.visit(field.syntax(), from, depth, false);
+        self.implicit(node, from);
+        // The pattern of a `for` loop binds the items, it names nothing the
+        // loop depends on.
+        let skipped = ast::ForExpr::cast(node.clone())
+            .and_then(|expr| expr.pat())
+            .map(|pat| pat.syntax().clone());
+        for child in node.children() {
+            if skipped.as_ref() != Some(&child) {
+                self.visit(&child, from, depth, false);
             }
-            return;
         }
-        if let Some(pat) = ast::PathPat::cast(node.clone()) {
-            self.pattern_path(pat.path(), pat.syntax(), from, false);
-            return;
-        }
-        if let Some(expr) = ast::FormatArgsExpr::cast(node.clone()) {
-            self.format_args(&expr, from, depth);
-            return;
-        }
-        if let Some(expr) = ast::TryExpr::cast(node.clone()) {
-            self.try_expr(&expr, from, depth);
-            return;
-        }
-        if let Some(expr) = ast::ForExpr::cast(node.clone()) {
-            self.for_expr(&expr, from, depth);
-            return;
-        }
-        if let Some(expr) = ast::PathExpr::cast(node.clone()) {
-            self.path_expr(&expr, from, depth);
-            return;
-        }
-        if ast::BinExpr::can_cast(node.kind())
+    }
+
+    /// Adds the edges of the calls that one node makes without naming them.
+    fn implicit(&mut self, node: &SyntaxNode, from: SymbolId) {
+        if let Some(expr) = ast::MatchExpr::cast(node.clone()) {
+            self.match_expr(&expr, from);
+        } else if let Some(expr) = ast::ForExpr::cast(node.clone()) {
+            // A `for` loop calls the iterator's own `next`.
+            if let Some(iterable) = expr.iterable() {
+                let iterator = self.typed_value(&iterable);
+                self.iterator_use(from, iterable.syntax(), iterator);
+            }
+        } else if let Some(expr) = ast::TryExpr::cast(node.clone()) {
+            // A `?` runs `From::from` on the error type of its operand.
+            if let Some(operand) = expr.expr() {
+                let error = self.error_type(&operand);
+                self.conversion_use(from, expr.syntax(), error);
+            }
+        } else if let Some(expr) = ast::FormatArgsExpr::cast(node.clone()) {
+            self.format_args(&expr, from);
+        } else if ast::BinExpr::can_cast(node.kind())
             || ast::PrefixExpr::can_cast(node.kind())
             || ast::IndexExpr::can_cast(node.kind())
         {
             self.operator_expr(node, from);
         }
-        if let Some(ty) = ast::PathType::cast(node.clone()) {
-            self.path_type(&ty, from, depth);
+    }
+
+    /// The definition a name reference refers to.
+    fn classify(&self, name_ref: &ast::NameRef) -> Option<Definition<'db>> {
+        self.guard(
+            || match NameRefClass::classify(self.input.sema, name_ref)? {
+                NameRefClass::Definition(def, _) => Some(def),
+                NameRefClass::FieldShorthand { field_ref, .. } => {
+                    Some(Definition::Field(field_ref))
+                }
+                NameRefClass::ExternCrateShorthand { .. } => None,
+            },
+        )
+    }
+
+    /// The definition a path refers to, which is what its last segment names.
+    fn resolve(&self, path: &ast::Path) -> Option<Definition<'db>> {
+        match path.segment().and_then(|segment| segment.name_ref()) {
+            Some(name_ref) => self.classify(&name_ref),
+            None => self
+                .guard(|| self.input.sema.resolve_path(path))
+                .map(Definition::from),
+        }
+    }
+
+    /// The symbol of a definition, if it produced one.
+    fn symbol(&self, def: Definition<'_>) -> Option<SymbolId> {
+        let key = match def {
+            Definition::Module(it) => DefKey::Module(it),
+            Definition::Function(it) => DefKey::Function(it),
+            Definition::Adt(it) => DefKey::Adt(it),
+            Definition::EnumVariant(it) => DefKey::Variant(it),
+            Definition::Field(it) => DefKey::Field(it),
+            Definition::Const(it) => DefKey::Const(it),
+            Definition::Static(it) => DefKey::Static(it),
+            Definition::Trait(it) => DefKey::Trait(it),
+            Definition::TypeAlias(it) => DefKey::TypeAlias(it),
+            Definition::Macro(it) => DefKey::Macro(it),
+            Definition::SelfType(it) => DefKey::Impl(it),
+            _ => return None,
+        };
+        self.input.symbols.get(key)
+    }
+
+    /// Adds the edges of a path, by where it is written.
+    ///
+    /// Only the whole path is a reference: its qualifier names the scope it
+    /// is found in. The generic arguments of a path in an expression or a type
+    /// are type positions of their own.
+    fn path(&mut self, path: &ast::Path, from: SymbolId, depth: u32) {
+        let Some(parent) = path.syntax().parent() else {
+            return;
+        };
+        if let Some(expr) = ast::PathExpr::cast(parent.clone()) {
+            self.path_expr(path, &expr, from);
+        } else if ast::PathType::can_cast(parent.kind()) {
+            match self.resolve(path) {
+                Some(
+                    def @ (Definition::Adt(_) | Definition::Trait(_) | Definition::TypeAlias(_)),
+                ) => {
+                    self.edge_to(
+                        def,
+                        from,
+                        EdgeKind::UsesType,
+                        path.syntax(),
+                        EdgeDetail::None,
+                    );
+                }
+                Some(_) => {}
+                None => self.record_unresolved_path(path),
+            }
+        } else if ast::PathPat::can_cast(parent.kind()) {
+            self.pattern_path(path, &parent, from, false);
+            return;
+        } else if let Some(pat) = ast::TupleStructPat::cast(parent.clone()) {
+            let rest = pat
+                .fields()
+                .any(|field| matches!(field, ast::Pat::RestPat(_)));
+            if let Some(def) = self.pattern_path(path, &parent, from, rest) {
+                self.tuple_pattern_fields(&pat, def, from);
+            }
+            return;
+        } else if let Some(pat) = ast::RecordPat::cast(parent.clone()) {
+            let rest = pat
+                .record_pat_field_list()
+                .is_some_and(|list| list.rest_pat().is_some());
+            self.pattern_path(path, &parent, from, rest);
+            return;
+        } else if let Some(expr) = ast::RecordExpr::cast(parent.clone()) {
+            self.record_expr(path, &expr, from);
+        } else {
             return;
         }
-        for child in node.children() {
-            self.visit(&child, from, depth, false);
+        self.type_arguments(path, from, depth);
+    }
+
+    /// Adds the edges of a path in value position: a call, a constructor, a
+    /// value, or the value of a shorthand field of a literal.
+    fn path_expr(&mut self, path: &ast::Path, expr: &ast::PathExpr, from: SymbolId) {
+        let parent = expr.syntax().parent();
+        if let Some(call) = parent.clone().and_then(ast::CallExpr::cast)
+            && call
+                .expr()
+                .is_some_and(|callee| callee.syntax() == expr.syntax())
+        {
+            let def = self.resolve(path);
+            match def {
+                Some(Definition::Function(function)) => self.call_to(function, from, path.syntax()),
+                // `Wrapper(1)` and `State::Busy(1)` are constructor calls.
+                Some(def @ (Definition::Adt(_) | Definition::EnumVariant(_))) => {
+                    self.constructs(def, from, path.syntax(), false);
+                }
+                Some(_) => {}
+                None => self.record_unresolved_path(path),
+            }
+            if let Some(def) = def {
+                self.tuple_literal_fields(def, call.arg_list(), from);
+            }
+            return;
+        }
+        let mut def = self.resolve(path);
+        // `Point { x }` names the field `x` and takes the value `x`.
+        if let Some(field) = parent.and_then(ast::RecordExprField::cast)
+            && field.name_ref().is_none()
+            && let Some(Definition::Field(target)) = def
+        {
+            self.literal_field(target, field.syntax(), from);
+            def = self
+                .guard(|| self.input.sema.resolve_path(path))
+                .map(Definition::from);
+        }
+        let Some(def) = def else {
+            self.record_unresolved_path(path);
+            return;
+        };
+        if let Some(kind) = value_kind(def) {
+            self.edge_to(def, from, kind, path.syntax(), EdgeDetail::None);
+        }
+        // `map(ToString::to_string)` hands the formatting trait to a caller
+        // instead of calling it, so the value it formats is not named where it
+        // is formatted.
+        if let Definition::Function(function) = def
+            && self.is_to_string(function)
+        {
+            self.formatting_site(
+                from,
+                path.syntax(),
+                &[FormattingTrait::Display],
+                ValueType::Unknown,
+            );
+        }
+    }
+
+    /// Adds the edges of a name reference that is not a path: a method, a
+    /// field, or the field of a literal or a pattern.
+    fn name_ref(&mut self, name_ref: &ast::NameRef, from: SymbolId) {
+        let Some(parent) = name_ref.syntax().parent() else {
+            return;
+        };
+        if let Some(call) = ast::MethodCallExpr::cast(parent.clone()) {
+            match self.classify(name_ref) {
+                Some(Definition::Function(function)) => {
+                    self.method_call(function, &call, name_ref, from);
+                }
+                Some(def @ Definition::Field(_)) => {
+                    let kind = EdgeKind::ReadsField;
+                    self.edge_to(def, from, kind, name_ref.syntax(), EdgeDetail::None);
+                }
+                Some(_) => {}
+                None => self.record_unresolved_name(name_ref),
+            }
+        } else if ast::FieldExpr::can_cast(parent.kind()) {
+            match self.classify(name_ref) {
+                Some(def @ Definition::Field(_)) => {
+                    let kind = if is_write_target(&parent) {
+                        EdgeKind::WritesField
+                    } else {
+                        EdgeKind::ReadsField
+                    };
+                    self.edge_to(def, from, kind, name_ref.syntax(), EdgeDetail::None);
+                }
+                // A field of a plain tuple has no symbol.
+                Some(Definition::TupleField(_)) => {}
+                _ => {
+                    if name_ref.as_tuple_field().is_none() {
+                        self.record_unresolved_name(name_ref);
+                    }
+                }
+            }
+        } else if ast::RecordExprField::can_cast(parent.kind()) {
+            if let Some(Definition::Field(field)) = self.classify(name_ref) {
+                self.literal_field(field, name_ref.syntax(), from);
+            }
+        } else if ast::RecordPatField::can_cast(parent.kind())
+            && let Some(Definition::Field(field)) = self.classify(name_ref)
+        {
+            self.pattern_field(field, &parent, from);
+        }
+    }
+
+    /// Adds the edge of a name a pattern binds, when it is the shorthand of a
+    /// field (`Point { x }`), which matches the field.
+    fn name(&mut self, name: &ast::Name, from: SymbolId) {
+        let Some(field) = name
+            .syntax()
+            .parent()
+            .filter(|parent| ast::IdentPat::can_cast(parent.kind()))
+            .and_then(|pat| pat.parent())
+            .and_then(ast::RecordPatField::cast)
+            .filter(|field| field.name_ref().is_none())
+        else {
+            return;
+        };
+        if let Some(NameClass::PatFieldShorthand { field_ref, .. }) =
+            self.guard(|| NameClass::classify(self.input.sema, name))
+        {
+            self.pattern_field(field_ref, field.syntax(), from);
+        }
+    }
+
+    /// Adds the edges of a method call to `function`.
+    fn method_call(
+        &mut self,
+        function: Function,
+        call: &ast::MethodCallExpr,
+        name_ref: &ast::NameRef,
+        from: SymbolId,
+    ) {
+        self.call_to(function, from, name_ref.syntax());
+        let receiver = call.receiver();
+        // `ToString::to_string` calls the `Display::fmt` of the receiver.
+        if let Some(receiver) = &receiver
+            && self.is_to_string(function)
+        {
+            let value = self.typed_value(receiver);
+            self.formatting_site(from, receiver.syntax(), &[FormattingTrait::Display], value);
+        }
+        // An adaptor call on an iterator runs the iterator's own `next` from
+        // inside the standard library.
+        if self.is_iterator_method(function)
+            && let Some(receiver) = &receiver
+        {
+            let iterator = self.typed_value(receiver);
+            self.iterator_use(from, name_ref.syntax(), iterator);
+        }
+        // `collect` builds the collection the type asks for through
+        // `FromIterator`, which nothing names.
+        if self.is_collect(function) {
+            let collection = self.typed_value(&ast::Expr::MethodCallExpr(call.clone()));
+            self.collect_use(from, name_ref.syntax(), collection);
+        }
+    }
+
+    /// Adds the `Constructs` edge of a struct or variant literal.
+    ///
+    /// `Self { .. }` and a type alias name the struct they stand for. A spread
+    /// leaves the other fields to the value it copies them from.
+    fn record_expr(&mut self, path: &ast::Path, expr: &ast::RecordExpr, from: SymbolId) {
+        let spread = expr
+            .record_expr_field_list()
+            .is_some_and(|list| list.spread().is_some());
+        let db = self.input.db;
+        let aliased = |adt: Adt| (!matches!(adt, Adt::Enum(_))).then_some(Definition::Adt(adt));
+        let target = match self.resolve(path) {
+            Some(Definition::SelfType(block)) => {
+                self.guard(|| block.self_ty(db).as_adt()).and_then(aliased)
+            }
+            Some(Definition::TypeAlias(alias)) => {
+                self.guard(|| alias.ty(db).as_adt()).and_then(aliased)
+            }
+            other => other,
+        };
+        match target {
+            // An enum is not a literal: only its path is located.
+            Some(def @ Definition::Adt(Adt::Enum(_))) => {
+                self.constructs(def, from, path.syntax(), spread);
+            }
+            Some(def @ (Definition::Adt(_) | Definition::EnumVariant(_))) => {
+                self.constructs(def, from, expr.syntax(), spread);
+            }
+            _ => {}
+        }
+    }
+
+    /// Adds the `WritesField` edge of a field named in a literal.
+    ///
+    /// A field named in a literal is not read: the literal itself is what
+    /// constructs the value. It does name the field, so a removed or retyped
+    /// field has to reach this site, and a field the literal leaves to a
+    /// `..base` does not.
+    fn literal_field(&mut self, field: Field, node: &SyntaxNode, from: SymbolId) {
+        let def = Definition::Field(field);
+        self.edge_to(def, from, EdgeKind::WritesField, node, EdgeDetail::None);
+    }
+
+    /// Adds the `Matches` edge of a field named in a record pattern.
+    fn pattern_field(&mut self, field: Field, node: &SyntaxNode, from: SymbolId) {
+        let detail = self.match_detail(node);
+        let def = Definition::Field(field);
+        self.edge_to(def, from, EdgeKind::Matches, node, detail);
+    }
+
+    /// Adds the `Matches` edge of an enum `match` on its scrutinee.
+    fn match_expr(&mut self, expr: &ast::MatchExpr, from: SymbolId) {
+        let Some(scrutinee) = expr.expr() else {
+            return;
+        };
+        let scrutinee_ty = self
+            .guard(|| self.input.sema.type_of_expr(&scrutinee))
+            .map(|info| info.original.strip_references());
+        if let Some(adt @ Adt::Enum(_)) = scrutinee_ty.and_then(|ty| ty.as_adt()) {
+            let detail = self.match_detail_of(expr);
+            let def = Definition::Adt(adt);
+            self.edge_to(def, from, EdgeKind::Matches, scrutinee.syntax(), detail);
+        }
+    }
+
+    /// Adds the `Matches` edge of a pattern that names a struct, variant or
+    /// constant, and returns what the pattern names.
+    ///
+    /// `rest` says that the pattern ends with `..`, which is recorded on the edge
+    /// to a struct or a variant: the pattern then matches whatever fields the
+    /// struct or variant grows, and leaves the fields it already has to be
+    /// checked individually.
+    fn pattern_path(
+        &mut self,
+        path: &ast::Path,
+        node: &SyntaxNode,
+        from: SymbolId,
+        rest: bool,
+    ) -> Option<Definition<'db>> {
+        let Some(def) = self.resolve(path) else {
+            self.record_unresolved_path(path);
+            return None;
+        };
+        let detail = match def {
+            Definition::Adt(Adt::Struct(_)) | Definition::EnumVariant(_) if rest => {
+                EdgeDetail::WithRest
+            }
+            Definition::Adt(_) | Definition::EnumVariant(_) | Definition::Const(_) => {
+                self.match_detail(node)
+            }
+            _ => return Some(def),
+        };
+        self.edge_to(def, from, EdgeKind::Matches, node, detail);
+        Some(def)
+    }
+
+    /// Visits the template of a format string.
+    ///
+    /// A captured argument (`format!("{NAME}")`) is only a name inside the
+    /// literal, so it has no syntax node of its own; the format machinery
+    /// resolves the names of the literal, and each of them is a value reference
+    /// like a path would be.
+    fn format_args(&mut self, expr: &ast::FormatArgsExpr, from: SymbolId) {
+        let template = expr
+            .syntax()
+            .descendants_with_tokens()
+            .filter_map(|child| child.into_token())
+            .find_map(ast::String::cast);
+        let traits = format_traits(&template);
+        if let Some(string) = template
+            && let Some(file) = string
+                .syntax()
+                .parent()
+                .and_then(|node| self.guard(|| Some(self.input.sema.hir_file_for(&node))))
+            && let Some(parts) = self.guard(|| self.input.sema.as_format_args_parts(&string))
+        {
+            for (range, resolution) in parts {
+                let Some(def) = resolution
+                    .and_then(|part| part.left())
+                    .map(Definition::from)
+                else {
+                    continue;
+                };
+                let Some(site) = self.guard(|| self.input.locate.location(file, range)) else {
+                    continue;
+                };
+                // A part that names an item is a value reference.
+                if let Some(kind) = value_kind(def)
+                    && let Some(id) = self.symbol(def)
+                {
+                    self.push(
+                        from,
+                        id,
+                        kind,
+                        Certainty::Resolved,
+                        site.clone(),
+                        EdgeDetail::None,
+                    );
+                }
+                // The part may also print a value, which runs the `fmt` of
+                // the value's formatting trait without naming it.
+                if !traits.is_empty()
+                    && let Some(value) = self.typed_definition(def)
+                {
+                    self.formatting_use(from, site, &traits, value);
+                }
+            }
+        }
+        // The values the template prints are handed to `fmt` of the formatting
+        // traits it names, which is a dispatch no reference in the syntax
+        // resolves.
+        if !traits.is_empty() {
+            for argument in expr
+                .syntax()
+                .children()
+                .filter_map(ast::FormatArgsArg::cast)
+            {
+                let Some(argument) = argument.expr() else {
+                    continue;
+                };
+                let value = self.typed_value(&argument);
+                self.formatting_site(from, argument.syntax(), &traits, value);
+            }
+        }
+    }
+
+    /// Visits the generic arguments of a path, which are type positions of their
+    /// own (`Wrapper<Item>` uses `Item` as well).
+    fn type_arguments(&mut self, path: &ast::Path, from: SymbolId, depth: u32) {
+        let root = path.syntax();
+        let lists: Vec<SyntaxNode> = root
+            .descendants()
+            .filter_map(ast::GenericArgList::cast)
+            .map(|list| list.syntax().clone())
+            .filter(|list| {
+                !list
+                    .ancestors()
+                    .skip(1)
+                    .take_while(|parent| parent != root)
+                    .any(|parent| ast::GenericArgList::can_cast(parent.kind()))
+            })
+            .collect();
+        for list in &lists {
+            self.visit(list, from, depth, false);
+        }
+    }
+
+    /// The fields of a struct, union or variant, in declaration order.
+    fn fields_of(&self, def: Definition<'_>) -> Option<Vec<Field>> {
+        let db = self.input.db;
+        self.guard(|| match def {
+            Definition::Adt(Adt::Struct(it)) => Some(it.fields(db)),
+            Definition::Adt(Adt::Union(it)) => Some(it.fields(db)),
+            Definition::EnumVariant(it) => Some(it.fields(db)),
+            _ => None,
+        })
+    }
+
+    /// Adds a `WritesField` edge to every positional field a tuple constructor
+    /// literal supplies.
+    ///
+    /// `Wrapper(1)` names its field by position rather than by name; the field
+    /// it supplies is the one at that position.
+    fn tuple_literal_fields(
+        &mut self,
+        def: Definition<'_>,
+        args: Option<ast::ArgList>,
+        from: SymbolId,
+    ) {
+        let (Some(args), Some(fields)) = (args, self.fields_of(def)) else {
+            return;
+        };
+        for (arg, field) in args.args().zip(fields) {
+            self.literal_field(field, arg.syntax(), from);
+        }
+    }
+
+    /// Adds a `Matches` edge to every positional field a tuple pattern names.
+    ///
+    /// A pattern with a `..` does not line its fields up with the declaration
+    /// positions, so only a pattern that names every field gets one.
+    fn tuple_pattern_fields(
+        &mut self,
+        pat: &ast::TupleStructPat,
+        def: Definition<'_>,
+        from: SymbolId,
+    ) {
+        let Some(fields) = self.fields_of(def) else {
+            return;
+        };
+        let inner: Vec<ast::Pat> = pat.fields().collect();
+        if inner.len() != fields.len() {
+            return;
+        }
+        for (sub, field) in inner.iter().zip(fields) {
+            self.pattern_field(field, sub.syntax(), from);
+        }
+    }
+
+    /// Adds a `Constructs` edge to a struct, union or variant.
+    ///
+    /// `spread` says that the literal ends with `..base`, which is recorded on
+    /// the edge to a struct or a variant: only those can be given from another
+    /// value of their type.
+    fn constructs(&mut self, def: Definition<'_>, from: SymbolId, node: &SyntaxNode, spread: bool) {
+        let Some(id) = self.symbol(def) else {
+            return;
+        };
+        let kind = self.input.graph.symbols[id.0 as usize].path.kind;
+        let detail = if spread && matches!(kind, SymbolKind::Struct | SymbolKind::Variant) {
+            EdgeDetail::WithRest
+        } else {
+            EdgeDetail::None
+        };
+        self.located_edge(
+            from,
+            id,
+            EdgeKind::Constructs,
+            Certainty::Resolved,
+            node,
+            detail,
+        );
+    }
+
+    /// Adds a resolved edge to the symbol of `def`, if it has one.
+    fn edge_to(
+        &mut self,
+        def: Definition<'_>,
+        from: SymbolId,
+        kind: EdgeKind,
+        node: &SyntaxNode,
+        detail: EdgeDetail,
+    ) {
+        if let Some(id) = self.symbol(def) {
+            self.located_edge(from, id, kind, Certainty::Resolved, node, detail);
         }
     }
 
@@ -1146,29 +1644,6 @@ impl Collector<'_, '_> {
         })
     }
 
-    /// Visits a call expression.
-    fn call_expr(&mut self, call: &ast::CallExpr, from: SymbolId, depth: u32) {
-        if let Some(callee) = call.expr() {
-            match &callee {
-                ast::Expr::PathExpr(path_expr) => {
-                    if let Some(path) = path_expr.path()
-                        && path.parent_path().is_none()
-                    {
-                        self.path_call(&path, from);
-                        self.tuple_literal_fields(&path, call.arg_list(), from);
-                        self.type_arguments(&path, from, depth);
-                    }
-                }
-                other => self.visit(other.syntax(), from, depth, false),
-            }
-        }
-        if let Some(args) = call.arg_list() {
-            for arg in args.args() {
-                self.visit(arg.syntax(), from, depth, false);
-            }
-        }
-    }
-
     /// The operator trait a block implements, when it is one of the standard
     /// operator traits.
     fn operator_trait(&mut self, block: Impl) -> Option<&'static str> {
@@ -1207,106 +1682,6 @@ impl Collector<'_, '_> {
         if let Some(function) = resolved {
             self.call_to(function, from, node);
         }
-    }
-
-    /// Adds the edge of a path in callee position.
-    fn path_call(&mut self, path: &ast::Path, from: SymbolId) {
-        match self.guard(|| self.input.sema.resolve_path(path)) {
-            Some(PathResolution::Def(ModuleDef::Function(function))) => {
-                self.call_to(function, from, path.syntax());
-            }
-            // `Wrapper(1)` and `State::Busy(1)` are constructor calls.
-            Some(PathResolution::Def(ModuleDef::Adt(adt))) => {
-                self.constructs_adt(adt, from, path.syntax(), false);
-            }
-            Some(PathResolution::Def(ModuleDef::EnumVariant(variant))) => {
-                self.constructs_variant_key(DefKey::Variant(variant), from, path.syntax(), false);
-            }
-            Some(_) => {}
-            None => self.record_unresolved_path(path),
-        }
-    }
-
-    /// Visits a method call.
-    fn method_call(&mut self, call: &ast::MethodCallExpr, from: SymbolId, depth: u32) {
-        if let Some(receiver) = call.receiver() {
-            self.visit(receiver.syntax(), from, depth, false);
-        }
-        if let Some(name_ref) = call.name_ref() {
-            let resolved = self.guard(|| self.input.sema.resolve_method_call_fallback(call));
-            match resolved {
-                Some((target, _)) => {
-                    let target = target.either(MethodTarget::Function, MethodTarget::Field);
-                    match target {
-                        MethodTarget::Function(function) => {
-                            self.call_to(function, from, name_ref.syntax());
-                            self.dispatch_to_display(function, from, call);
-                            // An adaptor call on an iterator runs the iterator's
-                            // own `next` from inside the standard library.
-                            if self.is_iterator_method(function)
-                                && let Some(receiver) = call.receiver()
-                            {
-                                let iterator = self.typed_value(&receiver);
-                                self.iterator_use(from, name_ref.syntax(), iterator);
-                            }
-                            // `collect` builds the collection the type asks for
-                            // through `FromIterator`, which nothing names.
-                            if self.is_collect(function) {
-                                let collection =
-                                    self.typed_value(&ast::Expr::MethodCallExpr(call.clone()));
-                                self.collect_use(from, name_ref.syntax(), collection);
-                            }
-                        }
-                        MethodTarget::Field(field) => {
-                            if let Some(id) = self.input.symbols.get(DefKey::Field(field)) {
-                                self.located_edge(
-                                    from,
-                                    id,
-                                    EdgeKind::ReadsField,
-                                    Certainty::Resolved,
-                                    name_ref.syntax(),
-                                    EdgeDetail::None,
-                                );
-                            }
-                        }
-                    }
-                }
-                None => self.record_unresolved_name(&name_ref),
-            }
-        }
-        if let Some(args) = call.arg_list() {
-            for arg in args.args() {
-                self.visit(arg.syntax(), from, depth, false);
-            }
-        }
-        for list in call
-            .syntax()
-            .children()
-            .filter_map(ast::GenericArgList::cast)
-        {
-            self.visit(list.syntax(), from, depth, false);
-        }
-    }
-
-    /// Adds the dispatch edges of a `to_string` call.
-    ///
-    /// `ToString::to_string` is implemented in the standard library and calls
-    /// `Display::fmt` of the receiver, so the workspace impl that can run is
-    /// reached through the receiver's type and not through a reference.
-    fn dispatch_to_display(
-        &mut self,
-        function: Function,
-        from: SymbolId,
-        call: &ast::MethodCallExpr,
-    ) {
-        if !self.is_to_string(function) {
-            return;
-        }
-        let Some(receiver) = call.receiver() else {
-            return;
-        };
-        let value = self.typed_value(&receiver);
-        self.formatting_site(from, receiver.syntax(), &[FormattingTrait::Display], value);
     }
 
     /// Whether a function is `ToString::to_string`, which calls the `Display`
@@ -1405,542 +1780,6 @@ impl Collector<'_, '_> {
                     );
                 }
             }
-        }
-    }
-
-    /// Visits a field access, which reads or writes the field.
-    fn field_expr(&mut self, field: &ast::FieldExpr, from: SymbolId, depth: u32) {
-        if let Some(base) = field.expr() {
-            self.visit(base.syntax(), from, depth, false);
-        }
-        let Some(name_ref) = field.name_ref() else {
-            return;
-        };
-        let kind = if is_write_target(field.syntax()) {
-            EdgeKind::WritesField
-        } else {
-            EdgeKind::ReadsField
-        };
-        match self.guard(|| self.input.sema.resolve_field(field)) {
-            Some(target) => {
-                // The second case is a field of a plain tuple, which has no symbol.
-                let key = target.either(|item| Some(DefKey::Field(item)), |_tuple_field| None);
-                if let Some(key) = key
-                    && let Some(id) = self.input.symbols.get(key)
-                {
-                    self.located_edge(
-                        from,
-                        id,
-                        kind,
-                        Certainty::Resolved,
-                        name_ref.syntax(),
-                        EdgeDetail::None,
-                    );
-                }
-            }
-            None => {
-                if name_ref.as_tuple_field().is_none() {
-                    self.record_unresolved_name(&name_ref);
-                }
-            }
-        }
-    }
-
-    /// Visits a struct or variant literal.
-    fn record_expr(&mut self, expr: &ast::RecordExpr, from: SymbolId, depth: u32) {
-        let path = expr.path();
-        // A spread leaves the other fields to the value it copies them from.
-        let spread = expr
-            .record_expr_field_list()
-            .is_some_and(|list| list.spread().is_some());
-        match self.guard(|| self.input.sema.resolve_variant(expr.clone())) {
-            Some(variant) => self.constructs_variant(&variant, from, expr.syntax(), spread),
-            None => {
-                if let Some(path) = &path
-                    && let Some(PathResolution::Def(ModuleDef::Adt(adt))) =
-                        self.guard(|| self.input.sema.resolve_path(path))
-                {
-                    self.constructs_adt(adt, from, path.syntax(), spread);
-                }
-            }
-        }
-        if let Some(path) = &path {
-            self.type_arguments(path, from, depth);
-        }
-        let Some(list) = expr.record_expr_field_list() else {
-            return;
-        };
-        // A field named in a literal is not read: the literal itself is what
-        // constructs the value. It does name the field, so a change to that
-        // field has to reach this site, and a field the literal does not name
-        // leaves it alone.
-        for field in list.fields() {
-            self.literal_field(&field, from);
-            if let Some(value) = field.expr() {
-                self.visit(value.syntax(), from, depth, false);
-            }
-        }
-        if let Some(spread) = list.spread() {
-            self.visit(spread.syntax(), from, depth, false);
-        }
-    }
-
-    /// Visits a `match` expression.
-    fn match_expr(&mut self, expr: &ast::MatchExpr, from: SymbolId, depth: u32) {
-        let detail = self.match_detail_of(expr);
-        if let Some(scrutinee) = expr.expr() {
-            let scrutinee_ty = self
-                .guard(|| self.input.sema.type_of_expr(&scrutinee))
-                .map(|info| info.original.strip_references());
-            if let Some(Adt::Enum(item)) = scrutinee_ty.and_then(|ty| ty.as_adt())
-                && let Some(id) = self.input.symbols.get(DefKey::Adt(Adt::Enum(item)))
-            {
-                self.located_edge(
-                    from,
-                    id,
-                    EdgeKind::Matches,
-                    Certainty::Resolved,
-                    scrutinee.syntax(),
-                    detail,
-                );
-            }
-            self.visit(scrutinee.syntax(), from, depth, false);
-        }
-        if let Some(arms) = expr.match_arm_list() {
-            for arm in arms.arms() {
-                self.visit(arm.syntax(), from, depth, false);
-            }
-        }
-    }
-
-    /// Visits a record pattern: it matches the struct or variant and its fields.
-    fn record_pat(&mut self, pat: &ast::RecordPat, from: SymbolId, depth: u32) {
-        self.pattern_path(pat.path(), pat.syntax(), from, record_pat_has_rest(pat));
-        let Some(list) = pat.record_pat_field_list() else {
-            return;
-        };
-        for field in list.fields() {
-            if let Some((field_def, _)) =
-                self.guard(|| self.input.sema.resolve_record_pat_field(&field))
-                && let Some(id) = self.input.symbols.get(DefKey::Field(field_def))
-            {
-                let detail = self.match_detail(field.syntax());
-                self.located_edge(
-                    from,
-                    id,
-                    EdgeKind::Matches,
-                    Certainty::Resolved,
-                    field.syntax(),
-                    detail,
-                );
-            }
-            if let Some(inner) = field.pat() {
-                self.visit(inner.syntax(), from, depth, false);
-            }
-        }
-    }
-
-    /// Adds the `Matches` edge of a pattern that names a struct, variant or
-    /// constant.
-    ///
-    /// `rest` says that the pattern ends with `..`, which is recorded on the edge
-    /// to a struct or a variant: the pattern then matches whatever fields the
-    /// struct or variant grows, and leaves the fields it already has to be
-    /// checked individually.
-    fn pattern_path(
-        &mut self,
-        path: Option<ast::Path>,
-        node: &SyntaxNode,
-        from: SymbolId,
-        rest: bool,
-    ) {
-        let Some(path) = path else {
-            return;
-        };
-        match self.guard(|| self.input.sema.resolve_path(&path)) {
-            Some(PathResolution::Def(def)) => {
-                let leaves_fields_out = rest
-                    && matches!(
-                        def,
-                        ModuleDef::Adt(Adt::Struct(_)) | ModuleDef::EnumVariant(_)
-                    );
-                let key = match def {
-                    ModuleDef::Adt(adt) => Some(DefKey::Adt(adt)),
-                    ModuleDef::EnumVariant(variant) => Some(DefKey::Variant(variant)),
-                    ModuleDef::Const(item) => Some(DefKey::Const(item)),
-                    _ => None,
-                };
-                if let Some(key) = key
-                    && let Some(id) = self.input.symbols.get(key)
-                {
-                    let detail = if leaves_fields_out {
-                        EdgeDetail::WithRest
-                    } else {
-                        self.match_detail(node)
-                    };
-                    self.located_edge(
-                        from,
-                        id,
-                        EdgeKind::Matches,
-                        Certainty::Resolved,
-                        node,
-                        detail,
-                    );
-                }
-            }
-            Some(_) => {}
-            None => self.record_unresolved_path(&path),
-        }
-    }
-
-    /// Visits a path in value position.
-    fn path_expr(&mut self, expr: &ast::PathExpr, from: SymbolId, depth: u32) {
-        let Some(path) = expr.path() else {
-            return;
-        };
-        if path.parent_path().is_some() {
-            return;
-        }
-        match self.guard(|| self.input.sema.resolve_path(&path)) {
-            Some(PathResolution::Def(def)) => {
-                if let Some((key, kind)) = value_target(def)
-                    && let Some(id) = self.input.symbols.get(key)
-                {
-                    self.located_edge(
-                        from,
-                        id,
-                        kind,
-                        Certainty::Resolved,
-                        path.syntax(),
-                        EdgeDetail::None,
-                    );
-                }
-                // `map(ToString::to_string)` hands the formatting trait to a
-                // caller instead of calling it, so the value it formats is not
-                // named where it is formatted.
-                if let ModuleDef::Function(function) = def
-                    && self.is_to_string(function)
-                {
-                    self.formatting_site(
-                        from,
-                        path.syntax(),
-                        &[FormattingTrait::Display],
-                        ValueType::Unknown,
-                    );
-                }
-            }
-            Some(_) => {}
-            None => self.record_unresolved_path(&path),
-        }
-        self.type_arguments(&path, from, depth);
-    }
-
-    /// Visits the template of a format string.
-    ///
-    /// A captured argument (`format!("{NAME}")`) is only a name inside the
-    /// literal, so it has no syntax node of its own; the format machinery
-    /// resolves the names of the literal, and each of them is a value reference
-    /// like a path would be.
-    fn format_args(&mut self, expr: &ast::FormatArgsExpr, from: SymbolId, depth: u32) {
-        let template = expr
-            .syntax()
-            .descendants_with_tokens()
-            .filter_map(|child| child.into_token())
-            .find_map(ast::String::cast);
-        let traits = format_traits(&template);
-        if let Some(string) = template.clone() {
-            let file = string
-                .syntax()
-                .parent()
-                .and_then(|node| self.guard(|| Some(self.input.sema.hir_file_for(&node))));
-            if let Some(file) = file
-                && let Some(parts) = self.guard(|| self.input.sema.as_format_args_parts(&string))
-            {
-                for (range, resolution) in parts {
-                    let Some(resolution) =
-                        resolution.and_then(|part| part.either(Some, |_asm_operand| None))
-                    else {
-                        continue;
-                    };
-                    let Some(site) = self.guard(|| self.input.locate.location(file, range)) else {
-                        continue;
-                    };
-                    // A part that names an item is a value reference.
-                    if let PathResolution::Def(def) = resolution
-                        && let Some((key, kind)) = value_target(def)
-                        && let Some(id) = self.input.symbols.get(key)
-                    {
-                        self.push(
-                            from,
-                            id,
-                            kind,
-                            Certainty::Resolved,
-                            site.clone(),
-                            EdgeDetail::None,
-                        );
-                    }
-                    // The part may also print a value, which runs the `fmt` of
-                    // the value's formatting trait without naming it.
-                    if !traits.is_empty()
-                        && let Some(value) = self.typed_resolution(resolution)
-                    {
-                        self.formatting_use(from, site, &traits, value);
-                    }
-                }
-            }
-        }
-        // The values the template prints are handed to `fmt` of the formatting
-        // traits it names, which is a dispatch no reference in the syntax
-        // resolves.
-        if !traits.is_empty() {
-            for argument in expr
-                .syntax()
-                .children()
-                .filter_map(ast::FormatArgsArg::cast)
-            {
-                let Some(argument) = argument.expr() else {
-                    continue;
-                };
-                let value = self.typed_value(&argument);
-                self.formatting_site(from, argument.syntax(), &traits, value);
-            }
-        }
-        // The explicit arguments are expressions of the expansion.
-        for child in expr.syntax().children() {
-            self.visit(&child, from, depth, false);
-        }
-    }
-
-    /// Visits a `?`, which converts its operand's error to the error of the
-    /// function it is written in.
-    fn try_expr(&mut self, expr: &ast::TryExpr, from: SymbolId, depth: u32) {
-        let operand = expr.expr();
-        if let Some(operand) = &operand {
-            // A `?` runs `From::from` on the error type of its operand: a
-            // conversion no reference in the syntax names.
-            let error = self.error_type(operand);
-            self.conversion_use(from, expr.syntax(), error);
-            self.visit(operand.syntax(), from, depth, false);
-        }
-    }
-
-    /// Visits a path in type position.
-    fn path_type(&mut self, ty: &ast::PathType, from: SymbolId, depth: u32) {
-        let Some(path) = ty.path() else {
-            return;
-        };
-        if path.parent_path().is_some() {
-            return;
-        }
-        match self.guard(|| self.input.sema.resolve_path(&path)) {
-            Some(PathResolution::Def(def)) => {
-                let key = match def {
-                    ModuleDef::Adt(adt) => Some(DefKey::Adt(adt)),
-                    ModuleDef::Trait(item) => Some(DefKey::Trait(item)),
-                    ModuleDef::TypeAlias(item) => Some(DefKey::TypeAlias(item)),
-                    _ => None,
-                };
-                if let Some(key) = key
-                    && let Some(id) = self.input.symbols.get(key)
-                {
-                    self.located_edge(
-                        from,
-                        id,
-                        EdgeKind::UsesType,
-                        Certainty::Resolved,
-                        path.syntax(),
-                        EdgeDetail::None,
-                    );
-                }
-            }
-            Some(_) => {}
-            None => self.record_unresolved_path(&path),
-        }
-        self.type_arguments(&path, from, depth);
-    }
-
-    /// Visits the generic arguments of a path, which are type positions of their
-    /// own (`Wrapper<Item>` uses `Item` as well).
-    fn type_arguments(&mut self, path: &ast::Path, from: SymbolId, depth: u32) {
-        let root = path.syntax();
-        let lists: Vec<SyntaxNode> = root
-            .descendants()
-            .filter_map(ast::GenericArgList::cast)
-            .map(|list| list.syntax().clone())
-            .filter(|list| {
-                !list
-                    .ancestors()
-                    .skip(1)
-                    .take_while(|parent| parent != root)
-                    .any(|parent| ast::GenericArgList::can_cast(parent.kind()))
-            })
-            .collect();
-        for list in &lists {
-            self.visit(list, from, depth, false);
-        }
-    }
-
-    /// Adds the `WritesField` edge of a field named in a literal.
-    ///
-    /// The literal supplies the field: it spells its name out and gives it a
-    /// value, so a removed or retyped field has to reach this site, and a field
-    /// the literal leaves to a `..base` does not.
-    fn literal_field(&mut self, field: &ast::RecordExprField, from: SymbolId) {
-        let resolved = self.guard(|| self.input.sema.resolve_record_field(field));
-        let Some((def, _, _)) = resolved else {
-            return;
-        };
-        let Some(id) = self.input.symbols.get(DefKey::Field(def)) else {
-            return;
-        };
-        let node = field
-            .name_ref()
-            .map_or_else(|| field.syntax().clone(), |name| name.syntax().clone());
-        self.located_edge(
-            from,
-            id,
-            EdgeKind::WritesField,
-            Certainty::Resolved,
-            &node,
-            EdgeDetail::None,
-        );
-    }
-
-    /// Adds a `WritesField` edge to every positional field a tuple constructor
-    /// literal supplies.
-    ///
-    /// `Wrapper(1)` names its field by position rather than by name; the field
-    /// it supplies is the one at that position.
-    fn tuple_literal_fields(
-        &mut self,
-        path: &ast::Path,
-        args: Option<ast::ArgList>,
-        from: SymbolId,
-    ) {
-        let Some(args) = args else {
-            return;
-        };
-        let Some(fields) = self.container_fields(path) else {
-            return;
-        };
-        for (index, arg) in args.args().enumerate() {
-            let Some(field) = fields.get(index) else {
-                return;
-            };
-            if let Some(id) = self.input.symbols.get(DefKey::Field(*field)) {
-                self.located_edge(
-                    from,
-                    id,
-                    EdgeKind::WritesField,
-                    Certainty::Resolved,
-                    arg.syntax(),
-                    EdgeDetail::None,
-                );
-            }
-        }
-    }
-
-    /// Adds a `Matches` edge to every positional field a tuple pattern names.
-    ///
-    /// A pattern with a `..` does not line its fields up with the declaration
-    /// positions, so only a pattern that names every field gets one.
-    fn tuple_pattern_fields(&mut self, pat: &ast::TupleStructPat, from: SymbolId) {
-        let Some(path) = pat.path() else {
-            return;
-        };
-        let Some(fields) = self.container_fields(&path) else {
-            return;
-        };
-        let inner: Vec<ast::Pat> = pat.fields().collect();
-        if inner.len() != fields.len() {
-            return;
-        }
-        for (sub, field) in inner.iter().zip(fields.iter()) {
-            let Some(id) = self.input.symbols.get(DefKey::Field(*field)) else {
-                continue;
-            };
-            let detail = self.match_detail(sub.syntax());
-            self.located_edge(
-                from,
-                id,
-                EdgeKind::Matches,
-                Certainty::Resolved,
-                sub.syntax(),
-                detail,
-            );
-        }
-    }
-
-    /// The fields of the struct or variant a path names, in declaration order.
-    fn container_fields(&mut self, path: &ast::Path) -> Option<Vec<Field>> {
-        let db = self.input.db;
-        self.guard(|| match self.input.sema.resolve_path(path)? {
-            PathResolution::Def(ModuleDef::Adt(Adt::Struct(it))) => Some(it.fields(db)),
-            PathResolution::Def(ModuleDef::Adt(Adt::Union(it))) => Some(it.fields(db)),
-            PathResolution::Def(ModuleDef::EnumVariant(variant)) => Some(variant.fields(db)),
-            _ => None,
-        })
-    }
-
-    /// Adds the `Constructs` edge of a struct, union or enum variant literal.
-    ///
-    /// `spread` says that the literal ends with `..base`, which is recorded on the
-    /// edge to a struct or a variant.
-    fn constructs_variant(
-        &mut self,
-        variant: &Variant,
-        from: SymbolId,
-        node: &SyntaxNode,
-        spread: bool,
-    ) {
-        let key = match variant {
-            Variant::Struct(item) => DefKey::Adt(Adt::Struct(*item)),
-            Variant::Union(item) => DefKey::Adt(Adt::Union(*item)),
-            Variant::EnumVariant(item) => DefKey::Variant(*item),
-        };
-        self.constructs_variant_key(key, from, node, spread);
-    }
-
-    /// Adds a `Constructs` edge to the symbol of `key`, when it has one.
-    fn constructs_variant_key(
-        &mut self,
-        key: DefKey,
-        from: SymbolId,
-        node: &SyntaxNode,
-        spread: bool,
-    ) {
-        if let Some(id) = self.input.symbols.get(key) {
-            let detail = self.constructs_detail(id, spread);
-            self.located_edge(
-                from,
-                id,
-                EdgeKind::Constructs,
-                Certainty::Resolved,
-                node,
-                detail,
-            );
-        }
-    }
-
-    /// Adds a `Constructs` edge to a struct or union.
-    fn constructs_adt(&mut self, adt: Adt, from: SymbolId, node: &SyntaxNode, spread: bool) {
-        self.constructs_variant_key(DefKey::Adt(adt), from, node, spread);
-    }
-
-    /// The detail of a `Constructs` edge to `id`.
-    ///
-    /// Only a struct or a variant field can be given from another value of its
-    /// type, and only the literal that does it leaves fields out; any other
-    /// literal names every field.
-    fn constructs_detail(&self, id: SymbolId, spread: bool) -> EdgeDetail {
-        if !spread {
-            return EdgeDetail::None;
-        }
-        let symbol = &self.input.graph.symbols[id.0 as usize];
-        if matches!(symbol.path.kind, SymbolKind::Struct | SymbolKind::Variant) {
-            EdgeDetail::WithRest
-        } else {
-            EdgeDetail::None
         }
     }
 
@@ -2159,16 +1998,14 @@ impl Collector<'_, '_> {
 
 /// The edge a path in value position produces for the definition it resolves
 /// to, if it is a value at all.
-fn value_target(def: ModuleDef) -> Option<(DefKey, EdgeKind)> {
-    Some(match def {
-        ModuleDef::Function(item) => (DefKey::Function(item), EdgeKind::TakesAsValue),
-        ModuleDef::Const(item) => (DefKey::Const(item), EdgeKind::UsesValue),
-        ModuleDef::Static(item) => (DefKey::Static(item), EdgeKind::UsesValue),
-        ModuleDef::EnumVariant(item) => (DefKey::Variant(item), EdgeKind::Constructs),
-        // A unit struct built by naming it.
-        ModuleDef::Adt(item) => (DefKey::Adt(item), EdgeKind::Constructs),
-        _ => return None,
-    })
+fn value_kind(def: Definition<'_>) -> Option<EdgeKind> {
+    match def {
+        Definition::Function(_) => Some(EdgeKind::TakesAsValue),
+        Definition::Const(_) | Definition::Static(_) => Some(EdgeKind::UsesValue),
+        // A unit struct or variant built by naming it.
+        Definition::EnumVariant(_) | Definition::Adt(_) => Some(EdgeKind::Constructs),
+        _ => None,
+    }
 }
 
 /// The traits one arithmetic operator invokes, plain and assigning.
@@ -2279,18 +2116,6 @@ fn same_kind(left: AssocItem, right: AssocItem) -> bool {
             | (AssocItem::Const(_), AssocItem::Const(_))
             | (AssocItem::TypeAlias(_), AssocItem::TypeAlias(_))
     )
-}
-
-/// Whether a tuple-struct pattern ends with a rest pattern (`Pair(a, ..)`).
-fn tuple_struct_has_rest(pat: &ast::TupleStructPat) -> bool {
-    pat.fields()
-        .any(|field| matches!(field, ast::Pat::RestPat(_)))
-}
-
-/// Whether a record pattern ends with `..` (`Point { x, .. }`).
-fn record_pat_has_rest(pat: &ast::RecordPat) -> bool {
-    pat.record_pat_field_list()
-        .is_some_and(|list| list.rest_pat().is_some())
 }
 
 /// Whether `node` is the target of an assignment or of a mutable borrow.
