@@ -238,7 +238,7 @@ fn normalize(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{LineMap, lexical_rel_path, rel_path};
+    use super::{LineMap, rel_path};
     use std::path::{Path, PathBuf};
 
     fn joined(parts: &[&str]) -> PathBuf {
@@ -328,6 +328,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_verbatim_root_and_a_plain_file_are_the_same_directory() {
+        use super::lexical_rel_path;
+
         // Windows canonical paths carry a `\\?\` prefix that the paths Cargo
         // reports for the files below them do not. A load hands out both
         // spellings, and a file of a crate has to be found below the root
