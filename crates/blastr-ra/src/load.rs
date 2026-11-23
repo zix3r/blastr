@@ -65,6 +65,7 @@ impl Workspace {
         progress: &dyn Progress,
         cancel: &CancelToken,
     ) -> Result<Workspace, Error> {
+        let _span = tracing::info_span!("load").entered();
         let mut attempt = 1;
         loop {
             let workspace = Workspace::load_once(root, manifest_dir, options, progress, cancel)?;

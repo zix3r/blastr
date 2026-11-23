@@ -117,13 +117,6 @@ impl<'a> Locator<'a> {
         self.location_in_file(rooted.file_id, rooted.range)
     }
 
-    /// The relative path of `file`, or `None` when it lies outside the root or
-    /// is a macro expansion.
-    pub(crate) fn file_path(&self, file: HirFileId) -> Option<RelPath> {
-        let file = file.file_id()?.file_id(self.db);
-        self.paths.get(&file)?.clone()
-    }
-
     /// The location of `range`, which is already known to be in the real file
     /// `file`.
     pub(crate) fn location_in_file(&self, file: FileId, range: TextRange) -> Option<Location> {

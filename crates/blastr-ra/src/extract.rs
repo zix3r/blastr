@@ -13,7 +13,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::time::{Duration, Instant};
 
 use blastr_model::{
     CancelToken, Certainty, CrateId, Edge, EdgeDetail, EdgeKind, ImplInfo, Location, Progress,
@@ -37,7 +36,6 @@ use ra_ap_ide_db::base_db::Crate as BaseCrate;
 
 use crate::locate::Locator;
 use crate::pipeline::{self, Crates, Threads};
-use crate::stats::{ExtractReport, Kind, Profile};
 use crate::symbols::{self, DefKey, Hashes, Raw, SymbolTable};
 use crate::{Error, ExtractOptions, Workspace, check_cancel, paths};
 
@@ -48,20 +46,16 @@ impl Workspace {
         progress: &dyn Progress,
         cancel: &CancelToken,
     ) -> Result<RevisionGraph, Error> {
-        let (graph, _report) = self.extract_with(&ExtractOptions::default(), progress, cancel)?;
-        Ok(graph)
+        self.extract_with(&ExtractOptions::default(), progress, cancel)
     }
 
-    /// Extracts the graph, and reports how long the extraction took.
-    ///
-    /// The report is empty unless [`ExtractOptions::measure`] is set; the graph
-    /// is the same either way.
+    /// Extracts the graph with the given options.
     pub fn extract_with(
         &self,
         options: &ExtractOptions,
         progress: &dyn Progress,
         cancel: &CancelToken,
-    ) -> Result<(RevisionGraph, ExtractReport), Error> {
+    ) -> Result<RevisionGraph, Error> {
         let database = self.host.raw_database();
         let db: &dyn HirDatabase = database;
         let source_db: &dyn SourceDatabase = database;
@@ -79,7 +73,6 @@ impl Workspace {
                 members.len(),
             );
             let mut walked: Vec<Option<Extractor<'_>>> = (0..members.len()).map(|_| None).collect();
-            let started = Instant::now();
             let inactive = pipeline::run(
                 pipeline::Input {
                     db,
@@ -91,20 +84,12 @@ impl Workspace {
                 },
                 &mut walked,
                 |index| {
-                    let extractor = Extractor::new(
-                        db,
-                        &locator,
-                        cancel,
-                        self,
-                        &members[index],
-                        options.measure,
-                    );
+                    let extractor = Extractor::new(db, &locator, cancel, self, &members[index]);
                     let extractor = extractor.run()?;
                     let modules = extractor.modules.clone();
                     Ok((extractor, modules))
                 },
             )?;
-            let pass = started.elapsed();
             let mut walks = Vec::with_capacity(walked.len());
             for walk in walked {
                 walks.push(
@@ -117,9 +102,8 @@ impl Workspace {
                 .iter()
                 .map(|member| member.resolved.krate.base())
                 .collect();
-            let assembler =
-                Assembler::merge(walks, db, &locator, self, workspace_crates, options.measure);
-            Ok(assembler.finish(inactive, pass))
+            let assembler = Assembler::merge(walks, db, &locator, self, workspace_crates);
+            Ok(assembler.finish(inactive))
         })
     }
 
@@ -231,8 +215,6 @@ struct Extractor<'a> {
     /// The procedural macros of the crate, waiting for the symbol of the
     /// function that implements them.
     aliases: Vec<MacroAlias>,
-    /// Records the time spent in each kind of work.
-    profile: Profile,
 }
 
 /// A procedural macro, which has no item of its own.
@@ -257,7 +239,6 @@ impl<'a> Extractor<'a> {
         cancel: &'a CancelToken,
         workspace: &'a Workspace,
         member: &Member,
-        measure: bool,
     ) -> Extractor<'a> {
         Extractor {
             db,
@@ -275,16 +256,7 @@ impl<'a> Extractor<'a> {
             modules: Vec::new(),
             containers: Vec::new(),
             aliases: Vec::new(),
-            profile: Profile::new(measure),
         }
-    }
-
-    /// Times one rust-analyzer query.
-    fn timed<T>(&self, kind: Kind, query: impl FnOnce() -> Option<T>) -> Option<T> {
-        let start = self.profile.start();
-        let result = self.guarded(query);
-        self.profile.finish(kind, start);
-        result
     }
 
     /// Walks the crate of this worker.
@@ -318,7 +290,6 @@ impl<'a> Extractor<'a> {
 
     /// Adds the crate root module and everything below it.
     fn walk_crate(&mut self, krate: Crate, crate_name: &str) -> Result<(), Error> {
-        let start = self.profile.start();
         let root = krate.root_module(self.db);
         let Some(location) = self.root_location(krate) else {
             return Ok(());
@@ -333,9 +304,7 @@ impl<'a> Extractor<'a> {
             None,
         );
         let index = self.push(raw, Some(DefKey::Module(root)));
-        let walked = self.walk_module(root, crate_name, Some(index), Scope::default());
-        self.profile.finish(Kind::CrateRoot, start);
-        walked
+        self.walk_module(root, crate_name, Some(index), Scope::default())
     }
 
     /// Adds the items of one module, and of its impl blocks.
@@ -346,11 +315,10 @@ impl<'a> Extractor<'a> {
         parent: Option<usize>,
         scope: Scope,
     ) -> Result<(), Error> {
-        let start = self.profile.start();
         check_cancel(self.cancel)?;
         self.note_module(module);
         let declarations = self
-            .timed(Kind::Declarations, || Some(module.declarations(self.db)))
+            .guarded(|| Some(module.declarations(self.db)))
             .unwrap_or_default();
         for def in declarations {
             self.add_def(def, path, parent, scope)?;
@@ -360,7 +328,7 @@ impl<'a> Extractor<'a> {
         // macros inherited from enclosing modules and from `#[macro_use]`
         // crates, so only the ones defined in this module are taken.
         let macros = self
-            .timed(Kind::Declarations, || Some(module.legacy_macros(self.db)))
+            .guarded(|| Some(module.legacy_macros(self.db)))
             .unwrap_or_default();
         for item in macros {
             if item.module(self.db) == module {
@@ -368,12 +336,11 @@ impl<'a> Extractor<'a> {
             }
         }
         let impls = self
-            .timed(Kind::Declarations, || Some(module.impl_defs(self.db)))
+            .guarded(|| Some(module.impl_defs(self.db)))
             .unwrap_or_default();
         for block in impls {
             self.add_impl(block, path, parent)?;
         }
-        self.profile.finish(Kind::Module, start);
         Ok(())
     }
 
@@ -385,10 +352,7 @@ impl<'a> Extractor<'a> {
         parent: Option<usize>,
         scope: Scope,
     ) -> Result<(), Error> {
-        let start = self.profile.start();
-        let result = self.add_def_inner(def, path, parent, scope);
-        self.profile.finish(Kind::Symbol, start);
-        result
+        self.add_def_inner(def, path, parent, scope)
     }
 
     /// Adds one definition that can appear in a module's declarations.
@@ -475,7 +439,7 @@ impl<'a> Extractor<'a> {
             return Ok(());
         }
         let Some(source) = self
-            .timed(Kind::Source, || function.source_with_range(self.db))
+            .guarded(|| function.source_with_range(self.db))
             .and_then(|source| self.resolve_source(source))
         else {
             return Ok(());
@@ -484,9 +448,7 @@ impl<'a> Extractor<'a> {
         if name.is_missing() {
             return Ok(());
         }
-        let start = self.profile.start();
         let has_self = function.has_self_param(self.db);
-        self.profile.finish(Kind::ItemQuery, start);
         let kind = if has_self {
             SymbolKind::Method
         } else {
@@ -494,22 +456,15 @@ impl<'a> Extractor<'a> {
         };
         let hashes = source
             .ast()
-            .map(|node| {
-                let start = self.profile.start();
-                let hashes = symbols::function_hashes(node);
-                self.profile.finish(Kind::Hashes, start);
-                hashes
-            })
+            .map(symbols::function_hashes)
             .unwrap_or_else(Hashes::none);
         let is_test = hashes.is_test;
         let has_body = hashes.has_body;
         let path = paths::child(path, name.as_str());
-        let start = self.profile.start();
         let visibility = function.visibility(self.db);
         let module = function.module(self.db);
         let visibility = self.model_visibility(visibility, module);
         let pub_api = self.is_pub_api(function.visibility(self.db), module);
-        self.profile.finish(Kind::ItemQuery, start);
         let mut raw = Raw::new(
             kind,
             path.clone(),
@@ -572,7 +527,7 @@ impl<'a> Extractor<'a> {
             return Ok(());
         }
         let Some(source) = self
-            .timed(Kind::Source, || adt.source(self.db))
+            .guarded(|| adt.source(self.db))
             .map(with_range)
             .and_then(|source| self.resolve_source(source))
         else {
@@ -580,12 +535,7 @@ impl<'a> Extractor<'a> {
         };
         let hashes = source
             .syntax()
-            .map(|node| {
-                let start = self.profile.start();
-                let hashes = symbols::adt_hashes(kind, node);
-                self.profile.finish(Kind::Hashes, start);
-                hashes
-            })
+            .map(|node| symbols::adt_hashes(kind, node))
             .unwrap_or_else(Hashes::none);
         let path = paths::child(path, name.as_str());
         let mut raw = Raw::new(
@@ -609,7 +559,7 @@ impl<'a> Extractor<'a> {
         match adt {
             Adt::Struct(it) => {
                 let fields = self
-                    .timed(Kind::Declarations, || Some(it.fields(self.db)))
+                    .guarded(|| Some(it.fields(self.db)))
                     .unwrap_or_default();
                 for field in fields {
                     self.add_field(field, module, &path, Some(index), scope)?;
@@ -617,7 +567,7 @@ impl<'a> Extractor<'a> {
             }
             Adt::Union(it) => {
                 let fields = self
-                    .timed(Kind::Declarations, || Some(it.fields(self.db)))
+                    .guarded(|| Some(it.fields(self.db)))
                     .unwrap_or_default();
                 for field in fields {
                     self.add_field(field, module, &path, Some(index), scope)?;
@@ -625,7 +575,7 @@ impl<'a> Extractor<'a> {
             }
             Adt::Enum(it) => {
                 let variants = self
-                    .timed(Kind::Declarations, || Some(it.variants(self.db)))
+                    .guarded(|| Some(it.variants(self.db)))
                     .unwrap_or_default();
                 for variant in variants {
                     self.add_variant(variant, &path, Some(index), scope)?;
@@ -653,7 +603,7 @@ impl<'a> Extractor<'a> {
         let module = variant.module(self.db);
         let visibility = variant.visibility(self.db);
         let Some(source) = self
-            .timed(Kind::Source, || variant.source(self.db))
+            .guarded(|| variant.source(self.db))
             .map(with_range)
             .and_then(|source| self.resolve_source(source))
         else {
@@ -661,12 +611,7 @@ impl<'a> Extractor<'a> {
         };
         let hashes = source
             .ast()
-            .map(|node| {
-                let start = self.profile.start();
-                let hashes = symbols::variant_hashes(node);
-                self.profile.finish(Kind::Hashes, start);
-                hashes
-            })
+            .map(symbols::variant_hashes)
             .unwrap_or_else(Hashes::none);
         let path = paths::child(path, name.as_str());
         let mut raw = Raw::new(
@@ -687,7 +632,7 @@ impl<'a> Extractor<'a> {
         };
         let index = self.push(raw, Some(key));
         let fields = self
-            .timed(Kind::Declarations, || Some(variant.fields(self.db)))
+            .guarded(|| Some(variant.fields(self.db)))
             .unwrap_or_default();
         for field in fields {
             self.add_field(field, module, &path, Some(index), scope)?;
@@ -708,7 +653,7 @@ impl<'a> Extractor<'a> {
             return Ok(());
         }
         let Some(source) = self
-            .timed(Kind::Source, || field.source(self.db))
+            .guarded(|| field.source(self.db))
             .map(with_range)
             .and_then(|source| self.resolve_source(source))
         else {
@@ -776,7 +721,7 @@ impl<'a> Extractor<'a> {
         let module = item.module(self.db);
         let visibility = item.visibility(self.db);
         let Some(source) = self
-            .timed(Kind::Source, || item.source(self.db))
+            .guarded(|| item.source(self.db))
             .map(with_range)
             .and_then(|source| self.resolve_source(source))
         else {
@@ -784,12 +729,7 @@ impl<'a> Extractor<'a> {
         };
         let hashes = source
             .ast()
-            .map(|node| {
-                let start = self.profile.start();
-                let hashes = symbols::const_hashes(node);
-                self.profile.finish(Kind::Hashes, start);
-                hashes
-            })
+            .map(symbols::const_hashes)
             .unwrap_or_else(Hashes::none);
         let has_body = hashes.has_body;
         let path = paths::child(path, name.as_str());
@@ -833,7 +773,7 @@ impl<'a> Extractor<'a> {
         let module = item.module(self.db);
         let visibility = item.visibility(self.db);
         let Some(source) = self
-            .timed(Kind::Source, || item.source(self.db))
+            .guarded(|| item.source(self.db))
             .map(with_range)
             .and_then(|source| self.resolve_source(source))
         else {
@@ -841,12 +781,7 @@ impl<'a> Extractor<'a> {
         };
         let hashes = source
             .ast()
-            .map(|node| {
-                let start = self.profile.start();
-                let hashes = symbols::static_hashes(node);
-                self.profile.finish(Kind::Hashes, start);
-                hashes
-            })
+            .map(symbols::static_hashes)
             .unwrap_or_else(Hashes::none);
         let has_body = hashes.has_body;
         let path = paths::child(path, name.as_str());
@@ -890,7 +825,7 @@ impl<'a> Extractor<'a> {
         let module = item.module(self.db);
         let visibility = item.visibility(self.db);
         let Some(source) = self
-            .timed(Kind::Source, || item.source(self.db))
+            .guarded(|| item.source(self.db))
             .map(with_range)
             .and_then(|source| self.resolve_source(source))
         else {
@@ -898,12 +833,7 @@ impl<'a> Extractor<'a> {
         };
         let hashes = source
             .ast()
-            .map(|node| {
-                let start = self.profile.start();
-                let hashes = symbols::type_alias_hashes(node);
-                self.profile.finish(Kind::Hashes, start);
-                hashes
-            })
+            .map(symbols::type_alias_hashes)
             .unwrap_or_else(Hashes::none);
         let path = paths::child(path, name.as_str());
         let mut raw = Raw::new(
@@ -945,7 +875,7 @@ impl<'a> Extractor<'a> {
         let module = item.module(self.db);
         let visibility = item.visibility(self.db);
         let Some(source) = self
-            .timed(Kind::Source, || item.source(self.db))
+            .guarded(|| item.source(self.db))
             .map(with_range)
             .and_then(|source| self.resolve_source(source))
         else {
@@ -953,12 +883,7 @@ impl<'a> Extractor<'a> {
         };
         let hashes = source
             .ast()
-            .map(|node| {
-                let start = self.profile.start();
-                let hashes = symbols::trait_hashes(node);
-                self.profile.finish(Kind::Hashes, start);
-                hashes
-            })
+            .map(symbols::trait_hashes)
             .unwrap_or_else(Hashes::none);
         let path = paths::child(path, name.as_str());
         let mut raw = Raw::new(
@@ -984,7 +909,7 @@ impl<'a> Extractor<'a> {
             in_trait_impl: scope.in_trait_impl,
         };
         let items = self
-            .timed(Kind::Declarations, || Some(item.items(self.db)))
+            .guarded(|| Some(item.items(self.db)))
             .unwrap_or_default();
         for item in items {
             self.add_assoc_item(item, &path, Some(index), inner)?;
@@ -1010,13 +935,13 @@ impl<'a> Extractor<'a> {
         let module = item.module(self.db);
         let visibility = item.visibility(self.db);
         let Some(source) = self
-            .timed(Kind::Source, || item.source(self.db))
+            .guarded(|| item.source(self.db))
             .map(with_range)
             .and_then(|source| self.resolve_source(source))
         else {
             return Ok(());
         };
-        let hashes = macro_source_hashes(&source, &self.profile);
+        let hashes = macro_source_hashes(&source);
         let path = paths::child(path, name.as_str());
         let mut raw = Raw::new(
             SymbolKind::Macro,
@@ -1056,9 +981,7 @@ impl<'a> Extractor<'a> {
     fn implementing_function<A: AstNode>(&self, source: &Source<A>) -> Option<Function> {
         let node = source.syntax()?;
         let function = ast::Fn::cast(node.clone())?;
-        self.timed(Kind::ResolveDef, || {
-            self.sema.to_def2(InFile::new(source.file, &function))
-        })
+        self.guarded(|| self.sema.to_def2(InFile::new(source.file, &function)))
     }
 
     /// Adds an impl block and the items it defines.
@@ -1069,7 +992,7 @@ impl<'a> Extractor<'a> {
             return Ok(());
         }
         let Some(source) = self
-            .timed(Kind::Source, || block.source_with_range(self.db))
+            .guarded(|| block.source_with_range(self.db))
             .and_then(|source| self.resolve_source(source))
         else {
             return Ok(());
@@ -1098,12 +1021,7 @@ impl<'a> Extractor<'a> {
         };
         let hashes = source
             .ast()
-            .map(|node| {
-                let start = self.profile.start();
-                let hashes = symbols::impl_hashes(node);
-                self.profile.finish(Kind::Hashes, start);
-                hashes
-            })
+            .map(symbols::impl_hashes)
             .unwrap_or_else(Hashes::none);
         let mut raw = Raw::new(
             SymbolKind::Impl,
@@ -1132,7 +1050,7 @@ impl<'a> Extractor<'a> {
             in_trait_impl: trait_def.is_some(),
         };
         let items = self
-            .timed(Kind::Declarations, || Some(block.items(self.db)))
+            .guarded(|| Some(block.items(self.db)))
             .unwrap_or_default();
         for item in items {
             self.add_assoc_item(item, &item_path, Some(index), inner)?;
@@ -1153,19 +1071,15 @@ impl<'a> Extractor<'a> {
         parent: usize,
         scope: Scope,
     ) -> Result<(), Error> {
-        let start = self.profile.start();
         let mut nodes = Vec::new();
         item_nodes(body, &mut nodes);
-        self.profile.finish(Kind::Nested, start);
         for node in nodes {
             check_cancel(self.cancel)?;
             let Some(item) = ast::Item::cast(node) else {
                 continue;
             };
             let block = match &item {
-                ast::Item::Impl(it) => self.timed(Kind::ResolveDef, || {
-                    self.sema.to_def2(InFile::new(file, it))
-                }),
+                ast::Item::Impl(it) => self.guarded(|| self.sema.to_def2(InFile::new(file, it))),
                 _ => None,
             };
             if let Some(block) = block {
@@ -1181,8 +1095,7 @@ impl<'a> Extractor<'a> {
 
     /// Resolves the syntax of an item in a block to its definition.
     fn nested_def(&self, file: HirFileId, item: &ast::Item) -> Option<ModuleDef> {
-        let start = self.profile.start();
-        let def = match item {
+        match item {
             ast::Item::Fn(it) => self
                 .guarded(|| self.sema.to_def2(InFile::new(file, it)))
                 .map(ModuleDef::Function),
@@ -1221,9 +1134,7 @@ impl<'a> Extractor<'a> {
                     .map(ModuleDef::Macro)
             }
             _ => None,
-        };
-        self.profile.finish(Kind::ResolveDef, start);
-        def
+        }
     }
 
     /// The canonical path of a trait, in a member crate or outside the project.
@@ -1391,10 +1302,7 @@ impl<'a> Extractor<'a> {
         &self,
         source: InFile<(TextRange, Option<A>)>,
     ) -> Option<Source<A>> {
-        let start = self.profile.start();
-        let result = self.resolve_source_inner(source);
-        self.profile.finish(Kind::Site, start);
-        result
+        self.resolve_source_inner(source)
     }
 
     /// Turns the syntax of a definition into its source, with a location.
@@ -1490,8 +1398,6 @@ struct Assembler<'a> {
     defs: HashMap<DefKey, usize>,
     /// The regions the dependency pass walks.
     containers: Vec<PendingContainer>,
-    /// Records the time spent in each kind of work.
-    profile: Profile,
 }
 
 impl<'a> Assembler<'a> {
@@ -1502,7 +1408,6 @@ impl<'a> Assembler<'a> {
         locator: &'a Locator<'a>,
         workspace: &'a Workspace,
         workspace_crates: HashSet<BaseCrate>,
-        measure: bool,
     ) -> Assembler<'a> {
         let mut assembler = Assembler {
             db,
@@ -1512,11 +1417,9 @@ impl<'a> Assembler<'a> {
             raws: Vec::new(),
             defs: HashMap::new(),
             containers: Vec::new(),
-            profile: Profile::new(measure),
         };
         for walk in walks {
             let offset = assembler.raws.len();
-            assembler.profile.merge(&walk.profile);
             for mut raw in walk.raws {
                 if let Some(parent) = raw.parent {
                     raw.parent = Some(parent + offset);
@@ -1536,7 +1439,7 @@ impl<'a> Assembler<'a> {
 
     /// Assigns the ids, builds the symbols and the `Contains` edges, and hands
     /// the result to the dependency-edge pass.
-    fn finish(self, mut inactive: Vec<Location>, pass: Duration) -> (RevisionGraph, ExtractReport) {
+    fn finish(self, mut inactive: Vec<Location>) -> RevisionGraph {
         sort_locations(&mut inactive);
         let mut order: Vec<usize> = (0..self.raws.len()).collect();
         order.sort_by(|&left, &right| raw_key(&self.raws[left]).cmp(&raw_key(&self.raws[right])));
@@ -1618,36 +1521,21 @@ impl<'a> Assembler<'a> {
         };
 
         let sema = Semantics::new_dyn(self.db);
-        let edge_started = Instant::now();
-        let (output, stats) = edges::collect(
-            EdgeInput {
-                db: self.db,
-                sema: &sema,
-                symbols: &table,
-                locate: self.locator,
-                graph: &graph,
-                workspace_crates: &self.workspace_crates,
-                containers: &containers,
-                inactive: &graph.inactive,
-            },
-            self.profile.enabled(),
-        );
-        let edge_pass = edge_started.elapsed();
-        let merge_started = Instant::now();
+        let output = edges::collect(EdgeInput {
+            db: self.db,
+            sema: &sema,
+            symbols: &table,
+            locate: self.locator,
+            graph: &graph,
+            workspace_crates: &self.workspace_crates,
+            containers: &containers,
+            inactive: &graph.inactive,
+        });
         graph.edges = edges;
         graph.edges.extend(output.edges);
         edges::sort_edges(&mut graph.edges);
         graph.unresolved = output.unresolved;
-        let merge = merge_started.elapsed();
-        self.profile.merge(&stats.profile);
-        let report = ExtractReport {
-            pipeline_pass: pass.as_secs_f64(),
-            edge_pass: edge_pass.as_secs_f64(),
-            merge: merge.as_secs_f64(),
-            files: stats.files,
-            phases: self.profile.phases(),
-        };
-        (graph, report)
+        graph
     }
 }
 
@@ -1711,20 +1599,17 @@ fn field_type(source: &FieldSource) -> Option<SyntaxNode> {
 
 /// The hashes of a macro definition, which is either the macro itself or, for a
 /// procedural macro, the function that implements it.
-fn macro_source_hashes<A: AstNode>(source: &Source<A>, profile: &Profile) -> Hashes {
+fn macro_source_hashes<A: AstNode>(source: &Source<A>) -> Hashes {
     let Some(node) = source.syntax() else {
         return Hashes::none();
     };
-    let start = profile.start();
-    let hashes = if let Some(item) = ast::Macro::cast(node.clone()) {
+    if let Some(item) = ast::Macro::cast(node.clone()) {
         symbols::macro_hashes(&item)
     } else if let Some(item) = ast::Fn::cast(node.clone()) {
         symbols::function_hashes(&item)
     } else {
         Hashes::none()
-    };
-    profile.finish(Kind::Hashes, start);
-    hashes
+    }
 }
 
 /// Collects the items declared directly in `node`, without descending into the

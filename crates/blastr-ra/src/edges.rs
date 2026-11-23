@@ -31,7 +31,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::time::Duration;
 
 use blastr_model::{
     Certainty, Edge, EdgeDetail, EdgeKind, Location, RevisionGraph, SymbolId, SymbolKind,
@@ -47,7 +46,6 @@ use ra_ap_syntax::{AstNode, AstToken, SyntaxNode, ast};
 
 use crate::hashing;
 use crate::locate::Locator;
-use crate::stats::{FileTiming, Kind, Profile};
 use crate::symbols::{DefKey, SymbolTable};
 
 /// The standard operator traits whose methods an operator expression invokes.
@@ -153,7 +151,7 @@ pub(crate) struct Output {
 }
 
 /// Collects every edge kind except `Contains`.
-pub(crate) fn collect(input: Input<'_, '_>, measure: bool) -> (Output, CollectorStats) {
+pub(crate) fn collect(input: Input<'_, '_>) -> Output {
     let mut collector = Collector {
         input,
         edges: Vec::new(),
@@ -172,55 +170,12 @@ pub(crate) fn collect(input: Input<'_, '_>, measure: bool) -> (Output, Collector
         invocations: HashMap::new(),
         quiet: false,
         expansion_site: None,
-        profile: Profile::new(measure),
-        file_times: HashMap::new(),
     };
     collector.run();
-    let files = file_timings(&collector.file_times, collector.input.locate);
-    (
-        Output {
-            edges: collector.edges,
-            unresolved: collector.unresolved,
-        },
-        CollectorStats {
-            profile: collector.profile,
-            files,
-        },
-    )
-}
-
-/// What one dependency pass measured.
-pub(crate) struct CollectorStats {
-    /// The times of each kind of work.
-    pub(crate) profile: Profile,
-    /// The time each file took.
-    pub(crate) files: Vec<FileTiming>,
-}
-
-/// The time one file took, accumulated over its regions.
-#[derive(Debug, Default, Clone, Copy)]
-struct FileCounters {
-    /// The time the regions of the file took.
-    duration: Duration,
-    /// The number of regions the file holds.
-    containers: u64,
-    /// The number of edges and unresolved references the file produced.
-    references: u64,
-}
-
-/// The per-file timings, in a deterministic order.
-fn file_timings(times: &HashMap<HirFileId, FileCounters>, locate: &Locator<'_>) -> Vec<FileTiming> {
-    let mut files: Vec<FileTiming> = times
-        .iter()
-        .map(|(&file, counters)| FileTiming {
-            file: locate.file_path(file),
-            containers: counters.containers,
-            references: counters.references,
-            seconds: counters.duration.as_secs_f64(),
-        })
-        .collect();
-    files.sort_by(|left, right| left.file.cmp(&right.file));
-    files
+    Output {
+        edges: collector.edges,
+        unresolved: collector.unresolved,
+    }
 }
 
 /// What one method call resolved to.
@@ -369,10 +324,6 @@ struct Collector<'a, 'db> {
     /// that call, because the tokens of the inner call are part of the outer call
     /// in the real file.
     expansion_site: Option<Location>,
-    /// Records the time spent in each kind of work.
-    profile: Profile,
-    /// The time each file took, by the file of its regions.
-    file_times: HashMap<HirFileId, FileCounters>,
 }
 
 impl Collector<'_, '_> {
@@ -406,11 +357,8 @@ impl Collector<'_, '_> {
             }
         }
         for container in self.input.containers {
-            let edges_before = self.edges.len();
-            let unresolved_before = self.unresolved.len();
-            let start = self.profile.start();
             // The semantics can only resolve nodes of trees it has parsed.
-            self.timed(Kind::Parse, || {
+            self.guard(|| {
                 self.input.sema.parse_or_expand(container.file);
                 Some(())
             });
@@ -419,33 +367,15 @@ impl Collector<'_, '_> {
             self.attrs(&container.node, container.file, container.id);
             self.visit(&container.node, container.id, 0, true);
             self.quiet = previous;
-            if let Some(start) = start {
-                let duration = start.elapsed();
-                self.profile.add(Kind::Visit, duration, 1);
-                let counters = self.file_times.entry(container.file).or_default();
-                counters.duration += duration;
-                counters.containers += 1;
-                counters.references += ((self.edges.len() - edges_before)
-                    + (self.unresolved.len() - unresolved_before))
-                    as u64;
-            }
         }
         self.generated_items();
         self.sort_unresolved();
     }
 
-    /// Times one rust-analyzer query.
-    fn timed<T>(&self, kind: Kind, query: impl FnOnce() -> Option<T>) -> Option<T> {
-        let start = self.profile.start();
-        let result = self.guard(query);
-        self.profile.finish(kind, start);
-        result
-    }
-
     /// Adds the `Implements` edges of one trait impl block.
     fn implements(&mut self, id: SymbolId, block: Impl) {
         let db = self.input.db;
-        let Some(trait_) = self.timed(Kind::Implements, || block.trait_(db)) else {
+        let Some(trait_) = self.guard(|| block.trait_(db)) else {
             return;
         };
         let site = self.symbol_location(id);
@@ -459,7 +389,7 @@ impl Collector<'_, '_> {
                 EdgeDetail::None,
             );
         }
-        let Some(items) = self.timed(Kind::Implements, || Some(block.items(db))) else {
+        let Some(items) = self.guard(|| Some(block.items(db))) else {
             return;
         };
         for item in items {
@@ -492,8 +422,8 @@ impl Collector<'_, '_> {
     /// recorded, and only their `fmt` is invoked implicitly.
     fn formatting_impl(&mut self, block: Impl) -> Option<FormattingImpl> {
         let db = self.input.db;
-        let trait_ = self.timed(Kind::Dispatch, || block.trait_(db))?;
-        let standard = self.timed(Kind::Dispatch, || {
+        let trait_ = self.guard(|| block.trait_(db))?;
+        let standard = self.guard(|| {
             Some(matches!(
                 trait_.module(db).krate(db).origin(db),
                 CrateOrigin::Lang(_)
@@ -502,13 +432,13 @@ impl Collector<'_, '_> {
         if !standard {
             return None;
         }
-        let trait_ = self.timed(Kind::Dispatch, || Some(trait_.name(db)))?;
+        let trait_ = self.guard(|| Some(trait_.name(db)))?;
         let trait_ = match trait_.as_str() {
             "Display" => FormattingTrait::Display,
             "Debug" => FormattingTrait::Debug,
             _ => return None,
         };
-        let fmt = self.timed(Kind::Dispatch, || {
+        let fmt = self.guard(|| {
             block.items(db).into_iter().find_map(|item| match item {
                 AssocItem::Function(function) if function.name(db).as_str() == "fmt" => {
                     Some(function)
@@ -517,9 +447,7 @@ impl Collector<'_, '_> {
             })
         })?;
         let symbol = self.input.symbols.assoc_item(AssocItem::Function(fmt))?;
-        let self_ty = self.timed(Kind::InferType, || {
-            block.self_ty(db).strip_references().as_adt()
-        });
+        let self_ty = self.guard(|| block.self_ty(db).strip_references().as_adt());
         Some(FormattingImpl {
             trait_,
             self_ty,
@@ -535,23 +463,18 @@ impl Collector<'_, '_> {
     /// `?` without one.
     fn conversion_impl(&mut self, block: Impl) -> Option<ConversionImpl> {
         let db = self.input.db;
-        let reference = self.timed(Kind::Dispatch, || block.trait_ref(db))?;
-        let trait_ = self.timed(Kind::Dispatch, || Some(reference.trait_()))?;
-        let standard = self.timed(Kind::Dispatch, || {
+        let reference = self.guard(|| block.trait_ref(db))?;
+        let trait_ = self.guard(|| Some(reference.trait_()))?;
+        let standard = self.guard(|| {
             Some(matches!(
                 trait_.module(db).krate(db).origin(db),
                 CrateOrigin::Lang(_)
             ))
         })?;
-        if !standard
-            || self
-                .timed(Kind::Dispatch, || Some(trait_.name(db)))?
-                .as_str()
-                != "From"
-        {
+        if !standard || self.guard(|| Some(trait_.name(db)))?.as_str() != "From" {
             return None;
         }
-        let from = self.timed(Kind::Dispatch, || {
+        let from = self.guard(|| {
             block.items(db).into_iter().find_map(|item| match item {
                 AssocItem::Function(function) if function.name(db).as_str() == "from" => {
                     Some(function)
@@ -562,9 +485,7 @@ impl Collector<'_, '_> {
         let symbol = self.input.symbols.assoc_item(AssocItem::Function(from))?;
         // The first argument of `From<T>` is the `Self` type, so the second is
         // the error type the conversion takes.
-        let source = self.timed(Kind::InferType, || {
-            reference.get_type_argument(1)?.strip_references().as_adt()
-        });
+        let source = self.guard(|| reference.get_type_argument(1)?.strip_references().as_adt());
         Some(ConversionImpl { source, symbol })
     }
 
@@ -600,28 +521,23 @@ impl Collector<'_, '_> {
     /// `Iterator`.
     fn iterator_impl(&mut self, block: Impl) -> Option<IteratorImpl> {
         let db = self.input.db;
-        let reference = self.timed(Kind::Dispatch, || block.trait_ref(db))?;
-        let trait_ = self.timed(Kind::Dispatch, || Some(reference.trait_()))?;
-        let standard = self.timed(Kind::Dispatch, || {
+        let reference = self.guard(|| block.trait_ref(db))?;
+        let trait_ = self.guard(|| Some(reference.trait_()))?;
+        let standard = self.guard(|| {
             Some(matches!(
                 trait_.module(db).krate(db).origin(db),
                 CrateOrigin::Lang(_)
             ))
         })?;
-        if !standard
-            || self
-                .timed(Kind::Dispatch, || Some(trait_.name(db)))?
-                .as_str()
-                != "Iterator"
-        {
+        if !standard || self.guard(|| Some(trait_.name(db)))?.as_str() != "Iterator" {
             return None;
         }
         let mut symbols = Vec::new();
-        for item in self.timed(Kind::Dispatch, || Some(block.items(db)))? {
+        for item in self.guard(|| Some(block.items(db)))? {
             let AssocItem::Function(function) = item else {
                 continue;
             };
-            let name = self.timed(Kind::Dispatch, || Some(function.name(db)))?;
+            let name = self.guard(|| Some(function.name(db)))?;
             if name.as_str() != "next" && name.as_str() != "size_hint" {
                 continue;
             }
@@ -632,9 +548,7 @@ impl Collector<'_, '_> {
         if symbols.is_empty() {
             return None;
         }
-        let self_ty = self.timed(Kind::InferType, || {
-            block.self_ty(db).strip_references().as_adt()
-        });
+        let self_ty = self.guard(|| block.self_ty(db).strip_references().as_adt());
         Some(IteratorImpl { self_ty, symbols })
     }
 
@@ -669,7 +583,7 @@ impl Collector<'_, '_> {
     /// Whether a function is one of the iterator protocol's methods.
     fn is_iterator_method(&mut self, function: Function) -> bool {
         let db = self.input.db;
-        self.timed(Kind::Dispatch, || {
+        self.guard(|| {
             let container = function.as_assoc_item(db)?.container(db);
             let trait_ = match container {
                 AssocItemContainer::Trait(trait_) => trait_,
@@ -690,23 +604,18 @@ impl Collector<'_, '_> {
     /// reference naming it.
     fn collect_impl(&mut self, block: Impl) -> Option<CollectImpl> {
         let db = self.input.db;
-        let reference = self.timed(Kind::Dispatch, || block.trait_ref(db))?;
-        let trait_ = self.timed(Kind::Dispatch, || Some(reference.trait_()))?;
-        let standard = self.timed(Kind::Dispatch, || {
+        let reference = self.guard(|| block.trait_ref(db))?;
+        let trait_ = self.guard(|| Some(reference.trait_()))?;
+        let standard = self.guard(|| {
             Some(matches!(
                 trait_.module(db).krate(db).origin(db),
                 CrateOrigin::Lang(_)
             ))
         })?;
-        if !standard
-            || self
-                .timed(Kind::Dispatch, || Some(trait_.name(db)))?
-                .as_str()
-                != "FromIterator"
-        {
+        if !standard || self.guard(|| Some(trait_.name(db)))?.as_str() != "FromIterator" {
             return None;
         }
-        let from_iter = self.timed(Kind::Dispatch, || {
+        let from_iter = self.guard(|| {
             block.items(db).into_iter().find_map(|item| match item {
                 AssocItem::Function(function) if function.name(db).as_str() == "from_iter" => {
                     Some(function)
@@ -718,9 +627,7 @@ impl Collector<'_, '_> {
             .input
             .symbols
             .assoc_item(AssocItem::Function(from_iter))?;
-        let self_ty = self.timed(Kind::InferType, || {
-            block.self_ty(db).strip_references().as_adt()
-        });
+        let self_ty = self.guard(|| block.self_ty(db).strip_references().as_adt());
         Some(CollectImpl { self_ty, symbol })
     }
 
@@ -755,7 +662,7 @@ impl Collector<'_, '_> {
     /// collection through `FromIterator`.
     fn is_collect(&mut self, function: Function) -> bool {
         let db = self.input.db;
-        self.timed(Kind::Dispatch, || {
+        self.guard(|| {
             let container = function.as_assoc_item(db)?.container(db);
             let trait_ = match container {
                 AssocItemContainer::Trait(trait_) => trait_,
@@ -783,7 +690,7 @@ impl Collector<'_, '_> {
 
     /// The error type of the operand of a `?`.
     fn error_type(&mut self, expr: &ast::Expr) -> ValueType {
-        let Some(info) = self.timed(Kind::InferType, || self.input.sema.type_of_expr(expr)) else {
+        let Some(info) = self.guard(|| self.input.sema.type_of_expr(expr)) else {
             return ValueType::Unknown;
         };
         let ty = info.original.strip_references();
@@ -857,19 +764,13 @@ impl Collector<'_, '_> {
     fn typed_resolution(&mut self, resolution: PathResolution<'_>) -> Option<ValueType> {
         let db = self.input.db;
         let ty = match resolution {
-            PathResolution::Local(local) => {
-                Some(self.timed(Kind::InferType, || Some(local.ty(db)))?)
-            }
-            PathResolution::Def(ModuleDef::Const(item)) => {
-                Some(self.timed(Kind::InferType, || Some(item.ty(db)))?)
-            }
-            PathResolution::Def(ModuleDef::Static(item)) => {
-                Some(self.timed(Kind::InferType, || Some(item.ty(db)))?)
-            }
+            PathResolution::Local(local) => Some(self.guard(|| Some(local.ty(db)))?),
+            PathResolution::Def(ModuleDef::Const(item)) => Some(self.guard(|| Some(item.ty(db)))?),
+            PathResolution::Def(ModuleDef::Static(item)) => Some(self.guard(|| Some(item.ty(db)))?),
             PathResolution::Def(ModuleDef::Adt(adt)) => return Some(ValueType::Data(adt)),
             PathResolution::Def(ModuleDef::EnumVariant(variant)) => {
                 return Some(ValueType::Data(Adt::Enum(
-                    self.timed(Kind::ResolveDef, || Some(variant.parent_enum(db)))?,
+                    self.guard(|| Some(variant.parent_enum(db)))?,
                 )));
             }
             _ => None,
@@ -879,7 +780,7 @@ impl Collector<'_, '_> {
 
     /// Which formatting impls the value of one expression can reach.
     fn typed_value(&mut self, expr: &ast::Expr) -> ValueType {
-        let Some(info) = self.timed(Kind::InferType, || self.input.sema.type_of_expr(expr)) else {
+        let Some(info) = self.guard(|| self.input.sema.type_of_expr(expr)) else {
             return ValueType::Unknown;
         };
         self.value_of_type(info.original)
@@ -898,7 +799,7 @@ impl Collector<'_, '_> {
         }
         let db = self.input.db;
         if self
-            .timed(Kind::InferType, || Some(ty.as_type_param(db).is_some()))
+            .guard(|| Some(ty.as_type_param(db).is_some()))
             .unwrap_or(false)
         {
             return ValueType::Unknown;
@@ -911,11 +812,10 @@ impl Collector<'_, '_> {
     /// The item of `trait_` that `item` of an impl block implements.
     fn trait_item(&self, trait_: Trait, item: AssocItem) -> Option<AssocItem> {
         let db = self.input.db;
-        let name = self.timed(Kind::Implements, || item.name(db))?;
-        let items = self.timed(Kind::Implements, || Some(trait_.items(db)))?;
+        let name = self.guard(|| item.name(db))?;
+        let items = self.guard(|| Some(trait_.items(db)))?;
         items.into_iter().find(|candidate| {
-            same_kind(*candidate, item)
-                && self.timed(Kind::Implements, || candidate.name(db)) == Some(name.clone())
+            same_kind(*candidate, item) && self.guard(|| candidate.name(db)) == Some(name.clone())
         })
     }
 
@@ -1014,9 +914,7 @@ impl Collector<'_, '_> {
         if depth >= MAX_EXPANSION_DEPTH {
             return;
         }
-        let Some(expanded) = self.timed(Kind::ExpandMacro, || {
-            self.input.sema.expand_macro_call(call)
-        }) else {
+        let Some(expanded) = self.guard(|| self.input.sema.expand_macro_call(call)) else {
             return;
         };
         if self.regions.contains(&expanded.value) {
@@ -1041,9 +939,7 @@ impl Collector<'_, '_> {
     /// invocation of a macro of the standard library or of a dependency
     /// resolves to no symbol and produces nothing.
     fn expands(&mut self, call: &ast::MacroCall, from: SymbolId) {
-        let Some(macro_) = self.timed(Kind::ResolveMacro, || {
-            self.input.sema.resolve_macro_call(call)
-        }) else {
+        let Some(macro_) = self.guard(|| self.input.sema.resolve_macro_call(call)) else {
             return;
         };
         let Some(id) = self.input.symbols.get(DefKey::Macro(macro_)) else {
@@ -1093,7 +989,7 @@ impl Collector<'_, '_> {
         // The definition map already knows whether an attribute macro applies
         // to the item, which is much cheaper than resolving the attributes of
         // every item of the workspace.
-        let attribute_macro = self.timed(Kind::ResolveMacro, || {
+        let attribute_macro = self.guard(|| {
             let file = self.input.sema.hir_file_for(item.syntax());
             Some(self.input.sema.is_attr_macro_call(InFile::new(file, &item)))
         });
@@ -1141,9 +1037,7 @@ impl Collector<'_, '_> {
         let Some(site) = self.site(meta.syntax()) else {
             return true;
         };
-        let derives = self.timed(Kind::ResolveMacro, || {
-            self.input.sema.resolve_derive_macro(&meta)
-        });
+        let derives = self.guard(|| self.input.sema.resolve_derive_macro(&meta));
         for derive in derives.into_iter().flatten().flatten() {
             self.invocation(derive, from, &site);
         }
@@ -1158,9 +1052,7 @@ impl Collector<'_, '_> {
         let Some(path) = meta.path() else {
             return;
         };
-        let resolved = self.timed(Kind::ResolveMacro, || {
-            self.input.sema.resolve_path_per_ns(&path)
-        });
+        let resolved = self.guard(|| self.input.sema.resolve_path_per_ns(&path));
         let Some(PathResolution::Def(ModuleDef::Macro(macro_))) =
             resolved.and_then(|resolution| resolution.macro_ns)
         else {
@@ -1280,10 +1172,8 @@ impl Collector<'_, '_> {
     /// The operator trait a block implements, when it is one of the standard
     /// operator traits.
     fn operator_trait(&mut self, block: Impl) -> Option<&'static str> {
-        let reference = self.timed(Kind::Dispatch, || block.trait_ref(self.input.db))?;
-        let name = self.timed(Kind::Dispatch, || {
-            Some(reference.trait_().name(self.input.db))
-        })?;
+        let reference = self.guard(|| block.trait_ref(self.input.db))?;
+        let name = self.guard(|| Some(reference.trait_().name(self.input.db)))?;
         OPERATOR_TRAITS
             .iter()
             .copied()
@@ -1306,11 +1196,11 @@ impl Collector<'_, '_> {
         }
         let sema = self.input.sema;
         let resolved = if let Some(expr) = ast::BinExpr::cast(node.clone()) {
-            self.timed(Kind::ResolveMethod, || sema.resolve_bin_expr(&expr))
+            self.guard(|| sema.resolve_bin_expr(&expr))
         } else if let Some(expr) = ast::PrefixExpr::cast(node.clone()) {
-            self.timed(Kind::ResolveMethod, || sema.resolve_prefix_expr(&expr))
+            self.guard(|| sema.resolve_prefix_expr(&expr))
         } else if let Some(expr) = ast::IndexExpr::cast(node.clone()) {
-            self.timed(Kind::ResolveMethod, || sema.resolve_index_expr(&expr))
+            self.guard(|| sema.resolve_index_expr(&expr))
         } else {
             None
         };
@@ -1321,7 +1211,7 @@ impl Collector<'_, '_> {
 
     /// Adds the edge of a path in callee position.
     fn path_call(&mut self, path: &ast::Path, from: SymbolId) {
-        match self.timed(Kind::ResolvePath, || self.input.sema.resolve_path(path)) {
+        match self.guard(|| self.input.sema.resolve_path(path)) {
             Some(PathResolution::Def(ModuleDef::Function(function))) => {
                 self.call_to(function, from, path.syntax());
             }
@@ -1343,9 +1233,7 @@ impl Collector<'_, '_> {
             self.visit(receiver.syntax(), from, depth, false);
         }
         if let Some(name_ref) = call.name_ref() {
-            let resolved = self.timed(Kind::ResolveMethod, || {
-                self.input.sema.resolve_method_call_fallback(call)
-            });
+            let resolved = self.guard(|| self.input.sema.resolve_method_call_fallback(call));
             match resolved {
                 Some((target, _)) => {
                     let target = target.either(MethodTarget::Function, MethodTarget::Field);
@@ -1425,7 +1313,7 @@ impl Collector<'_, '_> {
     /// implementation of whatever it is given.
     fn is_to_string(&mut self, function: Function) -> bool {
         let db = self.input.db;
-        self.timed(Kind::Dispatch, || {
+        self.guard(|| {
             let container = function.as_assoc_item(db)?.container(db);
             // `to_string` comes from the trait's declaration or from the
             // blanket implementation the standard library provides for it.
@@ -1447,7 +1335,7 @@ impl Collector<'_, '_> {
     /// receiver, so every implementation of the trait in the workspace may be
     /// reached as well.
     fn call_to(&mut self, function: Function, from: SymbolId, node: &SyntaxNode) {
-        let container = self.timed(Kind::ResolveDef, || {
+        let container = self.guard(|| {
             function
                 .as_assoc_item(self.input.db)
                 .map(|item| item.container(self.input.db))
@@ -1488,22 +1376,22 @@ impl Collector<'_, '_> {
         node: &SyntaxNode,
     ) {
         let db = self.input.db;
-        let Some(name) = self.timed(Kind::Dispatch, || Some(method.name(db))) else {
+        let Some(name) = self.guard(|| Some(method.name(db))) else {
             return;
         };
         for index in 0..self.impls.len() {
             let block = self.impls[index].1;
-            if self.timed(Kind::Dispatch, || block.trait_(db)) != Some(trait_) {
+            if self.guard(|| block.trait_(db)) != Some(trait_) {
                 continue;
             }
-            let Some(items) = self.timed(Kind::Dispatch, || Some(block.items(db))) else {
+            let Some(items) = self.guard(|| Some(block.items(db))) else {
                 continue;
             };
             for item in items {
                 let AssocItem::Function(candidate) = item else {
                     continue;
                 };
-                if self.timed(Kind::Dispatch, || Some(candidate.name(db))) != Some(name.clone()) {
+                if self.guard(|| Some(candidate.name(db))) != Some(name.clone()) {
                     continue;
                 }
                 if let Some(id) = self.input.symbols.assoc_item(item) {
@@ -1533,7 +1421,7 @@ impl Collector<'_, '_> {
         } else {
             EdgeKind::ReadsField
         };
-        match self.timed(Kind::ResolveField, || self.input.sema.resolve_field(field)) {
+        match self.guard(|| self.input.sema.resolve_field(field)) {
             Some(target) => {
                 // The second case is a field of a plain tuple, which has no symbol.
                 let key = target.either(|item| Some(DefKey::Field(item)), |_tuple_field| None);
@@ -1565,14 +1453,12 @@ impl Collector<'_, '_> {
         let spread = expr
             .record_expr_field_list()
             .is_some_and(|list| list.spread().is_some());
-        match self.timed(Kind::ResolveRecord, || {
-            self.input.sema.resolve_variant(expr.clone())
-        }) {
+        match self.guard(|| self.input.sema.resolve_variant(expr.clone())) {
             Some(variant) => self.constructs_variant(&variant, from, expr.syntax(), spread),
             None => {
                 if let Some(path) = &path
                     && let Some(PathResolution::Def(ModuleDef::Adt(adt))) =
-                        self.timed(Kind::ResolvePath, || self.input.sema.resolve_path(path))
+                        self.guard(|| self.input.sema.resolve_path(path))
                 {
                     self.constructs_adt(adt, from, path.syntax(), spread);
                 }
@@ -1604,7 +1490,7 @@ impl Collector<'_, '_> {
         let detail = self.match_detail_of(expr);
         if let Some(scrutinee) = expr.expr() {
             let scrutinee_ty = self
-                .timed(Kind::InferType, || self.input.sema.type_of_expr(&scrutinee))
+                .guard(|| self.input.sema.type_of_expr(&scrutinee))
                 .map(|info| info.original.strip_references());
             if let Some(Adt::Enum(item)) = scrutinee_ty.and_then(|ty| ty.as_adt())
                 && let Some(id) = self.input.symbols.get(DefKey::Adt(Adt::Enum(item)))
@@ -1634,9 +1520,9 @@ impl Collector<'_, '_> {
             return;
         };
         for field in list.fields() {
-            if let Some((field_def, _)) = self.timed(Kind::ResolveRecord, || {
-                self.input.sema.resolve_record_pat_field(&field)
-            }) && let Some(id) = self.input.symbols.get(DefKey::Field(field_def))
+            if let Some((field_def, _)) =
+                self.guard(|| self.input.sema.resolve_record_pat_field(&field))
+                && let Some(id) = self.input.symbols.get(DefKey::Field(field_def))
             {
                 let detail = self.match_detail(field.syntax());
                 self.located_edge(
@@ -1671,7 +1557,7 @@ impl Collector<'_, '_> {
         let Some(path) = path else {
             return;
         };
-        match self.timed(Kind::ResolvePath, || self.input.sema.resolve_path(&path)) {
+        match self.guard(|| self.input.sema.resolve_path(&path)) {
             Some(PathResolution::Def(def)) => {
                 let leaves_fields_out = rest
                     && matches!(
@@ -1715,7 +1601,7 @@ impl Collector<'_, '_> {
         if path.parent_path().is_some() {
             return;
         }
-        match self.timed(Kind::ResolvePath, || self.input.sema.resolve_path(&path)) {
+        match self.guard(|| self.input.sema.resolve_path(&path)) {
             Some(PathResolution::Def(def)) => {
                 if let Some((key, kind)) = value_target(def)
                     && let Some(id) = self.input.symbols.get(key)
@@ -1763,13 +1649,12 @@ impl Collector<'_, '_> {
             .find_map(ast::String::cast);
         let traits = format_traits(&template);
         if let Some(string) = template.clone() {
-            let file = string.syntax().parent().and_then(|node| {
-                self.timed(Kind::Site, || Some(self.input.sema.hir_file_for(&node)))
-            });
+            let file = string
+                .syntax()
+                .parent()
+                .and_then(|node| self.guard(|| Some(self.input.sema.hir_file_for(&node))));
             if let Some(file) = file
-                && let Some(parts) = self.timed(Kind::FormatArgs, || {
-                    self.input.sema.as_format_args_parts(&string)
-                })
+                && let Some(parts) = self.guard(|| self.input.sema.as_format_args_parts(&string))
             {
                 for (range, resolution) in parts {
                     let Some(resolution) =
@@ -1777,9 +1662,7 @@ impl Collector<'_, '_> {
                     else {
                         continue;
                     };
-                    let Some(site) =
-                        self.timed(Kind::Site, || self.input.locate.location(file, range))
-                    else {
+                    let Some(site) = self.guard(|| self.input.locate.location(file, range)) else {
                         continue;
                     };
                     // A part that names an item is a value reference.
@@ -1849,7 +1732,7 @@ impl Collector<'_, '_> {
         if path.parent_path().is_some() {
             return;
         }
-        match self.timed(Kind::ResolvePath, || self.input.sema.resolve_path(&path)) {
+        match self.guard(|| self.input.sema.resolve_path(&path)) {
             Some(PathResolution::Def(def)) => {
                 let key = match def {
                     ModuleDef::Adt(adt) => Some(DefKey::Adt(adt)),
@@ -1903,9 +1786,7 @@ impl Collector<'_, '_> {
     /// value, so a removed or retyped field has to reach this site, and a field
     /// the literal leaves to a `..base` does not.
     fn literal_field(&mut self, field: &ast::RecordExprField, from: SymbolId) {
-        let resolved = self.timed(Kind::ResolveRecord, || {
-            self.input.sema.resolve_record_field(field)
-        });
+        let resolved = self.guard(|| self.input.sema.resolve_record_field(field));
         let Some((def, _, _)) = resolved else {
             return;
         };
@@ -1993,13 +1874,11 @@ impl Collector<'_, '_> {
     /// The fields of the struct or variant a path names, in declaration order.
     fn container_fields(&mut self, path: &ast::Path) -> Option<Vec<Field>> {
         let db = self.input.db;
-        self.timed(Kind::ResolvePath, || {
-            match self.input.sema.resolve_path(path)? {
-                PathResolution::Def(ModuleDef::Adt(Adt::Struct(it))) => Some(it.fields(db)),
-                PathResolution::Def(ModuleDef::Adt(Adt::Union(it))) => Some(it.fields(db)),
-                PathResolution::Def(ModuleDef::EnumVariant(variant)) => Some(variant.fields(db)),
-                _ => None,
-            }
+        self.guard(|| match self.input.sema.resolve_path(path)? {
+            PathResolution::Def(ModuleDef::Adt(Adt::Struct(it))) => Some(it.fields(db)),
+            PathResolution::Def(ModuleDef::Adt(Adt::Union(it))) => Some(it.fields(db)),
+            PathResolution::Def(ModuleDef::EnumVariant(variant)) => Some(variant.fields(db)),
+            _ => None,
         })
     }
 
@@ -2150,9 +2029,7 @@ impl Collector<'_, '_> {
                 // A bare ident that names a constant or a unit variant is not a
                 // binding at all.
                 None => self
-                    .timed(Kind::ResolveBinding, || {
-                        self.input.sema.resolve_bind_pat_to_const(ident)
-                    })
+                    .guard(|| self.input.sema.resolve_bind_pat_to_const(ident))
                     .is_none(),
             },
             _ => false,
@@ -2201,7 +2078,7 @@ impl Collector<'_, '_> {
 
     /// The location of `node`, mapped back to the real file.
     fn site(&self, node: &SyntaxNode) -> Option<Location> {
-        self.timed(Kind::Site, || {
+        self.guard(|| {
             let file = self.input.sema.hir_file_for(node);
             self.input.locate.location(file, node.text_range())
         })
