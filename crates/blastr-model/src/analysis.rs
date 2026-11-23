@@ -334,8 +334,8 @@ impl Assume {
 impl Default for RankingParams {
     fn default() -> Self {
         RankingParams {
-            decay: 0.6,
-            candidate_weight: 0.4,
+            decay: 0.8,
+            candidate_weight: 0.5,
             adaptation_weight: 1.0,
             behaviour_weight: 0.8,
             score_floor: 0.05,
@@ -347,7 +347,7 @@ impl Default for AnalysisParams {
     fn default() -> Self {
         AnalysisParams {
             ranking: RankingParams::default(),
-            depth: 6,
+            depth: 8,
             min_confidence: Confidence::Possible,
             ignore: Vec::new(),
         }
@@ -414,10 +414,12 @@ mod tests {
     }
 
     #[test]
-    fn defaults_are_the_provisional_ones() {
+    fn defaults_are_the_tuned_ones() {
         let params = AnalysisParams::default();
-        assert_eq!(params.depth, 6);
+        assert_eq!(params.depth, 8);
         assert_eq!(params.min_confidence, Confidence::Possible);
-        assert!(params.ranking.decay > 0.59 && params.ranking.decay < 0.61);
+        assert_eq!(params.ranking.decay, 0.8);
+        assert_eq!(params.ranking.candidate_weight, 0.5);
+        assert_eq!(params.ranking.score_floor, 0.05);
     }
 }

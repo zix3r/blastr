@@ -726,10 +726,10 @@ mod tests {
         assert!((scores[0].1 - 0.8).abs() < 1e-5);
         assert_eq!(scores[0].2, 1);
         assert_eq!(scores[1].0, "krate::h");
-        assert!((scores[1].1 - 0.48).abs() < 1e-5);
+        assert!((scores[1].1 - 0.64).abs() < 1e-5);
         assert_eq!(scores[1].2, 2);
         assert_eq!(scores[2].0, "krate::i");
-        assert!((scores[2].1 - 0.288).abs() < 1e-5);
+        assert!((scores[2].1 - 0.512).abs() < 1e-5);
         assert_eq!(scores[2].2, 3);
         assert!(
             result
@@ -761,7 +761,7 @@ mod tests {
         let item = &result.items[0];
         assert_eq!(item.symbol.path, "krate::holder");
         assert_eq!(item.confidence, Confidence::Possible);
-        assert!((item.score - 0.32).abs() < 1e-5);
+        assert!((item.score - 0.4).abs() < 1e-5);
         assert_eq!(result.limits.candidate_steps, 1);
     }
 
@@ -829,7 +829,7 @@ mod tests {
         let changes = vec![change(ChangeKind::Body, "krate::f", SymbolKind::Function)];
         let params = AnalysisParams {
             ranking: RankingParams {
-                score_floor: 0.5,
+                score_floor: 0.7,
                 ..RankingParams::default()
             },
             ..AnalysisParams::default()
@@ -1111,18 +1111,8 @@ mod tests {
         builder.edge(test, hub, EdgeKind::Calls, EdgeDetail::None);
         let head = builder.finish();
         let changes = vec![change(ChangeKind::Body, "krate::f", SymbolKind::Function)];
-        // The validation parameters: depth 8, decay 0.8, candidate weight 0.4.
-        let params = AnalysisParams {
-            depth: 8,
-            ranking: RankingParams {
-                decay: 0.8,
-                candidate_weight: 0.4,
-                ..RankingParams::default()
-            },
-            ..AnalysisParams::default()
-        };
-
-        let result = run(&nothing(), &head, &changes, &params, &IgnoreSet::empty());
+        // The defaults: depth 8, decay 0.8, candidate weight 0.5.
+        let result = analyse(&nothing(), &head, &changes);
 
         // The item keeps reporting its best path: eight steps, all resolved.
         let hub_item = result
@@ -1141,7 +1131,7 @@ mod tests {
             .find(|item| item.symbol.path == "krate::test")
             .expect("the test is reached through the shorter path");
         assert_eq!(test_item.distance, 6);
-        assert!((test_item.score - 0.8 * 0.4 * 0.8_f32.powi(5)).abs() < 1e-5);
+        assert!((test_item.score - 0.8 * 0.5 * 0.8_f32.powi(5)).abs() < 1e-5);
         assert_eq!(test_item.confidence, Confidence::Possible);
         assert_eq!(result.limits.beyond_depth, 0);
         assert_eq!(result.limits.below_floor, 0);

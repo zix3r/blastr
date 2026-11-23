@@ -27,8 +27,17 @@ const LEGACY_FILE_NAME: &str = "window.json";
 /// The version of the settings file this build writes.
 ///
 /// 1 was the window state alone, in `window.json`; 2 adds the editor, the
-/// analysis and the per-repository settings.
-pub const VERSION: u32 = 2;
+/// analysis and the per-repository settings; 3 leaves the shape alone and
+/// records that the analysis depth default rose from 6 to 8, so that a file
+/// version 2 wrote is read with the tuned default and a file this build writes
+/// is not migrated again.
+pub const VERSION: u32 = 3;
+
+/// The depth every analysis ran with before the tuning in version 3.
+///
+/// Version 2 wrote the depth of every analysis to the file, whether the user
+/// had chosen it or not, so this is the value that means "the old default".
+const OLD_DEFAULT_DEPTH: u32 = 6;
 
 /// How many recent repositories are remembered.
 const MAX_RECENT: usize = 12;
@@ -286,6 +295,23 @@ impl AnalysisSettings {
             ..self
         }
     }
+
+    /// The settings of a file written before version 3, read as version 3.
+    ///
+    /// Version 2 wrote the depth it ran with even when the user had never
+    /// touched the setting, so the old default is the one value that cannot be
+    /// told apart from "unset": it takes the tuned default. A depth the user
+    /// chose is any other value, and is kept.
+    fn tuned(self) -> AnalysisSettings {
+        if self.depth == OLD_DEFAULT_DEPTH {
+            AnalysisSettings {
+                depth: AnalysisParams::default().depth,
+                ..self
+            }
+        } else {
+            self
+        }
+    }
 }
 
 /// What is analysed in one repository, and how far it may go.
@@ -425,9 +451,11 @@ impl Settings {
     ///
     /// A missing settings file is read from the `window.json` of version 1, so
     /// that the window opens where it closed and the repositories opened
-    /// before are still listed. The result says whether that happened, and
-    /// whether the file was damaged, so that the next save can write the
-    /// current shape and keep a copy of a damaged file as `<file>.bad`.
+    /// before are still listed. A file an older version wrote keeps the depth
+    /// the user chose and reads the depth default of its day as the current
+    /// one. The result says whether either happened, and whether the file was
+    /// damaged, so that the next save can write the current shape and keep a
+    /// copy of a damaged file as `<file>.bad`.
     pub fn load(path: &Path) -> Settings {
         let (text, legacy) = match std::fs::read_to_string(path) {
             Ok(text) => (text, false),
@@ -443,11 +471,15 @@ impl Settings {
                 ..Settings::default()
             },
         };
+        let written = settings.version;
         settings.version = VERSION;
         settings.panes = settings.panes.sane();
         settings.analysis = settings.analysis.sane();
+        if written < VERSION {
+            settings.analysis = settings.analysis.tuned();
+        }
         let folded = settings.fold_trust();
-        settings.migrated = legacy || folded;
+        settings.migrated = legacy || folded || written < VERSION;
         settings
     }
 
@@ -716,7 +748,46 @@ mod tests {
             .save(&path)
             .expect("the settings to be saved");
         let text = std::fs::read_to_string(&path).expect("the file");
-        assert!(text.contains("\"version\": 2"), "{text}");
+        assert!(text.contains("\"version\": 3"), "{text}");
+    }
+
+    #[test]
+    fn the_depth_default_of_the_previous_version_becomes_the_tuned_one() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = Settings::path_in(directory.path());
+        std::fs::write(
+            &path,
+            r#"{"version":2,"analysis":{"depth":6,"refresh_on_save":true}}"#,
+        )
+        .expect("the file to be written");
+
+        let settings = Settings::load(&path);
+
+        assert_eq!(settings.analysis.depth, AnalysisParams::default().depth);
+        assert!(settings.migrated, "the caller must write the new file");
+
+        settings.save(&path).expect("the settings to be saved");
+        let saved = Settings::load(&path);
+        assert!(!saved.migrated);
+        assert_eq!(saved.analysis.depth, AnalysisParams::default().depth);
+    }
+
+    #[test]
+    fn a_depth_the_user_chose_survives_the_tuning() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = Settings::path_in(directory.path());
+        std::fs::write(&path, r#"{"version":2,"analysis":{"depth":5}}"#)
+            .expect("the file to be written");
+        assert_eq!(Settings::load(&path).analysis.depth, 5);
+
+        // The old default chosen on purpose in this build is kept too: only a
+        // file written before version 3 is migrated.
+        let mut current = Settings::default();
+        current.analysis.depth = OLD_DEFAULT_DEPTH;
+        current.save(&path).expect("the settings to be saved");
+        let saved = Settings::load(&path);
+        assert_eq!(saved.analysis.depth, OLD_DEFAULT_DEPTH);
+        assert!(!saved.migrated);
     }
 
     #[test]
