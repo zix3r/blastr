@@ -251,7 +251,7 @@ sides, exactly as the check does. Stored cases that were excluded stay excluded.
 | `--out DIR` | where `tuning.json` and `tuning.md` go (default `validation/results`) |
 | `--limit N` | at most N cases per check and project: a smoke test, marked as such in the report |
 
-The default grid is 39 settings: decay {0.5, 0.6, 0.7, 0.8}, score floor
+The default grid is 40 settings: decay {0.5, 0.6, 0.7, 0.8}, score floor
 {0.01, 0.02, 0.05} and depth {6, 8, 10} crossed in full — the two cut-offs and
 the scale they compare against — plus the candidate weight {0.3, 0.4, 0.6, 0.8}
 swept at the default floor and depth. The full four-way cross (144 settings) is
@@ -421,14 +421,18 @@ or refute what Blastr says about them.
   though a candidate chain reaches it at distance 6 (test cases `358`, `417`).
   Following an item again when a shorter path arrives
   would carry the propagation on, but it changes the reachable set of every
-  project and the default parameters cannot exercise it: at decay 0.6 a
-  resolved hop is cheaper than a candidate one, so the longest path is never
-  the strongest. Chains of nine steps on the shortest route are cut by the same
-  depth limit without any shorter path to blame (cases `251`, `259`, `357`,
-  `379`, `390`, `429`).
+  project — and the defaults now sit at the depth and decay this was measured
+  at (depth 8, decay 0.8, candidate weight 0.5), so the flaw is part of what
+  the default analysis does: a resolved hop keeps 0.8 of the score where a
+  candidate hop keeps 0.4, so a long resolved path can be the strongest path to
+  an item, and the depth limit then cuts callers a shorter path reaches. Chains
+  of nine steps on the shortest route are cut by the same depth limit without
+  any shorter path to blame (cases `251`, `259`, `357`, `379`, `390`, `429`).
 - Two candidate steps on one path compound below the score floor: on `macrokit`,
   `Entry::source` and `Issue::render` reach their failing tests at 0.042 against
-  a floor of 0.05 (cases `168`, `395`).
+  a floor of 0.05, at the candidate weight of 0.4 the run used (cases `168`,
+  `395`). Two candidate steps scale with that weight squared, so the tuned 0.5
+  lifts the same path to 0.042 × (0.5 / 0.4)² = 0.066, above the floor.
 - Behaviour propagation continues from a function's references, not from a
   type's. A changed procedural macro reaches the items whose expansion names it
   and, through their generated methods, the code that calls those methods; code

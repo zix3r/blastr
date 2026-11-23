@@ -184,7 +184,7 @@ fn rounded(value: f32) -> f64 {
 /// the decay scales every score the floor is compared with, so those three are
 /// crossed in full (4 × 3 × 3 = 36 settings); the candidate weight only reaches
 /// the scores of candidate steps and is swept at the default floor and depth
-/// (3 more). A full four-way cross can be asked for with `--grid`.
+/// (4 more). A full four-way cross can be asked for with `--grid`.
 pub fn default_grid() -> Vec<Setting> {
     let base = Setting::defaults();
     let mut settings = Vec::new();
@@ -2017,9 +2017,9 @@ mod tests {
     #[test]
     fn the_last_tie_break_is_the_distance_to_the_defaults() {
         let mut close = row(0, 5, 3);
-        close.setting = setting(6, 0.6, 0.4, 0.05);
+        close.setting = setting(8, 0.8, 0.5, 0.05);
         let mut far = row(0, 5, 3);
-        far.setting = setting(10, 0.8, 0.4, 0.05);
+        far.setting = setting(10, 0.6, 0.3, 0.01);
         assert_eq!(select(&[far, close]), Some(1));
     }
 
@@ -2176,7 +2176,7 @@ mod tests {
         let defaults = Setting::defaults();
         assert!(defaults.distance(&defaults) < f64::EPSILON);
         let other = setting(10, 0.8, 0.8, 0.01);
-        assert!(other.distance(&defaults) > defaults.distance(&setting(8, 0.6, 0.4, 0.05)));
+        assert!(other.distance(&defaults) > defaults.distance(&setting(8, 0.8, 0.5, 0.05)));
     }
 
     #[test]
@@ -2197,18 +2197,19 @@ mod tests {
             !found.iter().any(|edge| edge.starts_with("candidate")),
             "the default candidate weight is not an end of its sweep: {found:?}"
         );
-        // The defaults are the smallest depth and the largest floor scanned.
+        // The defaults are the largest decay and the largest floor scanned,
+        // and an interior depth.
         assert_eq!(
             edges(&grid, &Setting::defaults()),
-            vec!["depth 6".to_owned(), "score floor 0.05".to_owned()]
+            vec!["decay 0.8".to_owned(), "score floor 0.05".to_owned()]
         );
     }
 
     #[test]
     fn a_setting_serializes_with_readable_numbers() {
         let text =
-            serde_json::to_string(&setting(6, 0.6, 0.4, 0.05)).expect("a setting serializes");
-        assert!(text.contains("\"decay\":0.6"), "{text}");
+            serde_json::to_string(&setting(8, 0.8, 0.5, 0.05)).expect("a setting serializes");
+        assert!(text.contains("\"decay\":0.8"), "{text}");
         assert!(text.contains("\"score_floor\":0.05"), "{text}");
         assert!(text.contains("\"min_confidence\":\"possible\""), "{text}");
     }

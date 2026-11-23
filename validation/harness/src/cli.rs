@@ -113,7 +113,7 @@ OPTIONS
   --confirm a,b    Tune only: the held-out projects to confirm the winner on.
   --grid SPEC      Tune only: `parameter=value,...;parameter=...` over
                    decay, candidate, floor and depth, a full cartesian
-                   product (default: a 39-setting grid, see the README).
+                   product (default: a 40-setting grid, see the README).
   --results DIR    Tune only: where the stored results are read from
                    (default: validation/results).
   -h, --help       This text.
