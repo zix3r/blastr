@@ -323,6 +323,9 @@ mod tests {
         );
     }
 
+    // Windows only: `\\?\` and `C:` are path prefixes only on Windows. Elsewhere they parse as a
+    // single file name with backslashes in it, and the mixed spellings this guards against never occur.
+    #[cfg(windows)]
     #[test]
     fn a_verbatim_root_and_a_plain_file_are_the_same_directory() {
         // Windows canonical paths carry a `\\?\` prefix that the paths Cargo
