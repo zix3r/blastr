@@ -9,17 +9,20 @@
 
 use blastr_model::{hash_tokens, sketch_tokens};
 use ra_ap_syntax::ast;
-use ra_ap_syntax::{AstNode, NodeOrToken, SyntaxNode};
+use ra_ap_syntax::{AstNode, NodeOrToken, SyntaxNode, SyntaxToken};
 
-/// The non-trivia token texts of `node`, in source order, minus the subtrees in
+/// The non-trivia tokens of `node`, in source order, minus the subtrees in
 /// `skip`.
-pub(crate) fn tokens(node: &SyntaxNode, skip: &[SyntaxNode]) -> Vec<String> {
+///
+/// The tokens are handles into the syntax tree, so their texts are read
+/// straight from the tree by [`hash`] and [`sketch`].
+pub(crate) fn tokens(node: &SyntaxNode, skip: &[SyntaxNode]) -> Vec<SyntaxToken> {
     let mut out = Vec::new();
     collect(node, skip, &mut out);
     out
 }
 
-fn collect(node: &SyntaxNode, skip: &[SyntaxNode], out: &mut Vec<String>) {
+fn collect(node: &SyntaxNode, skip: &[SyntaxNode], out: &mut Vec<SyntaxToken>) {
     for child in node.children_with_tokens() {
         match child {
             NodeOrToken::Node(child) => {
@@ -33,7 +36,7 @@ fn collect(node: &SyntaxNode, skip: &[SyntaxNode], out: &mut Vec<String>) {
             }
             NodeOrToken::Token(token) => {
                 if !token.kind().is_trivia() {
-                    out.push(token.text().to_owned());
+                    out.push(token);
                 }
             }
         }
@@ -49,22 +52,23 @@ pub(crate) fn text_without_ws(node: &SyntaxNode) -> String {
     let is_word = |c: char| c.is_alphanumeric() || c == '_';
     let mut text = String::new();
     for token in tokens(node, &[]) {
+        let token = token.text();
         if text.ends_with(is_word) && token.starts_with(is_word) {
             text.push(' ');
         }
-        text.push_str(&token);
+        text.push_str(token);
     }
     text
 }
 
-/// [`hash_tokens`] over an already collected token sequence.
-pub(crate) fn hash(tokens: &[String]) -> u64 {
-    hash_tokens(tokens.iter().map(String::as_str))
+/// [`hash_tokens`] over the texts of a token sequence.
+pub(crate) fn hash(tokens: &[SyntaxToken]) -> u64 {
+    hash_tokens(tokens.iter().map(SyntaxToken::text))
 }
 
-/// [`sketch_tokens`] over an already collected token sequence.
-pub(crate) fn sketch(tokens: &[String]) -> Vec<u32> {
-    sketch_tokens(tokens.iter().map(String::as_str))
+/// [`sketch_tokens`] over the texts of a token sequence.
+pub(crate) fn sketch(tokens: &[SyntaxToken]) -> Vec<u32> {
+    sketch_tokens(tokens.iter().map(SyntaxToken::text))
 }
 
 /// The attributes written directly on `node`.
@@ -142,11 +146,18 @@ mod tests {
             .expect("the snippet has one item")
     }
 
+    fn texts(node: &SyntaxNode) -> Vec<String> {
+        tokens(node, &[])
+            .iter()
+            .map(|token| token.text().to_owned())
+            .collect()
+    }
+
     #[test]
     fn tokens_drop_whitespace_and_comments() {
         let node = item_of("fn f(/* why */ x: u8) {}");
         assert_eq!(
-            tokens(&node, &[]),
+            texts(&node),
             ["fn", "f", "(", "x", ":", "u8", ")", "{", "}"]
         );
     }
@@ -154,7 +165,7 @@ mod tests {
     #[test]
     fn tokens_skip_doc_comments() {
         let node = item_of("/// Doc.\n/** More. */\nfn f() {}");
-        assert_eq!(tokens(&node, &[]), ["fn", "f", "(", ")", "{", "}"]);
+        assert_eq!(texts(&node), ["fn", "f", "(", ")", "{", "}"]);
     }
 
     #[test]
