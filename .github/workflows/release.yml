@@ -140,7 +140,7 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           VERSION: ${{ needs.check-version.outputs.version }}
         run: |
-          for crate in blastr-model blastr-store blastr-git blastr-ra blastr-core blastr-gui blastr; do
+          for crate in blastr-model blastr-git blastr-ra blastr-core blastr-gui blastr; do
             status=$(curl -s -o /dev/null -w '%{http_code}' -A 'blastr-release (github.com/zix3r/blastr)' \
               "https://crates.io/api/v1/crates/$crate/$VERSION")
             if [ "$status" = 200 ]; then

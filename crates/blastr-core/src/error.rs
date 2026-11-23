@@ -6,9 +6,9 @@ pub enum Error {
     /// A Git operation failed.
     #[error(transparent)]
     Git(#[from] blastr_git::Error),
-    /// A cache operation failed.
-    #[error(transparent)]
-    Store(#[from] blastr_store::Error),
+    /// No home directory could be determined for the current user.
+    #[error("could not determine the user's cache and configuration directories")]
+    NoUserDirs,
     /// Loading or analysing the project failed.
     #[error(transparent)]
     Ra(#[from] blastr_ra::Error),
@@ -63,13 +63,6 @@ impl Error {
             Error::Git(blastr_git::Error::Bare { .. }) => {
                 "blastr needs a repository with a working tree"
             }
-            Error::Store(blastr_store::Error::NewerSchema { .. }) => {
-                "install the newer Blastr, or delete the cache database"
-            }
-            Error::Store(blastr_store::Error::Sqlite(_))
-            | Error::Store(blastr_store::Error::Io(_)) => {
-                "if the cache is damaged, delete the cache database"
-            }
             Error::Git(blastr_git::Error::UnknownRevision(_)) => {
                 "check the revision with `git log`; branches, tags and commit ids all work"
             }
@@ -85,12 +78,12 @@ impl Error {
             Error::Ra(blastr_ra::Error::Toolchain(_)) => {
                 "check that `cargo --version` works in this directory"
             }
-            Error::Codec(_) => "delete the cache database",
+            Error::Codec(_) => "clear the cache",
             Error::RemoveDir { .. } => {
                 "close whatever holds the file (an editor, an antivirus scan, another build), \
                  then clear the cache again"
             }
-            Error::Git(_) | Error::Store(_) | Error::Ra(_) | Error::Io(_) => {
+            Error::Git(_) | Error::NoUserDirs | Error::Ra(_) | Error::Io(_) => {
                 return None;
             }
         };
@@ -130,34 +123,13 @@ mod tests {
     }
 
     #[test]
-    fn newer_schema_hint() {
-        let err = Error::Store(blastr_store::Error::NewerSchema {
-            found: 2,
-            supported: 1,
-        });
-        assert_eq!(
-            err.hint().as_deref(),
-            Some("install the newer Blastr, or delete the cache database")
-        );
-    }
-
-    #[test]
-    fn damaged_cache_hint() {
-        let io = Error::Store(blastr_store::Error::Io(std::io::Error::other("x")));
-        assert_eq!(
-            io.hint().as_deref(),
-            Some("if the cache is damaged, delete the cache database")
-        );
-    }
-
-    #[test]
     fn no_hint_for_cancelled() {
         assert_eq!(Error::Cancelled.hint(), None);
     }
 
     #[test]
-    fn no_hint_for_other_git_and_store_errors() {
+    fn no_hint_for_other_git_and_cache_errors() {
         assert_eq!(Error::Git(blastr_git::Error::Git("x".into())).hint(), None);
-        assert_eq!(Error::Store(blastr_store::Error::NoUserDirs).hint(), None);
+        assert_eq!(Error::NoUserDirs.hint(), None);
     }
 }

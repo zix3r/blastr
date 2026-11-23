@@ -255,12 +255,11 @@ fn write_project(root: &Path, files: &[(&str, &str)]) {
 /// An engine whose cache and target directory live in `dir`, so that the tests
 /// do not share one.
 fn engine(dir: &Path) -> Engine {
-    let paths = blastr_store::Paths {
+    let paths = blastr_model::Paths {
         cache_dir: dir.join("cache"),
         config_dir: dir.join("config"),
     };
-    let store = blastr_store::Store::open_in_memory().expect("an in-memory store");
-    Engine::with_store_and_paths(store, paths)
+    Engine::with_paths(paths)
 }
 
 /// Records the progress phases the engine reports.

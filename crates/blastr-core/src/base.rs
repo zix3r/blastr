@@ -343,12 +343,11 @@ mod tests {
     }
 
     fn engine(dir: &Path) -> Engine {
-        let paths = blastr_store::Paths {
+        let paths = blastr_model::Paths {
             cache_dir: dir.to_path_buf(),
             config_dir: dir.join("config"),
         };
-        let store = blastr_store::Store::open_in_memory().expect("open an in-memory store");
-        Engine::with_store_and_paths(store, paths)
+        Engine::with_paths(paths)
     }
 
     /// One edit replacing `src/lib.rs`.

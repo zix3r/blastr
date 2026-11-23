@@ -1160,12 +1160,11 @@ fn fixtures() {
     let expected_dir = fixtures.join("expected");
 
     let temp = tempfile::tempdir().expect("create a temporary directory");
-    let paths = blastr_store::Paths {
+    let paths = blastr_model::Paths {
         cache_dir: temp.path().to_path_buf(),
         config_dir: temp.path().join("config"),
     };
-    let store = blastr_store::Store::open_in_memory().expect("open an in-memory store");
-    let engine = Engine::with_store_and_paths(store, paths);
+    let engine = Engine::with_paths(paths);
 
     let output = engine
         .diff_dirs(

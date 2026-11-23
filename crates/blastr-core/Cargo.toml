@@ -15,7 +15,6 @@ blake3.workspace = true
 blastr-git.workspace = true
 blastr-model.workspace = true
 blastr-ra.workspace = true
-blastr-store.workspace = true
 postcard.workspace = true
 serde.workspace = true
 serde_json.workspace = true

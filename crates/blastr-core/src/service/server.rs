@@ -713,7 +713,7 @@ mod tests {
 
     use super::*;
 
-    /// Pipes of an engine that runs on a cache in memory.
+    /// Pipes of an engine that runs on a cache in a temporary directory.
     fn server() -> (
         PipeWriter,
         BufReader<PipeReader>,
@@ -722,13 +722,13 @@ mod tests {
         let (requests, input) = std::io::pipe().expect("a pipe");
         let (output, responses) = std::io::pipe().expect("a pipe");
         let handle = thread::spawn(move || {
+            // Lives as long as the server does.
+            let cache = tempfile::tempdir()?;
+            let paths = blastr_model::Paths::under(cache.path());
             serve_with(
                 requests,
                 responses,
-                Box::new(|| {
-                    let store = blastr_store::Store::open_in_memory()?;
-                    Ok(Engine::with_store(store))
-                }),
+                Box::new(move || Ok(Engine::with_paths(paths))),
             )
         });
         (input, BufReader::new(output), handle)

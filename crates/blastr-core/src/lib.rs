@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 mod base;
+mod cache;
 mod codec;
 pub mod config;
 pub mod diff;
@@ -28,7 +29,6 @@ pub const RUST_ANALYZER_VERSION: &str = blastr_ra::RUST_ANALYZER_VERSION;
 
 pub use base::{FileEdit, ProjectBase, Variant};
 pub use blastr_model::{CancelToken, NoProgress, Progress};
-pub use codec::{decode_graph, encode_graph};
 pub use engine::{CacheStatus, DiffOutput, Engine, build_id};
 pub use error::{Error, Result};
 pub use session::{Refresh, Session, SessionRequest};

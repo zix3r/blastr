@@ -15,11 +15,12 @@ use std::sync::Arc;
 use blastr_git::Repo;
 use blastr_model::{
     Analysis, AnalysisKey, AnalysisOptions, AnalysisParams, Assume, CancelToken, Change,
-    ChangedFile, Comparison, DiffResult, ExecMode, FileStatus, Limit, Progress, RelPath, RevSpec,
-    RevisionGraph, Source, SymbolPath,
+    ChangedFile, Comparison, DiffResult, ExecMode, FileStatus, Limit, Paths, Progress, RelPath,
+    RevSpec, RevisionGraph, Source, SymbolPath,
 };
 
-use crate::codec::{decode_graph, encode_graph};
+use crate::cache::{Cache, Kind};
+use crate::codec;
 use crate::config::IgnoreSet;
 use crate::error::{Error, Result};
 use crate::hunks::{changed_lines, overlaps};
@@ -68,12 +69,6 @@ const LOCK_FILE: &str = "Cargo.lock";
 /// Text hashed into every result key ahead of the two analysis keys, so that a
 /// result key can never repeat a digest computed for another purpose.
 const RESULT_KEY_DOMAIN: &[u8] = b"analysis-1";
-
-/// Compression level used for cached analyses.
-///
-/// A cached analysis is small next to the graphs it was computed from, but it
-/// is read as often, so the same middle level is used for both.
-const ANALYSIS_COMPRESSION_LEVEL: i32 = 3;
 
 /// Everything one call to [`Engine::graph_for`] needs beyond the source.
 pub(crate) struct GraphRequest<'a> {
@@ -164,40 +159,23 @@ struct Compared {
 /// Entry point of the analysis pipeline. Owns the cache.
 #[derive(Debug)]
 pub struct Engine {
-    store: blastr_store::Store,
-    paths: blastr_store::Paths,
+    cache: Cache,
+    paths: Paths,
 }
 
 impl Engine {
-    /// Opens the engine with the per-user cache database
-    /// (`blastr_store::paths()?.database()`).
+    /// Opens the engine on the per-user cache directory ([`blastr_model::paths`]).
     pub fn open() -> Result<Engine> {
-        let paths = blastr_store::paths()?;
-        let store = blastr_store::Store::open(&paths.database())?;
-        Ok(Engine::with_store_and_paths(store, paths))
+        let paths = blastr_model::paths().ok_or(Error::NoUserDirs)?;
+        Ok(Engine::with_paths(paths))
     }
 
-    /// Creates an engine on an already opened store (used by tests).
-    ///
-    /// The cache directories are taken from the system temporary directory,
-    /// so nothing outside it is touched.
-    pub fn with_store(store: blastr_store::Store) -> Engine {
-        Engine::with_store_and_paths(store, temporary_paths())
-    }
-
-    /// Creates an engine on an already opened store and explicit directories.
-    pub fn with_store_and_paths(store: blastr_store::Store, paths: blastr_store::Paths) -> Engine {
-        Engine { store, paths }
-    }
-
-    /// The cache this engine uses.
-    pub fn store(&self) -> &blastr_store::Store {
-        &self.store
-    }
-
-    /// The directory user-level configuration is read from.
-    pub fn config_dir(&self) -> &Path {
-        &self.paths.config_dir
+    /// Creates an engine whose cache lives in the given directories.
+    pub fn with_paths(paths: Paths) -> Engine {
+        Engine {
+            cache: Cache::new(&paths.cache_dir),
+            paths,
+        }
     }
 
     /// Full impact analysis of a comparison in the repository at `repo_root`.
@@ -270,8 +248,10 @@ impl Engine {
             _ => None,
         };
         if let Some(key_hash) = &key_hash
-            && let Some(bytes) = self.store.get_result(key_hash)?
-            && let Some(analysis) = decode_analysis(&bytes)
+            && let Some(bytes) = self.cache.get(Kind::Result, key_hash)?
+            // A damaged entry is not a failure of this run: the analysis is
+            // computed again and stored over it.
+            && let Ok(analysis) = codec::decode::<Analysis>(&bytes)
         {
             return Ok(analysis);
         }
@@ -312,8 +292,8 @@ impl Engine {
             // it is not stored: the next run tries the project again.
             && !missing_macros(&analysis.diff.limits)
         {
-            self.store
-                .put_result(key_hash, &encode_analysis(&analysis)?)?;
+            self.cache
+                .put(Kind::Result, key_hash, &codec::encode(&analysis)?)?;
         }
         Ok(analysis)
     }
@@ -649,10 +629,8 @@ impl Engine {
 
     /// Summarises what the cache holds and where it lives.
     pub fn cache_status(&self) -> Result<CacheStatus> {
-        let graphs = self.store.list_graphs()?.len() as u64;
-        let graph_bytes = self.store.total_size()?;
-        let results = self.store.result_count()?;
-        let result_bytes = self.store.result_bytes()?;
+        let (graphs, graph_bytes) = self.cache.stats(Kind::Graph)?;
+        let (results, result_bytes) = self.cache.stats(Kind::Result)?;
         let snapshots_dir = self.paths.snapshots_dir();
         let (snapshots, snapshot_bytes) = directory_stats(&snapshots_dir)?;
         Ok(CacheStatus {
@@ -662,7 +640,7 @@ impl Engine {
             result_bytes,
             snapshots,
             snapshot_bytes,
-            database: self.paths.database(),
+            cache_dir: self.paths.cache_dir.clone(),
             snapshots_dir,
         })
     }
@@ -670,7 +648,7 @@ impl Engine {
     /// Removes everything the cache holds and reports what was there.
     pub fn cache_clear(&self) -> Result<CacheStatus> {
         let status = self.cache_status()?;
-        self.store.clear()?;
+        self.cache.clear()?;
         remove_dir_if_present(&self.paths.snapshots_dir())?;
         remove_dir_if_present(&self.paths.target_dir())?;
         Ok(status)
@@ -707,8 +685,8 @@ impl Engine {
         let key = self.key_for(repo, source, options, toolchain)?;
 
         if let Some(key) = &key
-            && let Some(bytes) = self.store.get_graph(&key.hash())?
-            && let Ok(graph) = decode_graph(&bytes)
+            && let Some(bytes) = self.cache.get(Kind::Graph, &key.hash())?
+            && let Ok(graph) = codec::decode::<RevisionGraph>(&bytes)
         {
             return Ok(FetchedGraph {
                 graph: Arc::new(graph),
@@ -784,13 +762,9 @@ impl Engine {
         // before the load starts.
         let base_key = self.key_for(repo, &comparison.base, options, toolchain)?;
         let head_key = self.key_for(repo, &comparison.head, options, toolchain)?;
-        let cached = self.store.list_graphs()?;
-        let in_cache = |key: &Option<AnalysisKey>| match key {
-            Some(key) => {
-                let hash = key.hash();
-                cached.iter().any(|entry| entry.key_hash == hash)
-            }
-            None => false,
+        let in_cache = |key: &Option<AnalysisKey>| {
+            key.as_ref()
+                .is_some_and(|key| self.cache.contains(Kind::Graph, &key.hash()))
         };
         if in_cache(&base_key) || in_cache(&head_key) {
             return Ok(None);
@@ -991,11 +965,8 @@ impl Engine {
         let Some(key) = key else {
             return Ok(());
         };
-        let bytes = encode_graph(graph)?;
-        let key_json = serde_json::to_string(key).map_err(|error| {
-            Error::Codec(format!("could not serialise the analysis key: {error}"))
-        })?;
-        self.store.put_graph(&key.hash(), &key_json, &bytes)?;
+        self.cache
+            .put(Kind::Graph, &key.hash(), &codec::encode(graph)?)?;
         Ok(())
     }
 
@@ -1107,7 +1078,7 @@ pub struct DiffOutput {
 }
 
 /// What the cache holds and where it lives: revision graphs, the analyses
-/// computed from them, materialised snapshots and the database itself.
+/// computed from them and materialised snapshots.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CacheStatus {
     /// Number of cached graphs.
@@ -1123,20 +1094,10 @@ pub struct CacheStatus {
     pub snapshots: u64,
     /// Total size of the snapshots on disk, in bytes.
     pub snapshot_bytes: u64,
-    /// Path of the cache database.
-    pub database: PathBuf,
+    /// The cache directory.
+    pub cache_dir: PathBuf,
     /// Directory holding materialised snapshots.
     pub snapshots_dir: PathBuf,
-}
-
-/// The cache directories used by [`Engine::with_store`].
-fn temporary_paths() -> blastr_store::Paths {
-    let cache_dir = std::env::temp_dir().join("blastr");
-    let config_dir = cache_dir.join("config");
-    blastr_store::Paths {
-        cache_dir,
-        config_dir,
-    }
 }
 
 /// The cache key of an analysis: BLAKE3, as lowercase hexadecimal, of a fixed
@@ -1156,24 +1117,6 @@ fn result_key(base: &AnalysisKey, head: &AnalysisKey, params: &AnalysisParams) -
     hasher.update(head.hash().as_bytes());
     hasher.update(&parameters);
     Ok(hasher.finalize().to_hex().to_string())
-}
-
-/// Encodes an analysis for the cache: JSON compressed with zstd.
-fn encode_analysis(analysis: &Analysis) -> Result<Vec<u8>> {
-    let raw = serde_json::to_vec(analysis)
-        .map_err(|error| Error::Codec(format!("could not serialise the analysis: {error}")))?;
-    zstd::encode_all(raw.as_slice(), ANALYSIS_COMPRESSION_LEVEL)
-        .map_err(|error| Error::Codec(format!("could not compress the analysis: {error}")))
-}
-
-/// Decodes bytes produced by [`encode_analysis`]; `None` when they are not a
-/// readable analysis.
-///
-/// A damaged entry means the cache cannot be trusted, but it is not a failure
-/// of the current run: the analysis is computed again and stored over it.
-fn decode_analysis(bytes: &[u8]) -> Option<Analysis> {
-    let raw = zstd::decode_all(bytes).ok()?;
-    serde_json::from_slice(&raw).ok()
 }
 
 /// The output of `rustc --version` run in `dir`, or `unknown` when it cannot
@@ -1483,25 +1426,17 @@ mod tests {
 
     use super::*;
 
-    fn paths_under(dir: &Path) -> blastr_store::Paths {
-        blastr_store::Paths {
+    fn paths_under(dir: &Path) -> Paths {
+        Paths {
             cache_dir: dir.to_path_buf(),
             config_dir: dir.join("config"),
         }
     }
 
     #[test]
-    fn engine_uses_the_given_store() {
-        let store = blastr_store::Store::open_in_memory().unwrap();
-        let engine = Engine::with_store(store);
-        let _ = engine.store();
-    }
-
-    #[test]
     fn fresh_cache_reports_zeros() {
         let dir = tempfile::tempdir().unwrap();
-        let store = blastr_store::Store::open_in_memory().unwrap();
-        let engine = Engine::with_store_and_paths(store, paths_under(dir.path()));
+        let engine = Engine::with_paths(paths_under(dir.path()));
 
         let status = engine.cache_status().unwrap();
         assert_eq!(status.graphs, 0);
@@ -1510,17 +1445,17 @@ mod tests {
         assert_eq!(status.result_bytes, 0);
         assert_eq!(status.snapshots, 0);
         assert_eq!(status.snapshot_bytes, 0);
-        assert_eq!(status.database, dir.path().join("blastr.db"));
+        assert_eq!(status.cache_dir, dir.path());
         assert_eq!(status.snapshots_dir, dir.path().join("snapshots"));
     }
 
     #[test]
     fn clear_reports_and_removes_graphs_and_snapshots() {
         let dir = tempfile::tempdir().unwrap();
-        let store = blastr_store::Store::open_in_memory().unwrap();
-        store.put_graph("key", "{}", b"graph").unwrap();
-        store.put_result("result", b"analysis").unwrap();
         let paths = paths_under(dir.path());
+        let cache = Cache::new(&paths.cache_dir);
+        cache.put(Kind::Graph, "key", b"graph").unwrap();
+        cache.put(Kind::Result, "result", b"analysis").unwrap();
 
         let snapshot = paths.snapshots_dir().join("4f2a91c");
         std::fs::create_dir_all(&snapshot).unwrap();
@@ -1529,7 +1464,7 @@ mod tests {
         std::fs::create_dir_all(&build).unwrap();
         std::fs::write(build.join("out"), b"x").unwrap();
 
-        let engine = Engine::with_store_and_paths(store, paths.clone());
+        let engine = Engine::with_paths(paths.clone());
         let status = engine.cache_clear().unwrap();
 
         assert_eq!(status.graphs, 1);
@@ -1538,8 +1473,6 @@ mod tests {
         assert_eq!(status.result_bytes, 8);
         assert_eq!(status.snapshots, 1);
         assert_eq!(status.snapshot_bytes, 12);
-        assert!(engine.store().list_graphs().unwrap().is_empty());
-        assert_eq!(engine.store().result_count().unwrap(), 0);
         assert!(!paths.snapshots_dir().exists());
         assert!(!paths.target_dir().exists());
         assert_eq!(engine.cache_status().unwrap().graphs, 0);
@@ -1552,7 +1485,6 @@ mod tests {
         // Cargo and a Git checkout both leave read-only entries behind, and
         // Windows refuses to delete those until the attribute is cleared.
         let dir = tempfile::tempdir().unwrap();
-        let store = blastr_store::Store::open_in_memory().unwrap();
         let paths = paths_under(dir.path());
         let snapshot = paths.snapshots_dir().join("4f2a91c").join(".git");
         std::fs::create_dir_all(&snapshot).unwrap();
@@ -1562,7 +1494,7 @@ mod tests {
         permissions.set_readonly(true);
         std::fs::set_permissions(&pack, permissions).unwrap();
 
-        let engine = Engine::with_store_and_paths(store, paths.clone());
+        let engine = Engine::with_paths(paths.clone());
         engine.cache_clear().unwrap();
 
         assert!(!paths.snapshots_dir().exists());
@@ -1668,27 +1600,29 @@ mod tests {
     #[test]
     fn an_analysis_round_trips_through_the_codec() {
         let analysis = sample_analysis();
-        let bytes = encode_analysis(&analysis).unwrap();
+        let bytes = codec::encode(&analysis).unwrap();
         assert!(!bytes.is_empty());
-        assert_eq!(decode_analysis(&bytes), Some(analysis));
+        assert_eq!(codec::decode::<Analysis>(&bytes).ok(), Some(analysis));
     }
 
     #[test]
     fn a_damaged_analysis_blob_is_a_miss() {
-        assert_eq!(decode_analysis(b"not compressed at all"), None);
+        assert!(codec::decode::<Analysis>(b"not compressed at all").is_err());
 
-        let mut truncated = encode_analysis(&sample_analysis()).unwrap();
+        let mut truncated = codec::encode(&sample_analysis()).unwrap();
         truncated.truncate(truncated.len() / 2);
-        assert_eq!(decode_analysis(&truncated), None);
+        assert!(codec::decode::<Analysis>(&truncated).is_err());
     }
 
     #[test]
     fn cache_status_counts_stored_analyses() {
         let dir = tempfile::tempdir().unwrap();
-        let store = blastr_store::Store::open_in_memory().unwrap();
-        store.put_result("first", b"short").unwrap();
-        store.put_result("second", b"a longer payload").unwrap();
-        let engine = Engine::with_store_and_paths(store, paths_under(dir.path()));
+        let cache = Cache::new(dir.path());
+        cache.put(Kind::Result, "first", b"short").unwrap();
+        cache
+            .put(Kind::Result, "second", b"a longer payload")
+            .unwrap();
+        let engine = Engine::with_paths(paths_under(dir.path()));
 
         let status = engine.cache_status().unwrap();
         assert_eq!(status.results, 2);

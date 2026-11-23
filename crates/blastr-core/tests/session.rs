@@ -58,15 +58,14 @@ fn a_session_reports_what_a_save_affects() {
     let dir = temp.path();
     repository(dir);
 
-    let store = blastr_store::Store::open_in_memory().expect("open an in-memory store");
     // The cache lives outside the repository, or its files would be part of
     // the working tree the session watches.
     let outside = tempfile::tempdir().expect("create a second temporary directory");
-    let paths = blastr_store::Paths {
+    let paths = blastr_model::Paths {
         cache_dir: outside.path().join("cache"),
         config_dir: outside.path().join("config"),
     };
-    let engine = Engine::with_store_and_paths(store, paths);
+    let engine = Engine::with_paths(paths);
     let cancel = CancelToken::new();
     let spec = RevSpec {
         worktree: true,

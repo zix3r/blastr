@@ -232,7 +232,7 @@ pub fn repository_name(path: &Path) -> String {
 /// Empty when it cannot be determined, which leaves the settings file in the
 /// current directory; the window then starts from the defaults.
 pub fn config_dir() -> PathBuf {
-    blastr_store::paths()
+    blastr_model::paths()
         .map(|paths| paths.config_dir)
         .unwrap_or_default()
 }

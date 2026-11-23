@@ -1,34 +1,35 @@
-//! Encoding of [`RevisionGraph`] values for the cache.
+//! Encoding of cache entries: revision graphs and finished analyses.
 //!
-//! A graph is serialised with `postcard` and then compressed with `zstd`.
+//! A value is serialised with `postcard` and then compressed with `zstd`.
 //! Every failure is reported as [`Error::Codec`], because a value that cannot
 //! be encoded or decoded means the cache cannot be trusted, not that the
 //! project under analysis is wrong.
 
-use blastr_model::RevisionGraph;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 use crate::{Error, Result};
 
-/// Compression level used for cached graphs.
+/// Compression level used for cache entries.
 ///
-/// Graphs compress very well and are read far more often than they are
+/// Entries compress very well and are read far more often than they are
 /// written, so a middle level keeps both costs small.
 const COMPRESSION_LEVEL: i32 = 3;
 
-/// Encodes a graph as postcard bytes compressed with zstd.
-pub fn encode_graph(graph: &RevisionGraph) -> Result<Vec<u8>> {
-    let raw = postcard::to_allocvec(graph)
-        .map_err(|error| Error::Codec(format!("could not serialise the graph: {error}")))?;
+/// Encodes a value as postcard bytes compressed with zstd.
+pub(crate) fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>> {
+    let raw = postcard::to_allocvec(value)
+        .map_err(|error| Error::Codec(format!("could not serialise a cache entry: {error}")))?;
     zstd::encode_all(raw.as_slice(), COMPRESSION_LEVEL)
-        .map_err(|error| Error::Codec(format!("could not compress the graph: {error}")))
+        .map_err(|error| Error::Codec(format!("could not compress a cache entry: {error}")))
 }
 
-/// Decodes bytes produced by [`encode_graph`].
-pub fn decode_graph(bytes: &[u8]) -> Result<RevisionGraph> {
+/// Decodes bytes produced by [`encode`].
+pub(crate) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     let raw = zstd::decode_all(bytes)
-        .map_err(|error| Error::Codec(format!("could not decompress the graph: {error}")))?;
+        .map_err(|error| Error::Codec(format!("could not decompress a cache entry: {error}")))?;
     postcard::from_bytes(&raw)
-        .map_err(|error| Error::Codec(format!("could not deserialise the graph: {error}")))
+        .map_err(|error| Error::Codec(format!("could not deserialise a cache entry: {error}")))
 }
 
 #[cfg(test)]
@@ -38,7 +39,12 @@ mod tests {
         SymbolFlags, SymbolId, SymbolKind, SymbolPath, TargetKind, UnresolvedRef, Visibility,
     };
 
-    use super::*;
+    use super::{encode as encode_graph, *};
+    use blastr_model::RevisionGraph;
+
+    fn decode_graph(bytes: &[u8]) -> Result<RevisionGraph> {
+        decode(bytes)
+    }
 
     fn loc(file: &str, start: u32, end: u32) -> Location {
         Location {

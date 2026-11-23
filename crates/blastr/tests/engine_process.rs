@@ -195,8 +195,8 @@ fn the_engine_process_computes_what_a_direct_call_computes() {
     let mut driver = opened(driver, temp.path());
     let from_process = compare(&mut driver, temp.path(), spec.clone());
 
-    let store = blastr_store::Store::open_in_memory().expect("an in-memory store");
-    let direct = Engine::with_store(store)
+    let cache = tempfile::tempdir().expect("a cache directory");
+    let direct = Engine::with_paths(blastr_model::Paths::under(cache.path()))
         .analyze(
             temp.path(),
             &spec,

@@ -34,5 +34,4 @@ winresource.workspace = true
 
 [dev-dependencies]
 blastr-model.workspace = true
-blastr-store.workspace = true
 tempfile.workspace = true

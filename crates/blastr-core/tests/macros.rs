@@ -86,15 +86,14 @@ fn an_incomplete_graph_is_reported_and_not_cached() {
     let dir = temp.path().join("repo");
     repository(&dir);
 
-    let store = blastr_store::Store::open_in_memory().expect("open an in-memory store");
     // Snapshot and target directories live outside the repository, or their
     // files would be part of the working tree that is analysed.
     let outside = tempfile::tempdir().expect("create a second temporary directory");
-    let paths = blastr_store::Paths {
+    let paths = blastr_model::Paths {
         cache_dir: outside.path().join("cache"),
         config_dir: outside.path().join("config"),
     };
-    let engine = Engine::with_store_and_paths(store, paths);
+    let engine = Engine::with_paths(paths);
     let cancel = CancelToken::new();
     let spec = RevSpec {
         worktree: true,
@@ -134,8 +133,8 @@ fn an_incomplete_graph_is_reported_and_not_cached() {
     );
 
     // Nothing was stored, so the next run tries the project again.
-    assert!(engine.store().list_graphs().unwrap().is_empty());
-    assert_eq!(engine.store().result_count().unwrap(), 0);
+    assert_eq!(engine.cache_status().unwrap().graphs, 0);
+    assert_eq!(engine.cache_status().unwrap().results, 0);
 
     let again = engine
         .analyze(
@@ -152,6 +151,6 @@ fn an_incomplete_graph_is_reported_and_not_cached() {
         Some(vec!["broken_macro".to_owned()]),
         "the second run says the same thing"
     );
-    assert!(engine.store().list_graphs().unwrap().is_empty());
-    assert_eq!(engine.store().result_count().unwrap(), 0);
+    assert_eq!(engine.cache_status().unwrap().graphs, 0);
+    assert_eq!(engine.cache_status().unwrap().results, 0);
 }

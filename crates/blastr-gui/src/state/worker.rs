@@ -795,9 +795,9 @@ fn engine_program() -> Result<PathBuf, String> {
 
 /// The file the engine's log is written to.
 fn log_path() -> PathBuf {
-    match blastr_store::paths() {
-        Ok(paths) => paths.cache_dir.join(LOG_NAME),
-        Err(_) => std::env::temp_dir().join(format!("blastr-{LOG_NAME}")),
+    match blastr_model::paths() {
+        Some(paths) => paths.cache_dir.join(LOG_NAME),
+        None => std::env::temp_dir().join(format!("blastr-{LOG_NAME}")),
     }
 }
 
