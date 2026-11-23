@@ -6,7 +6,6 @@
 //! [`Display`](std::fmt::Display), so serialised data and human-readable output
 //! never disagree.
 
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Generates the `ALL` constant, `as_str` and `Display` for a vocabulary enum.
@@ -33,9 +32,7 @@ macro_rules! model_enum {
 }
 
 /// The kind of definition a symbol is.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SymbolKind {
     /// A free function.
@@ -89,7 +86,7 @@ model_enum!(
 );
 
 /// A directed dependency edge from one symbol to another.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum EdgeKind {
     /// A statically resolved call.
@@ -138,7 +135,7 @@ model_enum!(
 );
 
 /// How precisely a dependency edge was resolved.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Certainty {
     /// Resolved to exactly one definition.
@@ -156,7 +153,7 @@ model_enum!(
 );
 
 /// What kind of change happened to a symbol between two revisions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ChangeKind {
     /// Whitespace, comments or formatting only.
@@ -216,7 +213,7 @@ model_enum!(
 );
 
 /// Why a dependent symbol is affected by a change.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ImpactClass {
     /// The code refers to something whose shape changed and must be made
@@ -235,9 +232,7 @@ model_enum!(
 );
 
 /// How strongly the analysis believes an impact is real.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Confidence {
     /// The impact may exist but the evidence is weak.
@@ -258,7 +253,7 @@ model_enum!(
 );
 
 /// How much execution the analysis is allowed during a build.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ExecMode {
     /// Build scripts and procedural macros run.

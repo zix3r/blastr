@@ -580,13 +580,7 @@ impl<W: Write + Send> Server<W> {
         let progress = self.progress(id);
         let started = Instant::now();
         match engine.what_if(
-            repo_root,
-            symbol,
-            assume,
-            options,
-            params,
-            &progress,
-            cancel,
+            repo_root, symbol, assume, options, params, &progress, cancel,
         ) {
             Ok(analysis) => {
                 if !cancel.is_cancelled() {

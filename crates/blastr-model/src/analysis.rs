@@ -1,12 +1,10 @@
 //! The result of an impact analysis: what a set of changes can affect, why,
 //! and which tests exercise it.
 //!
-//! These types are what the JSON output contains, what the window shows and
-//! what the engine process sends across its pipes.
+//! These types are what the window shows and what the engine process sends
+//! across its pipes.
 
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 
 use crate::{
     Certainty, Confidence, DiffResult, EdgeDetail, EdgeKind, ImpactClass, Location, SymbolPath,
@@ -14,7 +12,7 @@ use crate::{
 };
 
 /// Why the first step of an evidence path reaches its item.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Reason {
     /// Calls a function whose body changed.
@@ -68,7 +66,7 @@ pub enum Reason {
 }
 
 /// One step of an evidence path: `from` depends on `to`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvidenceStep {
     /// The dependent symbol, the one this step reaches.
     pub from: SymbolPath,
@@ -86,7 +84,7 @@ pub struct EvidenceStep {
 }
 
 /// A chain of references leading from a change to an affected item.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EvidencePath {
     /// Index into [`DiffResult::changes`] of the change the path starts at.
     pub change: u32,
@@ -103,7 +101,7 @@ pub struct EvidencePath {
 }
 
 /// Facts about an affected item worth showing next to it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ImpactTags {
     /// The item is a test function.
     pub is_test: bool,
@@ -117,7 +115,7 @@ pub struct ImpactTags {
 }
 
 /// One item affected by the changes.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ImpactItem {
     /// The affected symbol, by its head-side identity.
     pub symbol: SymbolPath,
@@ -140,7 +138,7 @@ pub struct ImpactItem {
 }
 
 /// Why a test was selected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TestReason {
     /// The test itself changed or was added.
@@ -150,7 +148,7 @@ pub enum TestReason {
 }
 
 /// A test worth running.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SelectedTest {
     /// The test function.
     pub symbol: SymbolPath,
@@ -163,7 +161,7 @@ pub struct SelectedTest {
 }
 
 /// One `cargo test` invocation covering selected tests of one target.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TestCommand {
     /// The Cargo package.
     pub package: String,
@@ -182,7 +180,7 @@ pub struct TestCommand {
 }
 
 /// The tests affected by the changes.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct TestSelection {
     /// The selected tests, ordered by path.
     pub selected: Vec<SelectedTest>,
@@ -194,7 +192,7 @@ pub struct TestSelection {
 }
 
 /// What the impact result leaves out or is unsure about.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ImpactLimits {
     /// Unresolved references in the head graph.
     pub unresolved_total: u32,
@@ -215,7 +213,7 @@ pub struct ImpactLimits {
 }
 
 /// The weights used to score evidence paths.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct RankingParams {
     /// Multiplier applied for each step after the first.
     pub decay: f32,
@@ -230,7 +228,7 @@ pub struct RankingParams {
 }
 
 /// Everything that shapes an impact result besides the code itself.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AnalysisParams {
     /// Scoring weights.
     pub ranking: RankingParams,
@@ -243,7 +241,7 @@ pub struct AnalysisParams {
 }
 
 /// A complete impact analysis of one comparison.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Analysis {
     /// What was compared and what changed structurally.
     pub diff: DiffResult,
@@ -258,40 +256,8 @@ pub struct Analysis {
     pub params: AnalysisParams,
 }
 
-/// The version of the JSON output format.
-pub const SCHEMA_VERSION: u32 = 1;
-
-/// The JSON Schema of the JSON output: an [`Analysis`] object with a leading `schema_version`.
-pub fn analysis_schema() -> Value {
-    let mut schema = schemars::schema_for!(Analysis).to_value();
-    let describes_fields = schema
-        .as_object()
-        .and_then(|object| object.get("properties"))
-        .and_then(Value::as_object)
-        .is_some();
-    if !describes_fields {
-        return schema;
-    }
-    if let Some(object) = schema.as_object_mut() {
-        if let Some(properties) = object.get_mut("properties").and_then(Value::as_object_mut) {
-            properties.insert(
-                "schema_version".to_owned(),
-                json!({ "type": "integer", "const": SCHEMA_VERSION }),
-            );
-        }
-        if let Some(required) = object.get_mut("required").and_then(Value::as_array_mut) {
-            required.push(Value::String("schema_version".to_owned()));
-        }
-        object.insert(
-            "title".to_owned(),
-            Value::String("Blastr analysis".to_owned()),
-        );
-    }
-    schema
-}
-
 /// A change to assume for a what-if query.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Assume {
     /// The body or value changes.
