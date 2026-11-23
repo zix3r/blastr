@@ -1,19 +1,22 @@
-//! The impact rule matrix: which change reaches which dependents, with what
-//! class, certainty and reason.
+//! The impact rules: which dependents a change reaches, with what class,
+//! certainty and reason.
 //!
-//! The matrix is data, not a nest of branches. Every [`Rule`] names the changes
-//! it applies to, the graph it reads, the targets whose incoming edges it
-//! follows, and one [`Source`] per group of edge kinds with its own filter,
-//! certainty, reason and continuation. [`first_steps`] applies the table to one
-//! change; [`onward`] is the behaviour-propagation step the search repeats from
-//! every item it has reached.
+//! [`first_steps`] matches a change on its kind and detail and follows the
+//! incoming edges that case is about; [`onward`] is the behaviour step the
+//! search repeats from every item it has reached.
+//!
+//! A formatting-only change, a widened visibility, an added item, a reshaped
+//! variant, a trait item that gained a body and an attribute change on anything
+//! but a function reach nothing by themselves.
+
+use std::collections::HashSet;
 
 use blastr_model::{
     Certainty, Change, ChangeDetail, ChangeKind, Delta, Edge, EdgeDetail, EdgeKind, GraphIndex,
-    ImpactClass, Reason, RevisionGraph, SymbolId, SymbolKind, SymbolPath, Visibility,
+    ImpactClass, Reason, RevisionGraph, SymbolFlags, SymbolId, SymbolKind, SymbolPath, Visibility,
 };
 
-/// Which side of the comparison a rule reads.
+/// Which side of the comparison a step reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Side {
     /// The graph of the older side.
@@ -62,34 +65,29 @@ impl<'a> Graphs<'a> {
     }
 }
 
-/// One dependency step a rule took: the edge it followed and what the reached
-/// item means. The reached symbol is the edge's `from`.
+/// One dependency step: the edge it followed and what the reached item means.
+/// The reached symbol is the edge's `from`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Reach {
     /// The graph the edge index belongs to.
     pub(crate) side: Side,
     /// Index into that side's `edges`.
     pub(crate) edge: u32,
-    /// The class the reached item gets when the path stops here.
+    /// The class the reached item gets from this step.
     pub(crate) class: ImpactClass,
     /// How certain the step is.
     pub(crate) certainty: Certainty,
     /// Why the step applies.
     pub(crate) reason: Reason,
-    /// A step that precedes [`Reach::edge`] in the evidence path.
+    /// A step between the changed symbol and [`Reach::edge`], when the item
+    /// hangs off the change two steps away.
     pub(crate) via: Option<Via>,
-    /// Whether behaviour propagation continues from the reached item.
-    pub(crate) continues: bool,
     /// Whether the rule cannot tell exactly who is affected.
     pub(crate) coarse: bool,
 }
 
-/// A step between the changed symbol and the edge that reaches an item.
-///
-/// A group of edges with a [`Source::chained`] group takes two steps: the first
-/// one, next to the change, is kept here so that the evidence path can show how
-/// the item hangs off the change, and the edge that the [`Reach`] carries is the
-/// second one.
+/// The first of two steps: kept so that the evidence path can show how the
+/// item hangs off the change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Via {
     /// Index of the first step's edge on the reach's side.
@@ -98,8 +96,20 @@ pub(crate) struct Via {
     pub(crate) certainty: Certainty,
 }
 
-/// The changed symbol kinds a rule restricts itself to.
-const ANY_KIND: &[SymbolKind] = &[];
+/// Every edge kind that is a reference to the target: all but `Contains`.
+const REFERENCES: &[EdgeKind] = &[
+    EdgeKind::Calls,
+    EdgeKind::TakesAsValue,
+    EdgeKind::UsesType,
+    EdgeKind::ReadsField,
+    EdgeKind::WritesField,
+    EdgeKind::Constructs,
+    EdgeKind::Matches,
+    EdgeKind::Implements,
+    EdgeKind::MayDispatchTo,
+    EdgeKind::UsesValue,
+    EdgeKind::Expands,
+];
 /// Functions and methods.
 const FUNCTION_OR_METHOD: &[SymbolKind] = &[SymbolKind::Function, SymbolKind::Method];
 /// The kinds a signature change is reported for as a declaration change.
@@ -112,1058 +122,273 @@ const DECLARATIONS: &[SymbolKind] = &[
 ];
 /// The containers a field can belong to.
 const STRUCT_OR_VARIANT: &[SymbolKind] = &[SymbolKind::Struct, SymbolKind::Variant];
-/// An enum, as the only container whose variant a `match` misses.
-const ENUM_ONLY: &[SymbolKind] = &[SymbolKind::Enum];
-/// A trait, as the only container whose item an implementation can miss.
-const TRAIT_ONLY: &[SymbolKind] = &[SymbolKind::Trait];
 
-/// The rule matrix.
-///
-/// Four kinds of change reach nothing and therefore have no entry: a
-/// formatting-only change, a widened visibility, a trait item that gained a
-/// body, and an attribute change on anything but a function follow no edges.
-pub(crate) static RULES: &[Rule] = &[
-    // A body change reaches the callers of the changed function.
-    Rule {
-        applies: Applies {
-            kind: ChangeKind::Body,
-            detail: DetailMatch::Any,
-            symbol_kinds: ANY_KIND,
-            has_body: None,
-        },
-        side: Side::Head,
-        class: ImpactClass::Behaviour,
-        coarse: Coarse::Never,
-        container_kinds: ANY_KIND,
-        sources: &[Source {
-            target: Target::Symbol,
-            edges: EdgeSet::Kinds(&[EdgeKind::Calls]),
-            filter: EdgeFilter::None,
-            certainty: CertaintyRule::Edge,
-            reason: Reason::CallsChanged,
-            continues: Continue::Always,
-            chained: None,
-        }],
-    },
-    // A body change reaches the code that holds the function as a value.
-    Rule {
-        applies: Applies {
-            kind: ChangeKind::Body,
-            detail: DetailMatch::Any,
-            symbol_kinds: ANY_KIND,
-            has_body: None,
-        },
-        side: Side::Head,
-        class: ImpactClass::Behaviour,
-        coarse: Coarse::Never,
-        container_kinds: ANY_KIND,
-        sources: &[Source {
-            target: Target::Symbol,
-            edges: EdgeSet::Kinds(&[EdgeKind::TakesAsValue]),
-            filter: EdgeFilter::None,
-            certainty: CertaintyRule::Candidate,
-            reason: Reason::TakesChangedAsValue,
-            continues: Continue::Always,
-            chained: None,
-        }],
-    },
-    // A body change reaches the code that may dispatch to it.
-    Rule {
-        applies: Applies {
-            kind: ChangeKind::Body,
-            detail: DetailMatch::Any,
-            symbol_kinds: ANY_KIND,
-            has_body: None,
-        },
-        side: Side::Head,
-        class: ImpactClass::Behaviour,
-        coarse: Coarse::Never,
-        container_kinds: ANY_KIND,
-        sources: &[Source {
-            target: Target::Symbol,
-            edges: EdgeSet::Kinds(&[EdgeKind::MayDispatchTo]),
-            filter: EdgeFilter::None,
-            certainty: CertaintyRule::Candidate,
-            reason: Reason::DispatchesToChanged,
-            continues: Continue::Always,
-            chained: None,
-        }],
-    },
-    // A body change in a function that defines a procedural macro reaches what
-    // that macro expands to. A seed is never expanded by `onward`, so the
-    // changed function itself needs this first step; the C13 row covers only a
-    // changed `macro_rules!` definition.
-    //
-    // The certainty is a candidate rather than the edge's own one. The edge is
-    // resolved — rust-analyzer resolved the macro path — but a body change says
-    // nothing certain about the tokens the macro now writes, which is the same
-    // uncertainty C13 carries: the expansion may be identical. Taking the
-    // resolved edge would report every invoker as likely affected when only the
-    // expansion, not the reference, is in question.
-    Rule {
-        applies: Applies {
-            kind: ChangeKind::Body,
-            detail: DetailMatch::Any,
-            symbol_kinds: FUNCTION_OR_METHOD,
-            has_body: None,
-        },
-        side: Side::Head,
-        class: ImpactClass::Behaviour,
-        coarse: Coarse::Never,
-        container_kinds: ANY_KIND,
-        sources: &[Source {
-            target: Target::Symbol,
-            edges: EdgeSet::Kinds(&[EdgeKind::Expands]),
-            filter: EdgeFilter::None,
-            certainty: CertaintyRule::Candidate,
-            reason: Reason::InvokesChangedMacro,
-            continues: Continue::Always,
-            chained: None,
-        }],
-    },
-    // A signature change makes the callers and holders adapt. A method that
-    // implements a trait item is left out: its callers name the trait, whose
-    // declaration did not change, so they compile unchanged.
-    Rule {
-        applies: Applies {
-            kind: ChangeKind::Signature,
-            detail: DetailMatch::Any,
-            symbol_kinds: FUNCTION_OR_METHOD,
-            has_body: None,
-        },
-        side: Side::Head,
-        class: ImpactClass::Adaptation,
-        coarse: Coarse::Never,
-        container_kinds: ANY_KIND,
-        sources: &[
-            Source {
-                target: Target::Symbol,
-                edges: EdgeSet::Kinds(&[EdgeKind::Calls]),
-                filter: EdgeFilter::NotInTraitImpl,
-                certainty: CertaintyRule::Edge,
-                reason: Reason::SignatureChanged,
-                continues: Continue::Always,
-                chained: None,
-            },
-            Source {
-                target: Target::Symbol,
-                edges: EdgeSet::Kinds(&[EdgeKind::TakesAsValue]),
-                filter: EdgeFilter::NotInTraitImpl,
-                certainty: CertaintyRule::Edge,
-                reason: Reason::SignatureChanged,
-                continues: Continue::Always,
-                chained: None,
-            },
-        ],
-    },
-    // A signature change reaches the code that may dispatch to a method.
-    Rule {
-        applies: Applies {
-            kind: ChangeKind::Signature,
-            detail: DetailMatch::Any,
-            symbol_kinds: FUNCTION_OR_METHOD,
-            has_body: None,
-        },
-        side: Side::Head,
-        class: ImpactClass::Behaviour,
-        coarse: Coarse::Never,
-        container_kinds: ANY_KIND,
-        sources: &[Source {
-            target: Target::Symbol,
-            edges: EdgeSet::Kinds(&[EdgeKind::MayDispatchTo]),
-            filter: EdgeFilter::None,
-            certainty: CertaintyRule::Candidate,
-            reason: Reason::DispatchesToChanged,
-            continues: Continue::Always,
-            chained: None,
-        }],
-    },
-    // A declaration change reaches everything that names the type.
-    Rule {
-        applies: Applies {
-            kind: ChangeKind::Signature,
-            detail: DetailMatch::Any,
-            symbol_kinds: DECLARATIONS,
-            has_body: None,
-        },
-        side: Side::Head,
-        class: ImpactClass::Adaptation,
-        coarse: Coarse::Always,
-        container_kinds: ANY_KIND,
-        sources: &[Source {
-            target: Target::Symbol,
-            edges: EdgeSet::Kinds(&[
-                EdgeKind::UsesType,
-                EdgeKind::Constructs,
-                EdgeKind::Matches,
-                EdgeKind::Implements,
-            ]),
-            filter: EdgeFilter::None,
-            certainty: CertaintyRule::Candidate,
-            reason: Reason::DeclarationChanged,
-            continues: Continue::Never,
-            chained: None,
-        }],
-    },
-    // A narrowed visibility reaches the referrers it no longer covers.
-    Rule {
-        applies: Applies {
-            kind: ChangeKind::Visibility,
-            detail: DetailMatch::Narrowed,
-            symbol_kinds: ANY_KIND,
-            has_body: None,
-        },
-        side: Side::Head,
-        class: ImpactClass::Adaptation,
-        coarse: Coarse::Restricted,
-        container_kinds: STRUCT_OR_VARIANT,
-        sources: &[
-            Source {
-                target: Target::Symbol,
-                edges: EdgeSet::Any,
-                filter: EdgeFilter::OutsideVisibility,
-                certainty: CertaintyRule::Edge,
-                reason: Reason::NoLongerVisible,
-                continues: Continue::Never,
-                chained: None,
-            },
-            // A field is also named by the literals of its container, which
-            // carry no edge of their own to the field: the literal has to
-            // spell the name out, and the compiler rejects it once the field
-            // is out of reach. A literal that ends with `..` may or may not
-            // name it.
-            Source {
-                target: Target::Container,
-                edges: EdgeSet::Kinds(&[EdgeKind::Constructs]),
-                filter: EdgeFilter::OutsideVisibility,
-                certainty: CertaintyRule::WithRestIsCandidate,
-                reason: Reason::NoLongerVisible,
-                continues: Continue::Never,
-                chained: None,
-            },
-        ],
-    },
-    // A removal reaches everything that refers to the symbol or to
-    // anything inside it, on the base side.
-    Rule {
-        applies: Applies {
-            kind: ChangeKind::Removed,
-            detail: DetailMatch::Any,
-            symbol_kinds: ANY_KIND,
-            has_body: None,
-        },
-        side: Side::Base,
-        class: ImpactClass::Adaptation,
-        coarse: Coarse::Never,
-        container_kinds: ANY_KIND,
-        sources: &[Source {
-            target: Target::SelfAndDescendants,
-            edges: EdgeSet::Any,
-            filter: EdgeFilter::None,
-            certainty: CertaintyRule::Edge,
-            reason: Reason::RefersToRemoved,
-            continues: Continue::Never,
-            chained: None,
-        }],
-    },
-    // A rename reaches what referred to the previous identity, on the
-    // base side.
-    Rule {
-        applies: Applies {
-            kind: ChangeKind::Renamed,
-            detail: DetailMatch::Renamed,
-            symbol_kinds: ANY_KIND,
-            has_body: None,
-        },
-        side: Side::Base,
-        class: ImpactClass::Adaptation,
-        coarse: Coarse::Never,
-        container_kinds: ANY_KIND,
-        sources: &[Source {
-            target: Target::Previous,
-            edges: EdgeSet::Any,
-            filter: EdgeFilter::None,
-            certainty: CertaintyRule::Edge,
-            reason: Reason::RefersToRenamed,
-            continues: Continue::Never,
-            chained: None,
-        }],
-    },
-    // A removed field reaches the sites that name it: its readers and
-    // writers, the patterns that destructure it and the literals that supply
-    // it. A literal or pattern that leaves its fields to a `..` does not name
-    // it and still compiles.
-    Rule {
-        applies: Applies {
-            kind: ChangeKind::Field,
-            detail: DetailMatch::Member(Delta::Removed),
-            symbol_kinds: ANY_KIND,
-            has_body: None,
-        },
-        side: Side::Base,
-        class: ImpactClass::Adaptation,
-        coarse: Coarse::Never,
-        container_kinds: STRUCT_OR_VARIANT,
-        sources: &[Source {
-            target: Target::Symbol,
-            edges: EdgeSet::Kinds(&[
-                EdgeKind::ReadsField,
-                EdgeKind::WritesField,
-                EdgeKind::Matches,
-            ]),
-            filter: EdgeFilter::None,
-            certainty: CertaintyRule::Edge,
-            reason: Reason::UsesChangedField,
-            continues: Continue::Never,
-            chained: None,
-        }],
-    },
-    // A removed field that was the only use of one of its container's generic
-    // parameters leaves that parameter unused (`E0392`), so the container's own
-    // declaration has to drop it as well. The step runs from the field to the
-    // `contains` edge of its struct or union, which names the container; the
-    // field's flag decides whether it applies, so no container kind is needed.
-    Rule {
-        applies: Applies {
-            kind: ChangeKind::Field,
-            detail: DetailMatch::Member(Delta::Removed),
-            symbol_kinds: ANY_KIND,
-            has_body: None,
-        },
-        side: Side::Base,
-        class: ImpactClass::Adaptation,
-        coarse: Coarse::Never,
-        container_kinds: ANY_KIND,
-        sources: &[Source {
-            target: Target::Symbol,
-            edges: EdgeSet::Kinds(&[EdgeKind::Contains]),
-            filter: EdgeFilter::SoleParameterUse,
-            certainty: CertaintyRule::Edge,
-            reason: Reason::ParameterBecomesUnused,
-            continues: Continue::Never,
-            chained: None,
-        }],
-    },
-    // the same on the head side, and only a field read
-    // carries behaviour further.
-    Rule {
-        applies: Applies {
-            kind: ChangeKind::Field,
-            detail: DetailMatch::Member(Delta::Modified),
-            symbol_kinds: ANY_KIND,
-            has_body: None,
-        },
-        side: Side::Head,
-        class: ImpactClass::Adaptation,
-        coarse: Coarse::Never,
-        container_kinds: STRUCT_OR_VARIANT,
-        sources: &[Source {
-            target: Target::Symbol,
-            edges: EdgeSet::Kinds(&[
-                EdgeKind::ReadsField,
-                EdgeKind::WritesField,
-                EdgeKind::Matches,
-            ]),
-            filter: EdgeFilter::None,
-            certainty: CertaintyRule::Edge,
-            reason: Reason::UsesChangedField,
-            continues: Continue::Kinds(&[EdgeKind::ReadsField]),
-            chained: None,
-        }],
-    },
-    // A new field reaches the literals that name every field.
-    Rule {
-        applies: Applies {
-            kind: ChangeKind::Field,
-            detail: DetailMatch::Member(Delta::Added),
-            symbol_kinds: ANY_KIND,
-            has_body: None,
-        },
-        side: Side::Head,
-        class: ImpactClass::Adaptation,
-        coarse: Coarse::Never,
-        container_kinds: STRUCT_OR_VARIANT,
-        sources: &[Source {
-            target: Target::Container,
-            edges: EdgeSet::Kinds(&[EdgeKind::Constructs]),
-            filter: EdgeFilter::WithoutRest,
-            certainty: CertaintyRule::Edge,
-            reason: Reason::ConstructsWithoutField,
-            continues: Continue::Never,
-            chained: None,
-        }],
-    },
-    // A new field reaches the struct and variant patterns that name every
-    // field.
-    Rule {
-        applies: Applies {
-            kind: ChangeKind::Field,
-            detail: DetailMatch::Member(Delta::Added),
-            symbol_kinds: ANY_KIND,
-            has_body: None,
-        },
-        side: Side::Head,
-        class: ImpactClass::Adaptation,
-        coarse: Coarse::Never,
-        container_kinds: STRUCT_OR_VARIANT,
-        sources: &[Source {
-            target: Target::Container,
-            edges: EdgeSet::Kinds(&[EdgeKind::Matches]),
-            filter: EdgeFilter::WithoutRest,
-            certainty: CertaintyRule::Edge,
-            reason: Reason::PatternMissesField,
-            continues: Continue::Never,
-            chained: None,
-        }],
-    },
-    // A new variant reaches the exhaustive matches of the enum.
-    Rule {
-        applies: Applies {
-            kind: ChangeKind::Variant,
-            detail: DetailMatch::Member(Delta::Added),
-            symbol_kinds: ANY_KIND,
-            has_body: None,
-        },
-        side: Side::Head,
-        class: ImpactClass::Adaptation,
-        coarse: Coarse::Never,
-        container_kinds: ENUM_ONLY,
-        sources: &[Source {
-            target: Target::Container,
-            edges: EdgeSet::Kinds(&[EdgeKind::Matches]),
-            filter: EdgeFilter::Detail(EdgeDetail::MatchExhaustive),
-            certainty: CertaintyRule::Edge,
-            reason: Reason::ExhaustiveMatchMissesVariant,
-            continues: Continue::Never,
-            chained: None,
-        }],
-    },
-    // A new variant reaches the matches whose catch-all now catches it.
-    Rule {
-        applies: Applies {
-            kind: ChangeKind::Variant,
-            detail: DetailMatch::Member(Delta::Added),
-            symbol_kinds: ANY_KIND,
-            has_body: None,
-        },
-        side: Side::Head,
-        class: ImpactClass::Behaviour,
-        coarse: Coarse::Never,
-        container_kinds: ENUM_ONLY,
-        sources: &[Source {
-            target: Target::Container,
-            edges: EdgeSet::Kinds(&[EdgeKind::Matches]),
-            filter: EdgeFilter::Detail(EdgeDetail::MatchWildcard),
-            certainty: CertaintyRule::Edge,
-            reason: Reason::WildcardCatchesNewVariant,
-            continues: Continue::Always,
-            chained: None,
-        }],
-    },
-    // A removed variant reaches everything that used it, on the base
-    // side.
-    //
-    // A *reshaped* variant has no rule of its own: the fields that reshaped
-    // it are reported with it, and each of them reaches exactly the literals
-    // and patterns that name it.
-    Rule {
-        applies: Applies {
-            kind: ChangeKind::Variant,
-            detail: DetailMatch::Member(Delta::Removed),
-            symbol_kinds: ANY_KIND,
-            has_body: None,
-        },
-        side: Side::Base,
-        class: ImpactClass::Adaptation,
-        coarse: Coarse::Never,
-        container_kinds: ANY_KIND,
-        sources: &[Source {
-            target: Target::SelfAndDescendants,
-            edges: EdgeSet::Any,
-            filter: EdgeFilter::None,
-            certainty: CertaintyRule::Edge,
-            reason: Reason::UsesChangedVariant,
-            continues: Continue::Never,
-            chained: None,
-        }],
-    },
-    // A required trait item that appeared reaches the implementations
-    // of the trait.
-    Rule {
-        applies: Applies {
-            kind: ChangeKind::TraitItem,
-            detail: DetailMatch::Member(Delta::Added),
-            symbol_kinds: ANY_KIND,
-            has_body: Some(false),
-        },
-        side: Side::Head,
-        class: ImpactClass::Adaptation,
-        coarse: Coarse::Never,
-        container_kinds: TRAIT_ONLY,
-        sources: &[Source {
-            target: Target::Container,
-            edges: EdgeSet::Kinds(&[EdgeKind::Implements]),
-            filter: EdgeFilter::FromImpl,
-            certainty: CertaintyRule::Edge,
-            reason: Reason::MustImplementTraitItem,
-            continues: Continue::Never,
-            chained: None,
-        }],
-    },
-    // A changed trait item reaches the implementations that provide it
-    // and the code that calls it.
-    Rule {
-        applies: Applies {
-            kind: ChangeKind::TraitItem,
-            detail: DetailMatch::Member(Delta::Modified),
-            symbol_kinds: ANY_KIND,
-            has_body: None,
-        },
-        side: Side::Head,
-        class: ImpactClass::Adaptation,
-        coarse: Coarse::Never,
-        container_kinds: TRAIT_ONLY,
-        sources: &[
-            Source {
-                target: Target::Symbol,
-                edges: EdgeSet::Kinds(&[EdgeKind::Implements]),
-                filter: EdgeFilter::None,
-                certainty: CertaintyRule::Edge,
-                reason: Reason::MustImplementTraitItem,
-                continues: Continue::Never,
-                chained: Some(&IMPLEMENTATION_CALLERS),
-            },
-            Source {
-                target: Target::Symbol,
-                edges: EdgeSet::Kinds(&[EdgeKind::Calls, EdgeKind::TakesAsValue]),
-                filter: EdgeFilter::None,
-                certainty: CertaintyRule::Edge,
-                reason: Reason::UsesChangedTraitItem,
-                continues: Continue::Always,
-                chained: None,
-            },
-        ],
-    },
-    // A removed trait item reaches everything that used it, on the base
-    // side.
-    Rule {
-        applies: Applies {
-            kind: ChangeKind::TraitItem,
-            detail: DetailMatch::Member(Delta::Removed),
-            symbol_kinds: ANY_KIND,
-            has_body: None,
-        },
-        side: Side::Base,
-        class: ImpactClass::Adaptation,
-        coarse: Coarse::Never,
-        container_kinds: ANY_KIND,
-        sources: &[Source {
-            target: Target::Symbol,
-            edges: EdgeSet::Any,
-            filter: EdgeFilter::None,
-            certainty: CertaintyRule::Edge,
-            reason: Reason::UsesChangedTraitItem,
-            continues: Continue::Never,
-            chained: None,
-        }],
-    },
-    // A changed default body reaches the implementations that do not
-    // override it.
-    Rule {
-        applies: Applies {
-            kind: ChangeKind::TraitItem,
-            detail: DetailMatch::DefaultBody,
-            symbol_kinds: ANY_KIND,
-            has_body: None,
-        },
-        side: Side::Head,
-        class: ImpactClass::Behaviour,
-        coarse: Coarse::Never,
-        container_kinds: TRAIT_ONLY,
-        sources: &[Source {
-            target: Target::Container,
-            edges: EdgeSet::Kinds(&[EdgeKind::Implements]),
-            filter: EdgeFilter::ImplDoesNotOverride,
-            certainty: CertaintyRule::Edge,
-            reason: Reason::InheritsChangedDefault,
-            continues: Continue::Never,
-            chained: None,
-        }],
-    },
-    // A changed default body reaches its callers, less surely when an
-    // implementation replaces the default.
-    Rule {
-        applies: Applies {
-            kind: ChangeKind::TraitItem,
-            detail: DetailMatch::DefaultBody,
-            symbol_kinds: ANY_KIND,
-            has_body: None,
-        },
-        side: Side::Head,
-        class: ImpactClass::Behaviour,
-        coarse: Coarse::Never,
-        container_kinds: TRAIT_ONLY,
-        sources: &[Source {
-            target: Target::Symbol,
-            edges: EdgeSet::Kinds(&[EdgeKind::Calls]),
-            filter: EdgeFilter::None,
-            certainty: CertaintyRule::OverrideIsCandidate,
-            reason: Reason::CallsChanged,
-            continues: Continue::Always,
-            chained: None,
-        }],
-    },
-    // A changed default body reaches the code that holds it as a value.
-    Rule {
-        applies: Applies {
-            kind: ChangeKind::TraitItem,
-            detail: DetailMatch::DefaultBody,
-            symbol_kinds: ANY_KIND,
-            has_body: None,
-        },
-        side: Side::Head,
-        class: ImpactClass::Behaviour,
-        coarse: Coarse::Never,
-        container_kinds: TRAIT_ONLY,
-        sources: &[Source {
-            target: Target::Symbol,
-            edges: EdgeSet::Kinds(&[EdgeKind::TakesAsValue]),
-            filter: EdgeFilter::None,
-            certainty: CertaintyRule::Candidate,
-            reason: Reason::TakesChangedAsValue,
-            continues: Continue::Always,
-            chained: None,
-        }],
-    },
-    // An implementation that appeared changes the resolution of every
-    // reference to its items.
-    Rule {
-        applies: Applies {
-            kind: ChangeKind::Impl,
-            detail: DetailMatch::Member(Delta::Added),
-            symbol_kinds: ANY_KIND,
-            has_body: None,
-        },
-        side: Side::Head,
-        class: ImpactClass::Behaviour,
-        coarse: Coarse::Never,
-        container_kinds: ANY_KIND,
-        sources: &[Source {
-            target: Target::Children,
-            edges: EdgeSet::Kinds(&[
-                EdgeKind::Calls,
-                EdgeKind::TakesAsValue,
-                EdgeKind::MayDispatchTo,
-            ]),
-            filter: EdgeFilter::None,
-            certainty: CertaintyRule::Edge,
-            reason: Reason::ImplResolutionChanged,
-            continues: Continue::Always,
-            chained: None,
-        }],
-    },
-    // the same for an implementation that disappeared, read
-    // on the base side.
-    Rule {
-        applies: Applies {
-            kind: ChangeKind::Impl,
-            detail: DetailMatch::Member(Delta::Removed),
-            symbol_kinds: ANY_KIND,
-            has_body: None,
-        },
-        side: Side::Base,
-        class: ImpactClass::Behaviour,
-        coarse: Coarse::Never,
-        container_kinds: ANY_KIND,
-        sources: &[Source {
-            target: Target::Children,
-            edges: EdgeSet::Kinds(&[
-                EdgeKind::Calls,
-                EdgeKind::TakesAsValue,
-                EdgeKind::MayDispatchTo,
-            ]),
-            filter: EdgeFilter::None,
-            certainty: CertaintyRule::Edge,
-            reason: Reason::ImplResolutionChanged,
-            continues: Continue::Always,
-            chained: None,
-        }],
-    },
-    // A changed constant value reaches the code that reads it.
-    Rule {
-        applies: Applies {
-            kind: ChangeKind::ConstValue,
-            detail: DetailMatch::None,
-            symbol_kinds: ANY_KIND,
-            has_body: None,
-        },
-        side: Side::Head,
-        class: ImpactClass::Behaviour,
-        coarse: Coarse::Never,
-        container_kinds: ANY_KIND,
-        sources: &[Source {
-            target: Target::Symbol,
-            edges: EdgeSet::Kinds(&[EdgeKind::UsesValue]),
-            filter: EdgeFilter::None,
-            certainty: CertaintyRule::Edge,
-            reason: Reason::UsesChangedValue,
-            continues: Continue::Always,
-            chained: None,
-        }],
-    },
-    // A retyped constant makes the code that reads it adapt.
-    Rule {
-        applies: Applies {
-            kind: ChangeKind::ConstValue,
-            detail: DetailMatch::Retyped,
-            symbol_kinds: ANY_KIND,
-            has_body: None,
-        },
-        side: Side::Head,
-        class: ImpactClass::Adaptation,
-        coarse: Coarse::Never,
-        container_kinds: ANY_KIND,
-        sources: &[Source {
-            target: Target::Symbol,
-            edges: EdgeSet::Kinds(&[EdgeKind::UsesValue]),
-            filter: EdgeFilter::None,
-            certainty: CertaintyRule::Edge,
-            reason: Reason::UsesRetypedValue,
-            continues: Continue::Always,
-            chained: None,
-        }],
-    },
-    // A changed type alias reaches the code that names it.
-    Rule {
-        applies: Applies {
-            kind: ChangeKind::TypeAlias,
-            detail: DetailMatch::Any,
-            symbol_kinds: ANY_KIND,
-            has_body: None,
-        },
-        side: Side::Head,
-        class: ImpactClass::Adaptation,
-        coarse: Coarse::Always,
-        container_kinds: ANY_KIND,
-        sources: &[Source {
-            target: Target::Symbol,
-            edges: EdgeSet::Kinds(&[EdgeKind::UsesType]),
-            filter: EdgeFilter::None,
-            certainty: CertaintyRule::Candidate,
-            reason: Reason::UsesChangedAlias,
-            continues: Continue::Never,
-            chained: None,
-        }],
-    },
-    // A changed macro definition reaches the code that invokes it.
-    Rule {
-        applies: Applies {
-            kind: ChangeKind::MacroDef,
-            detail: DetailMatch::Any,
-            symbol_kinds: ANY_KIND,
-            has_body: None,
-        },
-        side: Side::Head,
-        class: ImpactClass::Behaviour,
-        coarse: Coarse::Never,
-        container_kinds: ANY_KIND,
-        sources: &[Source {
-            target: Target::Symbol,
-            edges: EdgeSet::Kinds(&[EdgeKind::Expands]),
-            filter: EdgeFilter::None,
-            certainty: CertaintyRule::Candidate,
-            reason: Reason::InvokesChangedMacro,
-            continues: Continue::Always,
-            chained: None,
-        }],
-    },
-    // A changed attribute on a function reaches what a body change reaches,
-    // as a candidate.
-    Rule {
-        applies: Applies {
-            kind: ChangeKind::Attribute,
-            detail: DetailMatch::Any,
-            symbol_kinds: FUNCTION_OR_METHOD,
-            has_body: None,
-        },
-        side: Side::Head,
-        class: ImpactClass::Behaviour,
-        coarse: Coarse::Never,
-        container_kinds: ANY_KIND,
-        sources: &[
-            Source {
-                target: Target::Symbol,
-                edges: EdgeSet::Kinds(&[EdgeKind::Calls]),
-                filter: EdgeFilter::None,
-                certainty: CertaintyRule::Candidate,
-                reason: Reason::AttributeChanged,
-                continues: Continue::Always,
-                chained: None,
-            },
-            Source {
-                target: Target::Symbol,
-                edges: EdgeSet::Kinds(&[EdgeKind::TakesAsValue]),
-                filter: EdgeFilter::None,
-                certainty: CertaintyRule::Candidate,
-                reason: Reason::AttributeChanged,
-                continues: Continue::Always,
-                chained: None,
-            },
-            Source {
-                target: Target::Symbol,
-                edges: EdgeSet::Kinds(&[EdgeKind::MayDispatchTo]),
-                filter: EdgeFilter::None,
-                certainty: CertaintyRule::Candidate,
-                reason: Reason::AttributeChanged,
-                continues: Continue::Always,
-                chained: None,
-            },
-        ],
-    },
-];
-
-/// The callers of the methods that implement a changed trait item.
-///
-/// The implementation has to be edited to match the new signature, so a call
-/// that names the implementation (through a concrete type, not a trait object)
-/// sees that signature and must adapt too. The `implements` group of the C9 row
-/// chains this group: the reach is two steps away, and its evidence path still
-/// starts at the changed trait item.
-static IMPLEMENTATION_CALLERS: Source = Source {
-    target: Target::Symbol,
-    edges: EdgeSet::Kinds(&[EdgeKind::Calls, EdgeKind::TakesAsValue]),
-    filter: EdgeFilter::None,
-    certainty: CertaintyRule::Edge,
-    reason: Reason::UsesChangedTraitItem,
-    continues: Continue::Always,
-    chained: None,
-};
-
-/// One row of the matrix: the changes it applies to, the graph it reads, and
-/// the groups of edges it follows.
-pub(crate) struct Rule {
-    /// The changes the row applies to.
-    applies: Applies,
-    /// The graph the row reads.
-    side: Side,
-    /// The class the reached items get when the path stops here.
+/// What the steps of one case give the items they reach.
+#[derive(Debug, Clone, Copy)]
+struct Step {
+    /// The class of the reached item.
     class: ImpactClass,
-    /// When the row counts as coarse.
-    coarse: Coarse,
-    /// The kinds the container of the changed symbol must have; empty for any.
-    container_kinds: &'static [SymbolKind],
-    /// The groups of edges the row follows.
-    sources: &'static [Source],
-}
-
-/// The changes a row applies to.
-struct Applies {
-    /// The kind of change.
-    kind: ChangeKind,
-    /// The detail the change must carry.
-    detail: DetailMatch,
-    /// The kinds the changed symbol must have; empty for any.
-    symbol_kinds: &'static [SymbolKind],
-    /// Whether the changed symbol must have a body; `None` for any.
-    has_body: Option<bool>,
-}
-
-impl Applies {
-    /// Whether the row applies to `change`, ignoring the body condition.
-    fn matches(&self, change: &Change) -> bool {
-        change.kind == self.kind
-            && self.detail.matches(&change.detail)
-            && (self.symbol_kinds.is_empty() || self.symbol_kinds.contains(&change.symbol.kind))
-    }
-}
-
-/// The detail a change must carry for a row to apply.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DetailMatch {
-    /// Any detail.
-    Any,
-    /// No detail.
-    None,
-    /// A member that appeared, disappeared or changed.
-    Member(Delta),
-    /// Only the body of a provided trait method changed.
-    DefaultBody,
-    /// A declared type changed.
-    Retyped,
-    /// A visibility was narrowed.
-    Narrowed,
-    /// A symbol moved to another identity.
-    Renamed,
-}
-
-impl DetailMatch {
-    /// Whether `detail` is the one this matcher wants.
-    fn matches(self, detail: &ChangeDetail) -> bool {
-        match (self, detail) {
-            (DetailMatch::Any, _) => true,
-            (DetailMatch::None, ChangeDetail::None) => true,
-            (DetailMatch::Member(wanted), ChangeDetail::Member(actual)) => wanted == *actual,
-            (DetailMatch::DefaultBody, ChangeDetail::DefaultBody) => true,
-            (DetailMatch::Retyped, ChangeDetail::Retyped) => true,
-            (DetailMatch::Narrowed, ChangeDetail::Visibility { from, to }) => *to < *from,
-            (DetailMatch::Renamed, ChangeDetail::Renamed { .. }) => true,
-            _ => false,
-        }
-    }
-}
-
-/// Where the edges a row follows must arrive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Target {
-    /// The changed symbol itself.
-    Symbol,
-    /// The container of the changed symbol.
-    Container,
-    /// The changed symbol and everything inside it.
-    SelfAndDescendants,
-    /// The direct children of the changed symbol.
-    Children,
-    /// The previous identity of a renamed symbol.
-    Previous,
-}
-
-/// One group of edges a row follows.
-struct Source {
-    /// Where the edges must arrive.
-    target: Target,
-    /// The kinds to follow.
-    edges: EdgeSet,
-    /// The extra conditions an edge must meet.
-    filter: EdgeFilter,
-    /// How certain the step is.
-    certainty: CertaintyRule,
     /// Why the step applies.
     reason: Reason,
-    /// Whether behaviour propagation continues from the reached item.
-    continues: Continue,
-    /// A group of edges followed from the items this group reaches, so that one
-    /// row can reach an item two steps away without giving up the evidence path.
-    ///
-    /// The reaches of the chained group carry the chained group's certainty and
-    /// reason, the row's class, and a [`Via`] naming this group's step.
-    chained: Option<&'static Source>,
+    /// Whether the case cannot tell exactly who is affected.
+    coarse: bool,
 }
 
-/// The kinds of edge a group follows.
-#[derive(Debug, Clone, Copy)]
-enum EdgeSet {
-    /// Every kind except `Contains`.
-    Any,
-    /// Exactly these kinds.
-    Kinds(&'static [EdgeKind]),
-}
-
-impl EdgeSet {
-    /// Whether `kind` belongs to this set.
-    fn contains(self, kind: EdgeKind) -> bool {
-        match self {
-            EdgeSet::Any => kind != EdgeKind::Contains,
-            EdgeSet::Kinds(kinds) => kinds.contains(&kind),
-        }
+/// A step whose item has to be edited.
+fn adapt(reason: Reason) -> Step {
+    Step {
+        class: ImpactClass::Adaptation,
+        reason,
+        coarse: false,
     }
 }
 
-/// The extra condition an edge must meet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EdgeFilter {
-    /// Every edge of the right kind.
-    None,
-    /// Only edges carrying this detail.
-    Detail(EdgeDetail),
-    /// Only edges that do not carry `WithRest`.
-    WithoutRest,
-    /// Only edges whose referrer is outside the new visibility of the change.
-    OutsideVisibility,
-    /// No edge at all when the changed symbol implements a trait item.
-    ///
-    /// The caller of such a method names the trait, not the implementation:
-    /// its call resolves through the trait declaration, which the change does
-    /// not touch, so it compiles unchanged. Only a change to the trait item
-    /// itself makes callers adapt.
-    NotInTraitImpl,
-    /// Only edges emitted by an implementation block.
-    FromImpl,
-    /// Only edges emitted by an implementation that does not override the
-    /// changed trait item.
-    ImplDoesNotOverride,
-    /// Only a step whose changed symbol is a field whose type is the only use of
-    /// one of its container's generic parameters.
-    ///
-    /// Removing that field leaves the parameter unused, which the compiler
-    /// rejects at the container's declaration.
-    SoleParameterUse,
-}
-
-/// How certain a step is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CertaintyRule {
-    /// The certainty of the edge.
-    Edge,
-    /// Always a candidate.
-    Candidate,
-    /// The certainty of the edge, but a candidate when it carries `WithRest`.
-    WithRestIsCandidate,
-    /// The certainty of the edge, but a candidate when an implementation of the
-    /// container replaces the changed item.
-    OverrideIsCandidate,
-}
-
-/// Whether behaviour propagation continues from a reached item.
-#[derive(Debug, Clone, Copy)]
-enum Continue {
-    /// Never.
-    Never,
-    /// From every reached item.
-    Always,
-    /// Only from items reached by one of these edge kinds.
-    Kinds(&'static [EdgeKind]),
-}
-
-impl Continue {
-    /// Whether a step over an edge of `kind` continues.
-    fn allows(self, kind: EdgeKind) -> bool {
-        match self {
-            Continue::Never => false,
-            Continue::Always => true,
-            Continue::Kinds(kinds) => kinds.contains(&kind),
-        }
+/// A step whose item may behave differently.
+fn behave(reason: Reason) -> Step {
+    Step {
+        class: ImpactClass::Behaviour,
+        reason,
+        coarse: false,
     }
 }
 
-/// When a row counts as coarse.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Coarse {
-    /// Never.
-    Never,
-    /// Always.
-    Always,
-    /// Only when the new visibility is `Restricted`.
-    Restricted,
+/// The edge's own certainty.
+fn as_resolved(edge: &Edge) -> Option<Certainty> {
+    Some(edge.certainty)
+}
+
+/// Always a candidate: the step itself is uncertain whatever the edge is.
+fn as_candidate(_: &Edge) -> Option<Certainty> {
+    Some(Certainty::Candidate)
+}
+
+/// The edge's own certainty, for an edge that does not end with `..`.
+fn without_rest(edge: &Edge) -> Option<Certainty> {
+    (edge.detail != EdgeDetail::WithRest).then_some(edge.certainty)
 }
 
 /// The first steps a change takes: the dependencies that arrive at what the
-/// change is about.
-///
-/// The result is ordered by side and edge index, so it does not depend on the
-/// order of the table.
-pub(crate) fn first_steps<'a>(change: &'a Change, ctx: &'a Graphs<'a>) -> Vec<Reach> {
+/// change is about, ordered by side and edge index.
+pub(crate) fn first_steps(change: &Change, graphs: &Graphs<'_>) -> Vec<Reach> {
+    use EdgeKind as E;
+    let head = Scope::new(graphs, Side::Head, change);
+    let base = Scope::new(graphs, Side::Base, change);
+    let function = FUNCTION_OR_METHOD.contains(&change.symbol.kind);
     let mut reaches = Vec::new();
-    for rule in RULES {
-        if !rule.applies.matches(change) {
-            continue;
+    let out = &mut reaches;
+    match (change.kind, &change.detail) {
+        (ChangeKind::Body, _) => {
+            let changed = head.symbol;
+            let calls = behave(Reason::CallsChanged);
+            head.follow(out, changed, &[E::Calls], calls, as_resolved);
+            let values = behave(Reason::TakesChangedAsValue);
+            head.follow(out, changed, &[E::TakesAsValue], values, as_candidate);
+            let dispatch = behave(Reason::DispatchesToChanged);
+            head.follow(out, changed, &[E::MayDispatchTo], dispatch, as_candidate);
+            // A procedural macro's function: a seed is never expanded by
+            // `onward`, so its expansions need a first step of their own. The
+            // reference is resolved, but a body change does not prove that
+            // the expansion changed, so the step is a candidate.
+            if function {
+                let expands = behave(Reason::InvokesChangedMacro);
+                head.follow(out, changed, &[E::Expands], expands, as_candidate);
+            }
         }
-        let scope = Scope::new(rule, change, ctx);
-        if !scope.has_expected_body() {
-            continue;
+        (ChangeKind::Signature, _) if function => {
+            // A method that implements a trait item is called through the
+            // trait, whose declaration did not change, so its callers compile.
+            if !head.flag(|flags| flags.in_trait_impl) {
+                let step = adapt(Reason::SignatureChanged);
+                let kinds = &[E::Calls, E::TakesAsValue];
+                head.follow(out, head.symbol, kinds, step, as_resolved);
+            }
+            let dispatch = behave(Reason::DispatchesToChanged);
+            head.follow(
+                out,
+                head.symbol,
+                &[E::MayDispatchTo],
+                dispatch,
+                as_candidate,
+            );
         }
-        for source in rule.sources {
-            scope.follow(source, &mut reaches);
+        (ChangeKind::Signature, _) if DECLARATIONS.contains(&change.symbol.kind) => {
+            let step = Step {
+                coarse: true,
+                ..adapt(Reason::DeclarationChanged)
+            };
+            let kinds = &[E::UsesType, E::Constructs, E::Matches, E::Implements];
+            head.follow(out, head.symbol, kinds, step, as_candidate);
         }
+        (ChangeKind::Visibility, &ChangeDetail::Visibility { from, to }) if to < from => {
+            let step = Step {
+                coarse: to == Visibility::Restricted,
+                ..adapt(Reason::NoLongerVisible)
+            };
+            let outside = |edge: &Edge| head.outside_visibility(to, edge.from);
+            head.follow(out, head.symbol, REFERENCES, step, |edge| {
+                outside(edge).then_some(edge.certainty)
+            });
+            // A field is also named by the literals of its container, which
+            // carry no edge to the field itself; one that ends with `..` may
+            // or may not name it.
+            let container = head.container(STRUCT_OR_VARIANT);
+            head.follow(out, container, &[E::Constructs], step, |edge| {
+                outside(edge).then_some(match edge.detail {
+                    EdgeDetail::WithRest => Certainty::Candidate,
+                    _ => edge.certainty,
+                })
+            });
+        }
+        (ChangeKind::Removed, _) => {
+            let step = adapt(Reason::RefersToRemoved);
+            base.follow(out, base.descendants(), REFERENCES, step, as_resolved);
+        }
+        (ChangeKind::Renamed, ChangeDetail::Renamed { from }) => {
+            let previous = graphs.base_index.by_path(from);
+            let step = adapt(Reason::RefersToRenamed);
+            base.follow(out, previous, REFERENCES, step, as_resolved);
+        }
+        (ChangeKind::Field, ChangeDetail::Member(Delta::Removed)) => {
+            let step = adapt(Reason::UsesChangedField);
+            let kinds = &[E::ReadsField, E::WritesField, E::Matches];
+            base.follow(out, base.symbol, kinds, step, as_resolved);
+            // The field was the only use of a generic parameter of its
+            // container, which then has to drop it as well (`E0392`).
+            if base.flag(|flags| flags.sole_parameter_use) {
+                let step = adapt(Reason::ParameterBecomesUnused);
+                base.follow(out, base.symbol, &[E::Contains], step, as_resolved);
+            }
+        }
+        (ChangeKind::Field, ChangeDetail::Member(Delta::Modified)) => {
+            let step = adapt(Reason::UsesChangedField);
+            let kinds = &[E::ReadsField, E::WritesField, E::Matches];
+            head.follow(out, head.symbol, kinds, step, as_resolved);
+        }
+        (ChangeKind::Field, ChangeDetail::Member(Delta::Added)) => {
+            let container = head.container(STRUCT_OR_VARIANT);
+            let literals = adapt(Reason::ConstructsWithoutField);
+            head.follow(out, container, &[E::Constructs], literals, without_rest);
+            let patterns = adapt(Reason::PatternMissesField);
+            head.follow(out, container, &[E::Matches], patterns, without_rest);
+        }
+        (ChangeKind::Variant, ChangeDetail::Member(Delta::Added)) => {
+            let container = head.container(&[SymbolKind::Enum]);
+            let detail = |wanted: EdgeDetail| {
+                move |edge: &Edge| (edge.detail == wanted).then_some(edge.certainty)
+            };
+            let exhaustive = adapt(Reason::ExhaustiveMatchMissesVariant);
+            let matches = &[E::Matches];
+            head.follow(
+                out,
+                container,
+                matches,
+                exhaustive,
+                detail(EdgeDetail::MatchExhaustive),
+            );
+            let wildcard = behave(Reason::WildcardCatchesNewVariant);
+            head.follow(
+                out,
+                container,
+                matches,
+                wildcard,
+                detail(EdgeDetail::MatchWildcard),
+            );
+        }
+        (ChangeKind::Variant, ChangeDetail::Member(Delta::Removed)) => {
+            let step = adapt(Reason::UsesChangedVariant);
+            base.follow(out, base.descendants(), REFERENCES, step, as_resolved);
+        }
+        (ChangeKind::TraitItem, ChangeDetail::Member(Delta::Added)) => {
+            // Only a required item has to be implemented.
+            if head.flag(|flags| !flags.has_body) {
+                let container = head.container(&[SymbolKind::Trait]);
+                let step = adapt(Reason::MustImplementTraitItem);
+                head.follow(out, container, &[E::Implements], step, |edge| {
+                    (head.kind_of(edge.from) == Some(SymbolKind::Impl)).then_some(edge.certainty)
+                });
+            }
+        }
+        (ChangeKind::TraitItem, ChangeDetail::Member(Delta::Modified)) => {
+            let uses = adapt(Reason::UsesChangedTraitItem);
+            let start = out.len();
+            let implements = adapt(Reason::MustImplementTraitItem);
+            head.follow(out, head.symbol, &[E::Implements], implements, as_resolved);
+            // The implementations have to be edited to match, so a call that
+            // names one of them directly sees the new signature too: that
+            // caller is two steps from the change.
+            let implementations = out[start..].to_vec();
+            for implementation in implementations {
+                let Some(edge) = head.graph.edges.get(implementation.edge as usize) else {
+                    continue;
+                };
+                let chained = out.len();
+                let kinds = &[E::Calls, E::TakesAsValue];
+                head.follow(out, Some(edge.from), kinds, uses, as_resolved);
+                for reach in &mut out[chained..] {
+                    reach.via = Some(Via {
+                        edge: implementation.edge,
+                        certainty: implementation.certainty,
+                    });
+                }
+            }
+            let kinds = &[E::Calls, E::TakesAsValue];
+            head.follow(out, head.symbol, kinds, uses, as_resolved);
+        }
+        (ChangeKind::TraitItem, ChangeDetail::Member(Delta::Removed)) => {
+            let step = adapt(Reason::UsesChangedTraitItem);
+            base.follow(out, base.symbol, REFERENCES, step, as_resolved);
+        }
+        (ChangeKind::TraitItem, ChangeDetail::DefaultBody) => {
+            let container = head.container(&[SymbolKind::Trait]);
+            let inherits = behave(Reason::InheritsChangedDefault);
+            head.follow(out, container, &[E::Implements], inherits, |edge| {
+                head.keeps_default(edge.from).then_some(edge.certainty)
+            });
+            // A call is less sure once an implementation replaces the default.
+            let overridden = head.is_overridden(container);
+            let calls = behave(Reason::CallsChanged);
+            head.follow(out, head.symbol, &[E::Calls], calls, |edge| {
+                Some(if overridden {
+                    Certainty::Candidate
+                } else {
+                    edge.certainty
+                })
+            });
+            let values = behave(Reason::TakesChangedAsValue);
+            head.follow(out, head.symbol, &[E::TakesAsValue], values, as_candidate);
+        }
+        (ChangeKind::Impl, ChangeDetail::Member(delta @ (Delta::Added | Delta::Removed))) => {
+            // The resolution of every reference to the block's items changed.
+            let side = if *delta == Delta::Added { &head } else { &base };
+            let step = behave(Reason::ImplResolutionChanged);
+            let kinds = &[E::Calls, E::TakesAsValue, E::MayDispatchTo];
+            side.follow(out, side.children(), kinds, step, as_resolved);
+        }
+        (ChangeKind::ConstValue, ChangeDetail::None) => {
+            let step = behave(Reason::UsesChangedValue);
+            head.follow(out, head.symbol, &[E::UsesValue], step, as_resolved);
+        }
+        (ChangeKind::ConstValue, ChangeDetail::Retyped) => {
+            let step = adapt(Reason::UsesRetypedValue);
+            head.follow(out, head.symbol, &[E::UsesValue], step, as_resolved);
+        }
+        (ChangeKind::TypeAlias, _) => {
+            let step = Step {
+                coarse: true,
+                ..adapt(Reason::UsesChangedAlias)
+            };
+            head.follow(out, head.symbol, &[E::UsesType], step, as_candidate);
+        }
+        (ChangeKind::MacroDef, _) => {
+            let step = behave(Reason::InvokesChangedMacro);
+            head.follow(out, head.symbol, &[E::Expands], step, as_candidate);
+        }
+        (ChangeKind::Attribute, _) if function => {
+            let step = behave(Reason::AttributeChanged);
+            let kinds = &[E::Calls, E::TakesAsValue, E::MayDispatchTo];
+            head.follow(out, head.symbol, kinds, step, as_candidate);
+        }
+        _ => {}
     }
     reaches.sort_by_key(|reach| (reach.side, reach.edge));
     reaches.dedup_by(|left, right| left.side == right.side && left.edge == right.edge);
@@ -1173,19 +398,14 @@ pub(crate) fn first_steps<'a>(change: &'a Change, ctx: &'a Graphs<'a>) -> Vec<Re
 /// The behaviour-propagation step: the references that reach `item` on the head
 /// graph.
 ///
-/// A call or a value read is certain, passing the item around as a value and
-/// dispatching to it through a trait are not, and every item reached this way
-/// continues the propagation.
-///
-/// An `Expands` edge is followed as well, so that a change anywhere in a
-/// procedural macro's implementation continues from the macro function to the
-/// items whose expansion names it. The edge is resolved, but whether the change
-/// alters the expansion is not, so the step is a candidate like C13's first
-/// step.
-pub(crate) fn onward(item: SymbolId, ctx: &Graphs<'_>) -> Vec<Reach> {
-    let graph = ctx.head;
+/// A call or a value read is certain; passing the item around as a value,
+/// dispatching to it through a trait and expanding a macro it implements are
+/// not. The `Expands` edge carries a change anywhere in a procedural macro's
+/// implementation on to the items whose expansion names it.
+pub(crate) fn onward(item: SymbolId, graphs: &Graphs<'_>) -> Vec<Reach> {
+    let graph = graphs.head;
     let mut reaches = Vec::new();
-    for &edge in ctx.head_index.edges_to(item) {
+    for &edge in graphs.head_index.edges_to(item) {
         let Some(reference) = graph.edges.get(edge as usize) else {
             continue;
         };
@@ -1207,392 +427,222 @@ pub(crate) fn onward(item: SymbolId, ctx: &Graphs<'_>) -> Vec<Reach> {
             certainty,
             reason,
             via: None,
-            continues: true,
             coarse: false,
         });
     }
     reaches
 }
 
-/// One row applied to one change, with the symbols the row needs already looked
-/// up on the side it reads.
+/// One change looked up on one side.
 struct Scope<'a> {
-    /// The row being applied.
-    rule: &'static Rule,
-    /// The change being applied.
+    /// The side read.
+    side: Side,
+    /// The graph of that side.
+    graph: &'a RevisionGraph,
+    /// Its lookup tables.
+    index: &'a GraphIndex,
+    /// The graph of the newer side, which decides visibility.
+    head: &'a RevisionGraph,
+    /// The change.
     change: &'a Change,
-    /// The graphs of the comparison.
-    ctx: &'a Graphs<'a>,
-    /// The changed symbol on the side the row reads.
+    /// The changed symbol on this side.
     symbol: Option<SymbolId>,
-    /// The container of the changed symbol on that side.
-    container: Option<SymbolId>,
-    /// The previous identity of a renamed symbol, on the base side.
-    previous: Option<SymbolId>,
 }
 
 impl<'a> Scope<'a> {
-    /// Looks up what the row needs.
-    fn new(rule: &'static Rule, change: &'a Change, ctx: &'a Graphs<'a>) -> Scope<'a> {
-        let graph = ctx.graph(rule.side);
-        let index = ctx.index(rule.side);
-        let symbol = index.by_path(&change.symbol);
-        let container = container_of(graph, index, change, symbol, rule.container_kinds);
-        let previous = match &change.detail {
-            ChangeDetail::Renamed { from } => ctx.base_index.by_path(from),
-            _ => None,
-        };
+    /// Looks the changed symbol up on `side`.
+    fn new(graphs: &'a Graphs<'a>, side: Side, change: &'a Change) -> Scope<'a> {
+        let index = graphs.index(side);
         Scope {
-            rule,
+            side,
+            graph: graphs.graph(side),
+            index,
+            head: graphs.head,
             change,
-            ctx,
-            symbol,
-            container,
-            previous,
+            symbol: index.by_path(&change.symbol),
         }
     }
 
-    /// Whether the changed symbol has the body the row expects, when the row
-    /// cares.
-    fn has_expected_body(&self) -> bool {
-        let Some(expected) = self.rule.applies.has_body else {
-            return true;
-        };
-        let graph = self.ctx.graph(self.rule.side);
-        self.symbol
-            .and_then(|symbol| graph.symbols.get(symbol.0 as usize))
-            .is_some_and(|symbol| symbol.flags.has_body == expected)
-    }
-
-    /// Adds a reach for every edge of `source` that arrives at one of the
-    /// source's targets.
-    ///
-    /// A source with a chained group adds the reaches of that group as well:
-    /// they start at the items this group reached, and carry this group's step
-    /// so the evidence path can show both.
-    fn follow(&self, source: &Source, out: &mut Vec<Reach>) {
-        let mut first = Vec::new();
-        self.follow_edges(source, &self.targets(source.target), None, &mut first);
-        let mut chained = Vec::new();
-        if let Some(next) = source.chained {
-            let graph = self.ctx.graph(self.rule.side);
-            for reach in &first {
-                let Some(edge) = graph.edges.get(reach.edge as usize) else {
-                    continue;
-                };
-                let via = Via {
-                    edge: reach.edge,
-                    certainty: reach.certainty,
-                };
-                self.follow_edges(next, &[edge.from], Some(via), &mut chained);
-            }
-        }
-        out.extend(chained);
-        out.extend(first);
-    }
-
-    /// Adds a reach for every edge of `source` that arrives at one of `targets`.
-    fn follow_edges(
+    /// Adds a reach for every edge of one of `kinds` that arrives at one of
+    /// `targets` from outside it and gets a certainty from `judge`.
+    fn follow(
         &self,
-        source: &Source,
-        targets: &[SymbolId],
-        via: Option<Via>,
         out: &mut Vec<Reach>,
+        targets: impl IntoIterator<Item = SymbolId>,
+        kinds: &[EdgeKind],
+        step: Step,
+        judge: impl Fn(&Edge) -> Option<Certainty>,
     ) {
-        let side = self.rule.side;
-        let graph = self.ctx.graph(side);
-        let index = self.ctx.index(side);
-        for &target in targets {
-            for &edge in index.edges_to(target) {
-                let Some(reference) = graph.edges.get(edge as usize) else {
+        for target in targets {
+            for &edge in self.index.edges_to(target) {
+                let Some(reference) = self.graph.edges.get(edge as usize) else {
                     continue;
                 };
-                if !source.edges.contains(reference.kind) {
+                if !kinds.contains(&reference.kind)
+                    || is_self_or_descendant(self.graph, reference.from, target)
+                {
                     continue;
                 }
-                if is_self_or_descendant(graph, reference.from, target) {
-                    continue;
-                }
-                let Some(certainty) = self.judge(source, reference) else {
+                let Some(certainty) = judge(reference) else {
                     continue;
                 };
                 out.push(Reach {
-                    side,
+                    side: self.side,
                     edge,
-                    class: self.rule.class,
+                    class: step.class,
                     certainty,
-                    reason: source.reason,
-                    via,
-                    continues: source.continues.allows(reference.kind),
-                    coarse: self.is_coarse(),
+                    reason: step.reason,
+                    via: None,
+                    coarse: step.coarse,
                 });
             }
         }
     }
 
-    /// The symbols whose incoming edges the group follows.
-    fn targets(&self, target: Target) -> Vec<SymbolId> {
-        let index = self.ctx.index(self.rule.side);
-        match target {
-            Target::Symbol => self.symbol.into_iter().collect(),
-            Target::Container => self.container.into_iter().collect(),
-            Target::Previous => self.previous.into_iter().collect(),
-            Target::SelfAndDescendants => match self.symbol {
-                Some(symbol) => descendants(index, symbol),
-                None => Vec::new(),
-            },
-            Target::Children => match self.symbol {
-                Some(symbol) => index.children(symbol).to_vec(),
-                None => Vec::new(),
-            },
-        }
-    }
-
-    /// The certainty of the step over `edge`, or `None` when the group's filter
-    /// rejects the edge.
-    fn judge(&self, source: &Source, edge: &Edge) -> Option<Certainty> {
-        if !self.passes(source.filter, edge) {
-            return None;
-        }
-        let certainty = match source.certainty {
-            CertaintyRule::Edge => edge.certainty,
-            CertaintyRule::Candidate => Certainty::Candidate,
-            CertaintyRule::WithRestIsCandidate => {
-                if edge.detail == EdgeDetail::WithRest {
-                    Certainty::Candidate
-                } else {
-                    edge.certainty
-                }
-            }
-            CertaintyRule::OverrideIsCandidate => {
-                if self.is_overridden() {
-                    Certainty::Candidate
-                } else {
-                    edge.certainty
-                }
-            }
-        };
-        Some(certainty)
-    }
-
-    /// Whether the edge passes the group's filter.
-    fn passes(&self, filter: EdgeFilter, edge: &Edge) -> bool {
-        match filter {
-            EdgeFilter::None => true,
-            EdgeFilter::Detail(detail) => edge.detail == detail,
-            EdgeFilter::WithoutRest => edge.detail != EdgeDetail::WithRest,
-            EdgeFilter::OutsideVisibility => self.outside_new_visibility(edge.from),
-            EdgeFilter::NotInTraitImpl => !self.in_trait_impl(),
-            EdgeFilter::FromImpl => self.kind_of(edge.from) == Some(SymbolKind::Impl),
-            EdgeFilter::ImplDoesNotOverride => self.impl_does_not_override(edge.from),
-            EdgeFilter::SoleParameterUse => self.sole_parameter_use(),
-        }
-    }
-
-    /// Whether the changed symbol is a field whose type is the only use of one
-    /// of its container's generic parameters.
-    fn sole_parameter_use(&self) -> bool {
+    /// Whether the changed symbol exists on this side with `test` true of its
+    /// flags.
+    fn flag(&self, test: impl Fn(&SymbolFlags) -> bool) -> bool {
         self.symbol
-            .and_then(|id| self.ctx.graph(self.rule.side).symbols.get(id.0 as usize))
-            .is_some_and(|symbol| symbol.flags.sole_parameter_use)
+            .and_then(|id| self.graph.symbols.get(id.0 as usize))
+            .is_some_and(|symbol| test(&symbol.flags))
     }
 
-    /// Whether the row counts as coarse for this change.
-    fn is_coarse(&self) -> bool {
-        match self.rule.coarse {
-            Coarse::Never => false,
-            Coarse::Always => true,
-            Coarse::Restricted => matches!(
-                &self.change.detail,
-                ChangeDetail::Visibility {
-                    to: Visibility::Restricted,
-                    ..
-                }
-            ),
-        }
-    }
-
-    /// The kind of a symbol on the side the row reads.
+    /// The kind of a symbol on this side.
     fn kind_of(&self, id: SymbolId) -> Option<SymbolKind> {
-        self.ctx
-            .graph(self.rule.side)
+        self.graph
             .symbols
             .get(id.0 as usize)
             .map(|symbol| symbol.path.kind)
     }
 
-    /// Whether `referrer` can no longer see the changed symbol under its new
-    /// visibility.
-    fn outside_new_visibility(&self, referrer: SymbolId) -> bool {
-        let head = self.ctx.head;
+    /// The changed symbol and everything inside it, the symbol first.
+    fn descendants(&self) -> Vec<SymbolId> {
+        let mut out: Vec<SymbolId> = self.symbol.into_iter().collect();
+        let mut seen: HashSet<SymbolId> = out.iter().copied().collect();
+        let mut cursor = 0;
+        while let Some(&current) = out.get(cursor) {
+            for &child in self.index.children(current) {
+                if seen.insert(child) {
+                    out.push(child);
+                }
+            }
+            cursor += 1;
+        }
+        out
+    }
+
+    /// The direct children of the changed symbol.
+    fn children(&self) -> Vec<SymbolId> {
+        self.symbol
+            .map(|symbol| self.index.children(symbol).to_vec())
+            .unwrap_or_default()
+    }
+
+    /// The container of the changed symbol when it has one of `kinds`: its
+    /// parent, or the symbol its path names without the last segment when
+    /// this side does not hold the changed symbol.
+    fn container(&self, kinds: &[SymbolKind]) -> Option<SymbolId> {
+        if let Some(id) = self.symbol {
+            let parent = self.graph.symbols.get(id.0 as usize)?.parent?;
+            return kinds.contains(&self.kind_of(parent)?).then_some(parent);
+        }
+        let text = container_text(&self.change.symbol)?;
+        self.index
+            .find(&text)
+            .iter()
+            .copied()
+            .find(|&id| self.kind_of(id).is_some_and(|kind| kinds.contains(&kind)))
+    }
+
+    /// Whether `referrer` can no longer see the changed symbol once it has
+    /// visibility `to`.
+    fn outside_visibility(&self, to: Visibility, referrer: SymbolId) -> bool {
+        let head = self.head;
         let Some(symbol) = self.symbol else {
             return false;
         };
-        let ChangeDetail::Visibility { to, .. } = &self.change.detail else {
-            return false;
-        };
         let referrer_module = enclosing_module(head, referrer);
-        match *to {
-            Visibility::Private => {
-                let Some(boundary) = enclosing_module(head, symbol) else {
-                    return true;
-                };
+        let outside = |boundary: Option<SymbolId>| match boundary {
+            None => true,
+            Some(boundary) => {
                 referrer_module.is_none_or(|module| !is_self_or_descendant(head, module, boundary))
             }
-            Visibility::Restricted => {
-                let boundary = enclosing_module(head, symbol)
-                    .and_then(|module| enclosing_module(head, module));
-                let Some(boundary) = boundary else {
-                    return true;
-                };
-                referrer_module.is_none_or(|module| !is_self_or_descendant(head, module, boundary))
-            }
+        };
+        match to {
+            Visibility::Private => outside(enclosing_module(head, symbol)),
+            Visibility::Restricted => outside(
+                enclosing_module(head, symbol).and_then(|module| enclosing_module(head, module)),
+            ),
             Visibility::Crate => {
-                let (Some(referrer), Some(changed)) = (
+                match (
                     head.symbols.get(referrer.0 as usize),
                     head.symbols.get(symbol.0 as usize),
-                ) else {
-                    return false;
-                };
-                referrer.krate != changed.krate
+                ) {
+                    (Some(referrer), Some(changed)) => referrer.krate != changed.krate,
+                    _ => false,
+                }
             }
             Visibility::Public => false,
         }
     }
 
-    /// Whether the changed symbol implements a trait item.
-    fn in_trait_impl(&self) -> bool {
-        self.symbol
-            .and_then(|id| self.ctx.graph(self.rule.side).symbols.get(id.0 as usize))
-            .is_some_and(|symbol| symbol.flags.in_trait_impl)
-    }
-
-    /// Whether any implementation of the container replaces the changed trait
-    /// item.
-    fn is_overridden(&self) -> bool {
-        let (Some(container), Some(symbol)) = (self.container, self.symbol) else {
+    /// Whether some implementation of `container`, a trait, replaces the
+    /// changed item.
+    fn is_overridden(&self, container: Option<SymbolId>) -> bool {
+        let (Some(container), Some(symbol)) = (container, self.symbol) else {
             return false;
         };
-        self.implementation_blocks(container)
-            .into_iter()
-            .any(|block| self.children_implement(block, symbol))
+        self.index
+            .edges_to(container)
+            .iter()
+            .filter_map(|&edge| self.graph.edges.get(edge as usize))
+            .filter(|reference| reference.kind == EdgeKind::Implements)
+            .filter(|reference| self.kind_of(reference.from) == Some(SymbolKind::Impl))
+            .any(|reference| self.implements(reference.from, symbol))
     }
 
-    /// Whether `block` keeps the default of the changed trait item.
-    fn impl_does_not_override(&self, block: SymbolId) -> bool {
-        if self.kind_of(block) != Some(SymbolKind::Impl) {
-            return false;
-        }
-        match self.symbol {
-            Some(symbol) => !self.children_implement(block, symbol),
-            None => true,
-        }
+    /// Whether `block` is an implementation that keeps the default of the
+    /// changed trait item.
+    fn keeps_default(&self, block: SymbolId) -> bool {
+        self.kind_of(block) == Some(SymbolKind::Impl)
+            && self
+                .symbol
+                .is_none_or(|symbol| !self.implements(block, symbol))
     }
 
-    /// Whether `block` has a child with an `Implements` edge to `symbol`.
-    fn children_implement(&self, block: SymbolId, symbol: SymbolId) -> bool {
-        let graph = self.ctx.graph(self.rule.side);
-        let index = self.ctx.index(self.rule.side);
-        index.children(block).iter().any(|&child| {
-            index.edges_from(child).iter().any(|&edge| {
-                graph.edges.get(edge as usize).is_some_and(|reference| {
-                    reference.kind == EdgeKind::Implements && reference.to == symbol
-                })
+    /// Whether a child of `block` has an `Implements` edge to `item`.
+    fn implements(&self, block: SymbolId, item: SymbolId) -> bool {
+        self.index.children(block).iter().any(|&child| {
+            self.index.edges_from(child).iter().any(|&edge| {
+                self.graph
+                    .edges
+                    .get(edge as usize)
+                    .is_some_and(|reference| {
+                        reference.kind == EdgeKind::Implements && reference.to == item
+                    })
             })
         })
     }
-
-    /// The implementation blocks of `container`, which must be a trait.
-    fn implementation_blocks(&self, container: SymbolId) -> Vec<SymbolId> {
-        let graph = self.ctx.graph(self.rule.side);
-        let index = self.ctx.index(self.rule.side);
-        index
-            .edges_to(container)
-            .iter()
-            .filter_map(|&edge| graph.edges.get(edge as usize))
-            .filter(|reference| reference.kind == EdgeKind::Implements)
-            .map(|reference| reference.from)
-            .filter(|&from| {
-                graph
-                    .symbols
-                    .get(from.0 as usize)
-                    .is_some_and(|symbol| symbol.path.kind == SymbolKind::Impl)
-            })
-            .collect()
-    }
-}
-
-/// The container of the changed symbol: its parent, or the symbol named by its
-/// path without the last segment when the change is about a symbol the graph
-/// does not know.
-fn container_of(
-    graph: &RevisionGraph,
-    index: &GraphIndex,
-    change: &Change,
-    symbol: Option<SymbolId>,
-    kinds: &[SymbolKind],
-) -> Option<SymbolId> {
-    if let Some(id) = symbol {
-        let parent = graph.symbols.get(id.0 as usize)?.parent?;
-        let parent_kind = graph.symbols.get(parent.0 as usize)?.path.kind;
-        return (kinds.is_empty() || kinds.contains(&parent_kind)).then_some(parent);
-    }
-    let text = container_text(&change.symbol)?;
-    let candidates = index.find(&text);
-    if kinds.is_empty() {
-        return candidates.first().copied();
-    }
-    candidates.iter().copied().find(|&id| {
-        graph
-            .symbols
-            .get(id.0 as usize)
-            .is_some_and(|symbol| kinds.contains(&symbol.path.kind))
-    })
 }
 
 /// The path text of a symbol's container: the path without its last segment.
 fn container_text(path: &SymbolPath) -> Option<String> {
     let text = path.path.as_str();
-    let name = path.name();
-    let rest = text.strip_suffix(name)?;
+    let rest = text.strip_suffix(path.name())?;
     let parent = rest.strip_suffix("::")?;
-    if parent.is_empty() {
-        return None;
-    }
-    Some(parent.to_owned())
-}
-
-/// `id` and every symbol inside it, the symbol first.
-fn descendants(index: &GraphIndex, id: SymbolId) -> Vec<SymbolId> {
-    let mut out = vec![id];
-    let mut cursor = 0;
-    while let Some(&current) = out.get(cursor) {
-        for &child in index.children(current) {
-            if !out.contains(&child) {
-                out.push(child);
-            }
-        }
-        cursor += 1;
-    }
-    out
+    (!parent.is_empty()).then(|| parent.to_owned())
 }
 
 /// Whether `id` is `ancestor` itself or lies inside it by `parent`.
 fn is_self_or_descendant(graph: &RevisionGraph, id: SymbolId, ancestor: SymbolId) -> bool {
-    if id == ancestor {
-        return true;
-    }
-    let mut current = graph
-        .symbols
-        .get(id.0 as usize)
-        .and_then(|symbol| symbol.parent);
-    while let Some(parent) = current {
-        if parent == ancestor {
+    let mut current = Some(id);
+    while let Some(symbol) = current {
+        if symbol == ancestor {
             return true;
         }
         current = graph
             .symbols
-            .get(parent.0 as usize)
+            .get(symbol.0 as usize)
             .and_then(|symbol| symbol.parent);
     }
     false
@@ -1600,10 +650,7 @@ fn is_self_or_descendant(graph: &RevisionGraph, id: SymbolId, ancestor: SymbolId
 
 /// The nearest ancestor of `id` that is a module.
 fn enclosing_module(graph: &RevisionGraph, id: SymbolId) -> Option<SymbolId> {
-    let mut current = graph
-        .symbols
-        .get(id.0 as usize)
-        .and_then(|symbol| symbol.parent);
+    let mut current = graph.symbols.get(id.0 as usize)?.parent;
     while let Some(parent) = current {
         let symbol = graph.symbols.get(parent.0 as usize)?;
         if symbol.path.kind == SymbolKind::Module {
@@ -1614,7 +661,6 @@ fn enclosing_module(graph: &RevisionGraph, id: SymbolId) -> Option<SymbolId> {
     None
 }
 
-/// Test helpers that build small graphs and changes by hand.
 #[cfg(test)]
 pub(crate) mod testkit {
     use blastr_model::{
@@ -1859,7 +905,7 @@ mod tests {
     }
 
     #[test]
-    fn row_2_a_body_change_reaches_its_callers() {
+    fn a_body_change_reaches_its_callers() {
         let mut builder = GraphBuilder::new();
         let module = builder.add("krate", SymbolKind::Module);
         let function = builder.child(module, "krate::f", SymbolKind::Function);
@@ -1880,12 +926,11 @@ mod tests {
         assert_eq!(step.class, ImpactClass::Behaviour);
         assert_eq!(step.certainty, Certainty::Resolved);
         assert_eq!(step.reason, Reason::CallsChanged);
-        assert!(step.continues);
         assert!(!step.coarse);
     }
 
     #[test]
-    fn row_3_a_body_change_reaches_holders_as_a_candidate() {
+    fn a_body_change_reaches_holders_as_a_candidate() {
         let mut builder = GraphBuilder::new();
         let module = builder.add("krate", SymbolKind::Module);
         let function = builder.child(module, "krate::f", SymbolKind::Function);
@@ -1906,11 +951,10 @@ mod tests {
         assert_eq!(step.certainty, Certainty::Candidate);
         assert_eq!(step.reason, Reason::TakesChangedAsValue);
         assert_eq!(step.class, ImpactClass::Behaviour);
-        assert!(step.continues);
     }
 
     #[test]
-    fn row_4_a_body_change_reaches_dispatch_as_a_candidate() {
+    fn a_body_change_reaches_dispatch_as_a_candidate() {
         let mut builder = GraphBuilder::new();
         let module = builder.add("krate", SymbolKind::Module);
         let method = builder.child(module, "krate::f", SymbolKind::Method);
@@ -1939,7 +983,6 @@ mod tests {
         );
         assert!(!steps.is_empty());
         assert_eq!(steps[0].reason, Reason::DispatchesToChanged);
-        assert!(steps[0].continues);
     }
 
     #[test]
@@ -1974,7 +1017,7 @@ mod tests {
         assert!(
             steps
                 .iter()
-                .all(|step| step.class == ImpactClass::Behaviour && step.continues)
+                .all(|step| step.class == ImpactClass::Behaviour)
         );
     }
 
@@ -1992,7 +1035,7 @@ mod tests {
     }
 
     #[test]
-    fn row_5_a_signature_change_reaches_callers_and_holders() {
+    fn a_signature_change_reaches_callers_and_holders() {
         let mut builder = GraphBuilder::new();
         let module = builder.add("krate", SymbolKind::Module);
         let function = builder.child(module, "krate::f", SymbolKind::Function);
@@ -2017,12 +1060,11 @@ mod tests {
             assert_eq!(step.class, ImpactClass::Adaptation);
             assert_eq!(step.certainty, Certainty::Resolved);
             assert_eq!(step.reason, Reason::SignatureChanged);
-            assert!(step.continues);
         }
     }
 
     #[test]
-    fn row_5_a_signature_change_to_a_trait_impl_method_leaves_callers_alone() {
+    fn a_signature_change_to_a_trait_impl_method_leaves_callers_alone() {
         let mut builder = GraphBuilder::new();
         let module = builder.add("krate", SymbolKind::Module);
         let stage = builder.child(module, "krate::Stage", SymbolKind::Trait);
@@ -2052,7 +1094,7 @@ mod tests {
     }
 
     #[test]
-    fn row_6_a_signature_change_reaches_dispatch_only() {
+    fn a_signature_change_reaches_dispatch_only() {
         let mut builder = GraphBuilder::new();
         let module = builder.add("krate", SymbolKind::Module);
         let method = builder.child(module, "krate::run", SymbolKind::Method);
@@ -2079,11 +1121,10 @@ mod tests {
         assert_eq!(step.class, ImpactClass::Behaviour);
         assert_eq!(step.certainty, Certainty::Candidate);
         assert_eq!(step.reason, Reason::DispatchesToChanged);
-        assert!(step.continues);
     }
 
     #[test]
-    fn row_7_a_declaration_change_reaches_the_users_of_the_type() {
+    fn a_declaration_change_reaches_the_users_of_the_type() {
         let mut builder = GraphBuilder::new();
         let module = builder.add("krate", SymbolKind::Module);
         let point = builder.child(module, "krate::Point", SymbolKind::Struct);
@@ -2124,12 +1165,11 @@ mod tests {
                 .all(|step| step.certainty == Certainty::Candidate)
         );
         assert!(steps.iter().all(|step| step.coarse));
-        assert!(steps.iter().all(|step| !step.continues));
         assert_eq!(steps[0].reason, Reason::DeclarationChanged);
     }
 
     #[test]
-    fn row_8_a_private_change_reaches_only_referrers_outside_the_module() {
+    fn a_private_change_reaches_only_referrers_outside_the_module() {
         let mut builder = GraphBuilder::new();
         let root = builder.add("krate", SymbolKind::Module);
         let inner = builder.child(root, "krate::inner", SymbolKind::Module);
@@ -2161,12 +1201,11 @@ mod tests {
         let step = step_to(&steps, &nothing(), &head, "krate::outside");
         assert_eq!(step.class, ImpactClass::Adaptation);
         assert_eq!(step.reason, Reason::NoLongerVisible);
-        assert!(!step.continues);
         assert!(!step.coarse);
     }
 
     #[test]
-    fn row_8_restricted_visibility_is_coarse_and_crate_visibility_crosses_crates() {
+    fn restricted_visibility_is_coarse_and_crate_visibility_crosses_crates() {
         let mut builder = GraphBuilder::new();
         let root = builder.add("krate", SymbolKind::Module);
         let inner = builder.child(root, "krate::inner", SymbolKind::Module);
@@ -2230,7 +1269,7 @@ mod tests {
     }
 
     #[test]
-    fn row_8_a_narrowed_field_reaches_the_literals_and_patterns_that_name_it() {
+    fn a_narrowed_field_reaches_the_literals_and_patterns_that_name_it() {
         let mut builder = GraphBuilder::new();
         let root = builder.add("krate", SymbolKind::Module);
         let spec = builder.child(root, "krate::Spec", SymbolKind::Struct);
@@ -2280,7 +1319,6 @@ mod tests {
         assert_eq!(step.class, ImpactClass::Adaptation);
         assert_eq!(step.reason, Reason::NoLongerVisible);
         assert_eq!(step.certainty, Certainty::Resolved);
-        assert!(!step.continues);
         let step = step_to(&steps, &nothing(), &head, "other::rebuild");
         assert_eq!(
             step.certainty,
@@ -2290,7 +1328,7 @@ mod tests {
     }
 
     #[test]
-    fn row_8_a_widened_visibility_reaches_nothing() {
+    fn a_widened_visibility_reaches_nothing() {
         let mut builder = GraphBuilder::new();
         let module = builder.add("krate", SymbolKind::Module);
         let item = builder.child(module, "krate::item", SymbolKind::Struct);
@@ -2311,7 +1349,7 @@ mod tests {
     }
 
     #[test]
-    fn row_10_a_removal_reaches_base_side_referrers_but_not_the_container() {
+    fn a_removal_reaches_base_side_referrers_but_not_the_container() {
         let mut builder = GraphBuilder::new();
         let module = builder.add("krate", SymbolKind::Module);
         let gone = builder.child(module, "krate::gone", SymbolKind::Function);
@@ -2328,11 +1366,10 @@ mod tests {
         assert_eq!(steps[0].side, Side::Base);
         assert_eq!(steps[0].class, ImpactClass::Adaptation);
         assert_eq!(steps[0].reason, Reason::RefersToRemoved);
-        assert!(!steps[0].continues);
     }
 
     #[test]
-    fn row_11_a_rename_reaches_base_side_referrers_of_the_previous_name() {
+    fn a_rename_reaches_base_side_referrers_of_the_previous_name() {
         let mut builder = GraphBuilder::new();
         let module = builder.add("krate", SymbolKind::Module);
         let old = builder.child(module, "krate::old_name", SymbolKind::Function);
@@ -2356,11 +1393,10 @@ mod tests {
         assert_eq!(reached_paths(&steps, &base, &head), vec!["krate::caller"]);
         assert_eq!(steps[0].reason, Reason::RefersToRenamed);
         assert_eq!(steps[0].class, ImpactClass::Adaptation);
-        assert!(!steps[0].continues);
     }
 
     #[test]
-    fn row_12_a_removed_field_skips_readers_of_other_fields() {
+    fn a_removed_field_skips_readers_of_other_fields() {
         let mut builder = GraphBuilder::new();
         let module = builder.add("krate", SymbolKind::Module);
         let point = builder.child(module, "krate::Point", SymbolKind::Struct);
@@ -2397,13 +1433,12 @@ mod tests {
             step_to(&steps, &base, &head, "krate::reader").certainty,
             Certainty::Resolved
         );
-        assert!(steps.iter().all(|step| !step.continues));
         assert_eq!(steps[0].reason, Reason::UsesChangedField);
         assert_eq!(steps[0].class, ImpactClass::Adaptation);
     }
 
     #[test]
-    fn row_13_a_modified_field_carries_only_reads_further() {
+    fn a_modified_field_carries_only_reads_further() {
         let mut builder = GraphBuilder::new();
         let module = builder.add("krate", SymbolKind::Module);
         let point = builder.child(module, "krate::Point", SymbolKind::Struct);
@@ -2431,16 +1466,10 @@ mod tests {
             reached_paths(&steps, &nothing(), &head),
             vec!["krate::literal", "krate::reader", "krate::writer"]
         );
-        assert!(
-            step_to(&steps, &nothing(), &head, "krate::reader").continues,
-            "a field read carries behaviour further"
-        );
-        assert!(!step_to(&steps, &nothing(), &head, "krate::writer").continues);
-        assert!(!step_to(&steps, &nothing(), &head, "krate::literal").continues);
     }
 
     #[test]
-    fn row_14_a_new_field_reaches_literals_without_rest() {
+    fn a_new_field_reaches_literals_without_rest() {
         let mut builder = GraphBuilder::new();
         let module = builder.add("krate", SymbolKind::Module);
         let point = builder.child(module, "krate::Point", SymbolKind::Struct);
@@ -2472,11 +1501,10 @@ mod tests {
         );
         assert_eq!(steps[0].reason, Reason::ConstructsWithoutField);
         assert_eq!(steps[0].class, ImpactClass::Adaptation);
-        assert!(!steps[0].continues);
     }
 
     #[test]
-    fn row_14_an_invented_field_finds_its_container_by_path() {
+    fn an_invented_field_finds_its_container_by_path() {
         let mut builder = GraphBuilder::new();
         let module = builder.add("krate", SymbolKind::Module);
         let point = builder.child(module, "krate::Point", SymbolKind::Struct);
@@ -2506,7 +1534,7 @@ mod tests {
     }
 
     #[test]
-    fn row_15_a_new_field_reaches_patterns_without_rest() {
+    fn a_new_field_reaches_patterns_without_rest() {
         let mut builder = GraphBuilder::new();
         let module = builder.add("krate", SymbolKind::Module);
         let point = builder.child(module, "krate::Point", SymbolKind::Struct);
@@ -2556,7 +1584,7 @@ mod tests {
     }
 
     #[test]
-    fn row_16_an_exhaustive_match_is_an_adaptation_and_a_wildcard_is_not() {
+    fn an_exhaustive_match_is_an_adaptation_and_a_wildcard_is_not() {
         let mut builder = GraphBuilder::new();
         let module = builder.add("krate", SymbolKind::Module);
         let choice = builder.child(module, "krate::Choice", SymbolKind::Enum);
@@ -2586,11 +1614,10 @@ mod tests {
         );
         assert_eq!(steps[0].class, ImpactClass::Adaptation);
         assert_eq!(steps[0].reason, Reason::ExhaustiveMatchMissesVariant);
-        assert!(!steps[0].continues);
     }
 
     #[test]
-    fn row_17_a_wildcard_match_is_behaviour_and_continues() {
+    fn a_wildcard_match_is_behaviour() {
         let mut builder = GraphBuilder::new();
         let module = builder.add("krate", SymbolKind::Module);
         let choice = builder.child(module, "krate::Choice", SymbolKind::Enum);
@@ -2620,11 +1647,10 @@ mod tests {
         );
         assert_eq!(steps[0].class, ImpactClass::Behaviour);
         assert_eq!(steps[0].reason, Reason::WildcardCatchesNewVariant);
-        assert!(steps[0].continues);
     }
 
     #[test]
-    fn row_18_a_removed_variant_reaches_its_uses_on_the_base_side() {
+    fn a_removed_variant_reaches_its_uses_on_the_base_side() {
         let mut builder = GraphBuilder::new();
         let module = builder.add("krate", SymbolKind::Module);
         let choice = builder.child(module, "krate::Choice", SymbolKind::Enum);
@@ -2664,13 +1690,12 @@ mod tests {
         );
         assert!(steps.iter().all(|step| step.side == Side::Base));
         assert_eq!(steps[0].reason, Reason::UsesChangedVariant);
-        assert!(!steps[0].continues);
     }
 
     // A reshaped variant has no rule of its own: its fields are reported with
     // it, and each field rule reaches the literals and patterns that name it.
     #[test]
-    fn row_19_a_reshaped_variant_reaches_nobody_by_itself() {
+    fn a_reshaped_variant_reaches_nobody_by_itself() {
         let mut builder = GraphBuilder::new();
         let module = builder.add("krate", SymbolKind::Module);
         let choice = builder.child(module, "krate::Choice", SymbolKind::Enum);
@@ -2701,7 +1726,7 @@ mod tests {
     }
 
     #[test]
-    fn row_20_a_required_trait_item_reaches_the_implementations() {
+    fn a_required_trait_item_reaches_the_implementations() {
         let mut builder = GraphBuilder::new();
         let module = builder.add("krate", SymbolKind::Module);
         let trait_ = builder.child(module, "krate::Trait", SymbolKind::Trait);
@@ -2727,11 +1752,10 @@ mod tests {
         );
         assert_eq!(steps[0].reason, Reason::MustImplementTraitItem);
         assert_eq!(steps[0].class, ImpactClass::Adaptation);
-        assert!(!steps[0].continues);
     }
 
     #[test]
-    fn row_21_a_trait_item_with_a_body_reaches_nothing() {
+    fn a_trait_item_with_a_body_reaches_nothing() {
         let mut builder = GraphBuilder::new();
         let module = builder.add("krate", SymbolKind::Module);
         let trait_ = builder.child(module, "krate::Trait", SymbolKind::Trait);
@@ -2751,7 +1775,7 @@ mod tests {
     }
 
     #[test]
-    fn row_22_a_modified_trait_item_reaches_implementations_and_callers() {
+    fn a_modified_trait_item_reaches_implementations_and_callers() {
         let mut builder = GraphBuilder::new();
         let module = builder.add("krate", SymbolKind::Module);
         let trait_ = builder.child(module, "krate::Trait", SymbolKind::Trait);
@@ -2795,14 +1819,12 @@ mod tests {
             "krate::<impl Trait for Point>::run",
         );
         assert_eq!(implementation.reason, Reason::MustImplementTraitItem);
-        assert!(!implementation.continues);
         let caller = step_to(&steps, &nothing(), &head, "krate::caller");
         assert_eq!(caller.reason, Reason::UsesChangedTraitItem);
-        assert!(caller.continues);
     }
 
     #[test]
-    fn row_23_a_removed_trait_item_reaches_its_uses_on_the_base_side() {
+    fn a_removed_trait_item_reaches_its_uses_on_the_base_side() {
         let mut builder = GraphBuilder::new();
         let module = builder.add("krate", SymbolKind::Module);
         let trait_ = builder.child(module, "krate::Trait", SymbolKind::Trait);
@@ -2824,11 +1846,10 @@ mod tests {
 
         assert_eq!(reached_paths(&steps, &base, &head), vec!["krate::caller"]);
         assert_eq!(steps[0].reason, Reason::UsesChangedTraitItem);
-        assert!(!steps[0].continues);
     }
 
     #[test]
-    fn row_24_a_changed_default_body_skips_implementations_that_override_it() {
+    fn a_changed_default_body_skips_implementations_that_override_it() {
         let mut builder = GraphBuilder::new();
         let module = builder.add("krate", SymbolKind::Module);
         let trait_ = builder.child(module, "krate::Trait", SymbolKind::Trait);
@@ -2866,11 +1887,10 @@ mod tests {
         );
         assert_eq!(steps[0].reason, Reason::InheritsChangedDefault);
         assert_eq!(steps[0].class, ImpactClass::Behaviour);
-        assert!(!steps[0].continues);
     }
 
     #[test]
-    fn row_25_a_call_to_a_default_body_is_certain_unless_an_impl_overrides_it() {
+    fn a_call_to_a_default_body_is_certain_unless_an_impl_overrides_it() {
         let build = |overriding: bool| {
             let mut builder = GraphBuilder::new();
             let module = builder.add("krate", SymbolKind::Module);
@@ -2900,7 +1920,6 @@ mod tests {
         let caller = step_to(&steps, &nothing(), &plain, "krate::caller");
         assert_eq!(caller.certainty, Certainty::Resolved);
         assert_eq!(caller.reason, Reason::CallsChanged);
-        assert!(caller.continues);
 
         let overriding = build(true);
         let steps = first(&nothing(), &overriding, &change);
@@ -2913,7 +1932,7 @@ mod tests {
     }
 
     #[test]
-    fn row_26_a_default_body_held_as_a_value_is_a_candidate() {
+    fn a_default_body_held_as_a_value_is_a_candidate() {
         let mut builder = GraphBuilder::new();
         let module = builder.add("krate", SymbolKind::Module);
         let trait_ = builder.child(module, "krate::Trait", SymbolKind::Trait);
@@ -2943,7 +1962,7 @@ mod tests {
     }
 
     #[test]
-    fn row_27_a_new_implementation_reaches_the_users_of_its_items() {
+    fn a_new_implementation_reaches_the_users_of_its_items() {
         let mut builder = GraphBuilder::new();
         let module = builder.add("krate", SymbolKind::Module);
         let block = builder.child(module, "krate::<impl Point>", SymbolKind::Impl);
@@ -2971,11 +1990,10 @@ mod tests {
         );
         assert_eq!(steps[0].reason, Reason::ImplResolutionChanged);
         assert_eq!(steps[0].class, ImpactClass::Behaviour);
-        assert!(steps[0].continues);
     }
 
     #[test]
-    fn row_28_a_removed_implementation_reaches_its_users_on_the_base_side() {
+    fn a_removed_implementation_reaches_its_users_on_the_base_side() {
         let mut builder = GraphBuilder::new();
         let module = builder.add("krate", SymbolKind::Module);
         let block = builder.child(module, "krate::<impl Point>", SymbolKind::Impl);
@@ -2997,11 +2015,10 @@ mod tests {
 
         assert_eq!(reached_paths(&steps, &base, &head), vec!["krate::caller"]);
         assert_eq!(steps[0].reason, Reason::ImplResolutionChanged);
-        assert!(steps[0].continues);
     }
 
     #[test]
-    fn row_29_a_changed_value_reaches_its_readers() {
+    fn a_changed_value_reaches_its_readers() {
         let mut builder = GraphBuilder::new();
         let module = builder.add("krate", SymbolKind::Module);
         let limit = builder.child(module, "krate::LIMIT", SymbolKind::Const);
@@ -3020,11 +2037,10 @@ mod tests {
         );
         assert_eq!(steps[0].class, ImpactClass::Behaviour);
         assert_eq!(steps[0].reason, Reason::UsesChangedValue);
-        assert!(steps[0].continues);
     }
 
     #[test]
-    fn row_30_a_retyped_value_makes_its_readers_adapt() {
+    fn a_retyped_value_makes_its_readers_adapt() {
         let mut builder = GraphBuilder::new();
         let module = builder.add("krate", SymbolKind::Module);
         let limit = builder.child(module, "krate::LIMIT", SymbolKind::Static);
@@ -3046,11 +2062,10 @@ mod tests {
         );
         assert_eq!(steps[0].class, ImpactClass::Adaptation);
         assert_eq!(steps[0].reason, Reason::UsesRetypedValue);
-        assert!(steps[0].continues);
     }
 
     #[test]
-    fn row_31_a_changed_alias_reaches_its_users_as_a_coarse_candidate() {
+    fn a_changed_alias_reaches_its_users_as_a_coarse_candidate() {
         let mut builder = GraphBuilder::new();
         let module = builder.add("krate", SymbolKind::Module);
         let alias = builder.child(module, "krate::Alias", SymbolKind::TypeAlias);
@@ -3071,11 +2086,10 @@ mod tests {
         assert_eq!(steps[0].certainty, Certainty::Candidate);
         assert_eq!(steps[0].reason, Reason::UsesChangedAlias);
         assert!(steps[0].coarse);
-        assert!(!steps[0].continues);
     }
 
     #[test]
-    fn row_32_a_changed_macro_reaches_its_invocations() {
+    fn a_changed_macro_reaches_its_invocations() {
         let mut builder = GraphBuilder::new();
         let module = builder.add("krate", SymbolKind::Module);
         let macro_ = builder.child(module, "krate::declare", SymbolKind::Macro);
@@ -3095,11 +2109,10 @@ mod tests {
         assert_eq!(steps[0].class, ImpactClass::Behaviour);
         assert_eq!(steps[0].certainty, Certainty::Candidate);
         assert_eq!(steps[0].reason, Reason::InvokesChangedMacro);
-        assert!(steps[0].continues);
     }
 
     #[test]
-    fn row_33_a_changed_attribute_reaches_what_the_body_rules_reach_as_a_candidate() {
+    fn a_changed_attribute_reaches_what_the_body_rules_reach_as_a_candidate() {
         let mut builder = GraphBuilder::new();
         let module = builder.add("krate", SymbolKind::Module);
         let function = builder.child(module, "krate::f", SymbolKind::Function);
@@ -3133,11 +2146,10 @@ mod tests {
                 .iter()
                 .all(|step| step.class == ImpactClass::Behaviour)
         );
-        assert!(steps.iter().all(|step| step.continues));
     }
 
     #[test]
-    fn row_34_an_attribute_on_anything_but_a_function_reaches_nothing() {
+    fn an_attribute_on_anything_but_a_function_reaches_nothing() {
         let mut builder = GraphBuilder::new();
         let module = builder.add("krate", SymbolKind::Module);
         let point = builder.child(module, "krate::Point", SymbolKind::Struct);
@@ -3235,7 +2247,6 @@ mod tests {
                 .iter()
                 .all(|step| step.class == ImpactClass::Behaviour)
         );
-        assert!(reached.iter().all(|step| step.continues));
         assert_eq!(
             step_to(&reached, &base, &head, "krate::caller").certainty,
             Certainty::Resolved
@@ -3268,16 +2279,78 @@ mod tests {
         assert_eq!(expansion.class, ImpactClass::Behaviour);
         assert_eq!(expansion.certainty, Certainty::Candidate);
         assert_eq!(expansion.reason, Reason::InvokesChangedMacro);
-        assert!(expansion.continues);
         assert!(!expansion.coarse);
     }
 
     #[test]
-    fn the_table_holds_every_row_that_follows_edges() {
-        assert_eq!(
-            super::RULES.len(),
-            31,
-            "one entry for every kind of change that follows edges"
+    fn a_removed_field_that_alone_used_a_parameter_reaches_its_container() {
+        let build = |sole: bool| {
+            let mut builder = GraphBuilder::new();
+            let module = builder.add("krate", SymbolKind::Module);
+            let holder = builder.child(module, "krate::Holder", SymbolKind::Struct);
+            let field = builder.child(holder, "krate::Holder::value", SymbolKind::Field);
+            builder.symbol(field).flags.sole_parameter_use = sole;
+            builder.edge(holder, field, EdgeKind::Contains, EdgeDetail::None);
+            builder.finish()
+        };
+        let change = member(
+            ChangeKind::Field,
+            "krate::Holder::value",
+            SymbolKind::Field,
+            Delta::Removed,
         );
+
+        let base = build(true);
+        let steps = first(&base, &nothing(), &change);
+        assert_eq!(
+            reached_paths(&steps, &base, &nothing()),
+            vec!["krate::Holder"]
+        );
+        assert_eq!(steps[0].reason, Reason::ParameterBecomesUnused);
+        assert_eq!(steps[0].class, ImpactClass::Adaptation);
+
+        let base = build(false);
+        assert!(first(&base, &nothing(), &change).is_empty());
+    }
+
+    #[test]
+    fn a_modified_trait_item_reaches_the_callers_of_its_implementations_in_two_steps() {
+        let mut builder = GraphBuilder::new();
+        let module = builder.add("krate", SymbolKind::Module);
+        let trait_ = builder.child(module, "krate::Trait", SymbolKind::Trait);
+        let run = builder.child(trait_, "krate::Trait::run", SymbolKind::Method);
+        let block = builder.child(module, "krate::<impl Trait for A>", SymbolKind::Impl);
+        let implementation =
+            builder.child(block, "krate::<impl Trait for A>::run", SymbolKind::Method);
+        let direct = builder.child(module, "krate::direct", SymbolKind::Function);
+        builder.edge(implementation, run, EdgeKind::Implements, EdgeDetail::None);
+        builder.candidate(direct, implementation, EdgeKind::Calls, EdgeDetail::None);
+        let head = builder.finish();
+        let change = member(
+            ChangeKind::TraitItem,
+            "krate::Trait::run",
+            SymbolKind::Method,
+            Delta::Modified,
+        );
+
+        let steps = first(&nothing(), &head, &change);
+
+        let caller = step_to(&steps, &nothing(), &head, "krate::direct");
+        assert_eq!(caller.reason, Reason::UsesChangedTraitItem);
+        assert_eq!(caller.class, ImpactClass::Adaptation);
+        assert_eq!(caller.certainty, Certainty::Candidate);
+        let via = caller.via.expect("the caller hangs off the implementation");
+        assert_eq!(head.edges[via.edge as usize].from, implementation);
+        assert_eq!(via.certainty, Certainty::Resolved);
+    }
+
+    #[test]
+    fn references_are_every_edge_kind_but_contains() {
+        let expected: Vec<EdgeKind> = EdgeKind::ALL
+            .iter()
+            .copied()
+            .filter(|&kind| kind != EdgeKind::Contains)
+            .collect();
+        assert_eq!(super::REFERENCES, expected.as_slice());
     }
 }
