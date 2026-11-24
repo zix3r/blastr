@@ -204,10 +204,7 @@ mod tests {
 
     #[test]
     fn a_byte_inside_a_character_is_on_its_line() {
-        let map = LineIndex::new(
-            "{e9}
-x",
-        );
+        let map = LineIndex::new("\u{e9}\nx");
         assert_eq!(line(&map, TextSize::from(1)), 1);
         assert_eq!(line(&map, TextSize::from(3)), 2);
     }
