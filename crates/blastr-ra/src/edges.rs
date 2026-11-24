@@ -33,8 +33,8 @@ use std::collections::{HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use blastr_model::{
-    Certainty, Edge, EdgeDetail, EdgeKind, Location, RevisionGraph, SymbolId, SymbolKind,
-    UnresolvedRef,
+    Certainty, Edge, EdgeDetail, EdgeKind, Location, RelPath, RevisionGraph, Span, SymbolId,
+    SymbolKind, UnresolvedRef,
 };
 use ra_ap_hir::{
     Adt, AsAssocItem, AssocItem, AssocItemContainer, Crate, Field, Function, HirFileId, Impl,
@@ -164,6 +164,7 @@ pub(crate) fn collect(input: Input<'_, '_>) -> Output {
             .iter()
             .map(|container| container.node.clone())
             .collect(),
+        inactive: inactive_by_file(input.inactive),
         impl_fns: HashMap::new(),
         implicit: HashMap::new(),
         operators: HashSet::new(),
@@ -269,6 +270,9 @@ struct Collector<'a, 'db> {
     unresolved: Vec<UnresolvedRef>,
     /// The region nodes, so that a nested region is not walked twice.
     regions: HashSet<SyntaxNode>,
+    /// The code ranges that are inactive under the analysed configuration, by
+    /// file and sorted by their start.
+    inactive: HashMap<RelPath, Vec<Span>>,
     /// The functions of the workspace's trait impls, by trait, which a call
     /// through the trait may dispatch to.
     impl_fns: HashMap<Trait, Vec<ImplFn>>,
@@ -1432,11 +1436,13 @@ impl<'db> Collector<'_, 'db> {
         let Some(site) = self.site(call.syntax()) else {
             return false;
         };
-        self.input.inactive.iter().any(|range| {
-            range.file == site.file
-                && site.span.start <= range.span.start
-                && range.span.end <= site.span.end
-        })
+        let ranges = self.inactive_in(&site);
+        // The ranges that start inside the call, of which one must end inside it.
+        let first = ranges.partition_point(|range| range.start < site.span.start);
+        ranges[first..]
+            .iter()
+            .take_while(|range| range.start <= site.span.end)
+            .any(|range| range.end <= site.span.end)
     }
 
     /// Adds the edge of an operator expression, which calls the operator's
@@ -1639,11 +1645,17 @@ impl<'db> Collector<'_, 'db> {
 
     /// Whether `location` lies in code that is inactive under the configuration.
     fn is_inactive(&self, location: &Location) -> bool {
-        self.input.inactive.iter().any(|range| {
-            range.file == location.file
-                && range.span.start <= location.span.start
-                && location.span.end <= range.span.end
-        })
+        let ranges = self.inactive_in(location);
+        // The ranges that start before the location, of which one must cover it.
+        let end = ranges.partition_point(|range| range.start <= location.span.start);
+        ranges[..end]
+            .iter()
+            .any(|range| location.span.end <= range.end)
+    }
+
+    /// The inactive ranges of the file of `location`, sorted by their start.
+    fn inactive_in(&self, location: &Location) -> &[Span] {
+        self.inactive.get(&location.file).map_or(&[], Vec::as_slice)
     }
 
     /// The location of `node`, mapped back to the real file.
@@ -1725,6 +1737,21 @@ impl<'db> Collector<'_, 'db> {
     fn guard<T>(&self, query: impl FnOnce() -> Option<T>) -> Option<T> {
         catch_unwind(AssertUnwindSafe(query)).ok().flatten()
     }
+}
+
+/// The inactive ranges by file, each list sorted by start.
+fn inactive_by_file(ranges: &[Location]) -> HashMap<RelPath, Vec<Span>> {
+    let mut by_file: HashMap<RelPath, Vec<Span>> = HashMap::new();
+    for range in ranges {
+        by_file
+            .entry(range.file.clone())
+            .or_default()
+            .push(range.span);
+    }
+    for spans in by_file.values_mut() {
+        spans.sort_by_key(|span| (span.start, span.end));
+    }
+    by_file
 }
 
 /// The edge a path in value position produces for the definition it resolves
