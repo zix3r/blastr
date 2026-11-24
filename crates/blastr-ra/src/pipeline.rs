@@ -7,7 +7,8 @@
 //!
 //! An extraction runs in three phases:
 //!
-//! - the definition maps of every crate, on the workers, dependencies first;
+//! - rust-analyzer's own cache priming of every crate: the definition maps,
+//!   dependencies first, and the trait impls that method resolution reads;
 //! - the walk of each member crate, on the calling thread, because the syntax
 //!   trees a walk builds cannot move to another thread;
 //! - the inactive ranges of the modules the walks found, on the workers. They
@@ -15,7 +16,6 @@
 //!   infers every body of the module, which also leaves the types in place for
 //!   the dependency pass that follows.
 
-use std::collections::HashSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use blastr_model::{CancelToken, Location, Progress};
 use ra_ap_hir::{AnyDiagnostic, Crate, Module, attach_db, db::HirDatabase};
 use ra_ap_ide::RootDatabase;
+use ra_ap_ide_db::prime_caches;
 
 use crate::locate::{Locator, Paths};
 use crate::{Error, check_cancel};
@@ -52,21 +53,27 @@ impl Pipeline<'_> {
         members: usize,
         mut walk: impl FnMut(usize) -> Result<(T, Vec<Module>), Error>,
     ) -> Result<(Vec<T>, Vec<Location>), Error> {
-        let crates = {
-            let _span = tracing::info_span!("def maps").entered();
-            let crates = dependencies_first(self.database);
-            let defined = self.parallel(&crates, |db, krate| {
-                ra_ap_hir::crate_def_map(db, krate.base());
-                Some(())
-            });
-            if !defined {
+        {
+            let _span = tracing::info_span!("prime caches").entered();
+            let crates: Vec<_> = Crate::all(self.database)
+                .into_iter()
+                .map(|krate| krate.base())
+                .collect();
+            let primed = catch_unwind(AssertUnwindSafe(|| {
+                prime_caches::parallel_prime_caches(
+                    self.database,
+                    &crates,
+                    self.threads(),
+                    &|_| {},
+                );
+            }));
+            if primed.is_err() {
                 return Err(Error::Internal(
                     "a definition map of the project could not be computed".to_owned(),
                 ));
             }
-            crates.len()
-        };
-        tracing::debug!(crates, "definition maps computed");
+        }
+        check_cancel(self.cancel)?;
 
         let span = tracing::info_span!("walk").entered();
         let mut walks = Vec::with_capacity(members);
@@ -100,6 +107,12 @@ impl Pipeline<'_> {
         Ok((walks, lock(&inactive).split_off(0)))
     }
 
+    /// The number of workers: as many as asked for, or one per core.
+    fn threads(&self) -> usize {
+        let available = std::thread::available_parallelism().map_or(1, |count| count.get());
+        self.threads.filter(|count| *count > 0).unwrap_or(available)
+    }
+
     /// Runs `work` on every item, each on the first worker that is free, and
     /// returns false when a piece of work panicked, which stops the others.
     fn parallel<I: Sync>(
@@ -107,8 +120,7 @@ impl Pipeline<'_> {
         items: &[I],
         work: impl Fn(&dyn HirDatabase, &I) -> Option<()> + Sync,
     ) -> bool {
-        let available = std::thread::available_parallelism().map_or(1, |count| count.get());
-        let threads = self.threads.filter(|count| *count > 0).unwrap_or(available);
+        let threads = self.threads();
         let next = AtomicUsize::new(0);
         let failed = AtomicBool::new(false);
         let cancel = self.cancel;
@@ -139,24 +151,6 @@ impl Pipeline<'_> {
         });
         !failed.load(Ordering::Relaxed)
     }
-}
-
-/// Every crate of the crate graph, each after the crates it depends on.
-fn dependencies_first(db: &dyn HirDatabase) -> Vec<Crate> {
-    fn visit(db: &dyn HirDatabase, krate: Crate, seen: &mut HashSet<Crate>, out: &mut Vec<Crate>) {
-        if seen.insert(krate) {
-            for dependency in krate.dependencies(db) {
-                visit(db, dependency.krate, seen, out);
-            }
-            out.push(krate);
-        }
-    }
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    for krate in Crate::all(db) {
-        visit(db, krate, &mut seen, &mut out);
-    }
-    out
 }
 
 /// Locks a mutex, ignoring a panic of another worker.
