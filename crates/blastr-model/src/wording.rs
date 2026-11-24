@@ -88,6 +88,22 @@ pub fn short_name(path: &str) -> ShortName {
         };
     }
 
+    // An impl block itself is named by what it implements for what.
+    if let Some(inner) = segments[last]
+        .strip_prefix("<impl ")
+        .and_then(|rest| rest.strip_suffix('>'))
+    {
+        let words: Vec<String> = strip_generics(inner)
+            .split_whitespace()
+            .map(|word| word.rsplit("::").next().unwrap_or(word).to_owned())
+            .collect();
+        let module: Vec<String> = segments[..last].iter().map(|s| clean(s)).collect();
+        return ShortName {
+            name: format!("impl {}", words.join(" ")),
+            module: module.join("::"),
+        };
+    }
+
     let name = clean(segments[last]);
     let owner = last
         .checked_sub(1)
@@ -696,6 +712,10 @@ mod short_name_tests {
                 "Deserializer::deserialize_any".into(),
                 "serde_json::de".into()
             )
+        );
+        assert_eq!(
+            split("billing::<impl fmt::Display for Total<T>>"),
+            ("impl Display for Total".into(), "billing".into())
         );
         assert_eq!(
             split("billing::<impl Invoice>::total"),
