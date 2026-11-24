@@ -2,7 +2,7 @@
 //! answer.
 //!
 //! The panel is the only place with room for the long form: the class, the
-//! confidence, the score, every evidence path as a clickable chain of steps,
+//! confidence, every evidence path as a clickable chain of steps,
 //! the limits in plain words and the tests that cover the item.
 
 use gpui_kit::prelude::*;
@@ -371,30 +371,6 @@ impl Shell {
                 .items_center()
                 .text_size(TEXT_SMALL)
                 .text_color(theme::FG_3)
-                .child(
-                    div()
-                        .w(px(44.))
-                        .h(px(4.))
-                        .flex_shrink_0()
-                        .rounded(px(2.))
-                        .bg(theme::BG_RAISED_2)
-                        .child(
-                            div()
-                                .w(px(44. * item.score.clamp(0.0, 1.0)))
-                                .h_full()
-                                .rounded(px(2.))
-                                .bg(accent.solid),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .font_family(theme::mono())
-                        .text_size(px(11.5))
-                        .text_color(theme::FG_2)
-                        .child(format!("{:.2}", item.score)),
-                )
-                .child("·")
                 .child(
                     div()
                         .flex_1()
@@ -1315,7 +1291,6 @@ mod tests {
             },
             class,
             confidence: Confidence::Likely,
-            score: 0.5,
             distance: 1,
             paths: vec![blastr_model::EvidencePath {
                 change,
@@ -1339,7 +1314,6 @@ mod tests {
                         },
                     })
                     .collect(),
-                score: 0.5,
             }],
             path_count: 1,
             tags: ImpactTags {

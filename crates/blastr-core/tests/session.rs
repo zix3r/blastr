@@ -9,7 +9,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use blastr_core::Engine;
+use blastr_core::{AnalysisRequest, Engine};
 use blastr_model::{
     AnalysisOptions, AnalysisParams, CancelToken, ImpactClass, NoProgress, RevSpec,
 };
@@ -71,15 +71,14 @@ fn a_session_reports_what_a_save_affects() {
         worktree: true,
         ..RevSpec::default()
     };
+    let request = AnalysisRequest {
+        repo_root: dir,
+        spec: &spec,
+        options: &AnalysisOptions::default(),
+        params: &AnalysisParams::default(),
+    };
     let mut session = engine
-        .session(
-            dir,
-            &spec,
-            &AnalysisOptions::default(),
-            &AnalysisParams::default(),
-            &NoProgress,
-            &cancel,
-        )
+        .session(&request, &NoProgress, &cancel, &mut |_| {})
         .expect("the session opens");
 
     // Nothing is edited yet, so nothing changed and nothing is affected.
@@ -95,21 +94,19 @@ fn a_session_reports_what_a_save_affects() {
     .expect("write the library");
     assert!(session.is_stale().expect("the working tree is readable"));
     let refresh = session
-        .refresh(&NoProgress, &cancel)
-        .expect("the session refreshes");
+        .refresh(&NoProgress, &cancel, &mut |_| {})
+        .expect("the session refreshes")
+        .clone();
     // Cargo writes a `Cargo.lock` while the project is analysed, so the change
     // count is not a fixed number; the edited source has to be among them.
-    assert!(refresh.changed_files >= 1);
     assert!(
         refresh
-            .analysis
             .diff
             .changed_files
             .iter()
             .any(|file| file.path.as_str() == "src/lib.rs")
     );
     let changes: Vec<String> = refresh
-        .analysis
         .diff
         .changes
         .iter()
@@ -117,7 +114,6 @@ fn a_session_reports_what_a_save_affects() {
         .collect();
     assert_eq!(changes, ["session_app::used"]);
     let affected: Vec<(&str, ImpactClass)> = refresh
-        .analysis
         .items
         .iter()
         .map(|item| (item.symbol.path.as_str(), item.class))
@@ -134,23 +130,24 @@ fn a_session_reports_what_a_save_affects() {
     // Editing something nothing depends on leaves the impact as it was.
     fs::write(dir.join("README.md"), "Notes.\n").expect("write a note");
     let refresh = session
-        .refresh(&NoProgress, &cancel)
-        .expect("the session refreshes");
+        .refresh(&NoProgress, &cancel, &mut |_| {})
+        .expect("the session refreshes")
+        .clone();
     assert!(
         refresh
-            .analysis
             .diff
             .changed_files
             .iter()
             .any(|file| file.path.as_str() == "README.md")
     );
-    assert_eq!(refresh.analysis.items.len(), 2);
+    assert_eq!(refresh.items.len(), 2);
 
     // Reverting the edit returns to a tree with no structural change.
     fs::write(dir.join("src/lib.rs"), LIB).expect("write the library");
     let refresh = session
-        .refresh(&NoProgress, &cancel)
-        .expect("the session refreshes");
-    assert!(refresh.analysis.diff.changes.is_empty());
-    assert!(refresh.analysis.items.is_empty());
+        .refresh(&NoProgress, &cancel, &mut |_| {})
+        .expect("the session refreshes")
+        .clone();
+    assert!(refresh.diff.changes.is_empty());
+    assert!(refresh.items.is_empty());
 }

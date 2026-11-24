@@ -1,0 +1,312 @@
+//! The one analysis pipeline, and the one place file edits reach a loaded
+//! project.
+//!
+//! Whatever produced the two graphs — the cache, two project loads, one load
+//! with the head side applied on top, or a [`Session`](crate::Session) that
+//! keeps the working tree loaded — [`pipeline`] classifies the changes between
+//! them, hands them over as soon as they are known, and traces their impact.
+
+use std::collections::BTreeMap;
+use std::ops::RangeInclusive;
+use std::sync::Arc;
+
+use blastr_git::Repo;
+use blastr_model::{
+    Analysis, AnalysisKey, AnalysisOptions, AnalysisParams, CancelToken, Change, ChangedFile,
+    Comparison, DiffResult, ExecMode, FileStatus, IgnoreSet, Limit, Progress, RelPath,
+    RevisionGraph, Source,
+};
+
+use crate::error::Result;
+use crate::hunks::{changed_lines, overlaps};
+use crate::impact::ImpactInput;
+
+/// The file name whose changes are reported as manifest changes.
+pub(crate) const MANIFEST_FILE: &str = "Cargo.toml";
+
+/// What every step of one run against an open repository reads.
+#[derive(Clone, Copy)]
+pub(crate) struct Run<'a> {
+    /// The repository the sides belong to.
+    pub(crate) repo: &'a Repo,
+    /// Configuration to analyse the project under.
+    pub(crate) options: &'a AnalysisOptions,
+    /// The toolchain version recorded in analysis keys.
+    pub(crate) toolchain: &'a str,
+    /// Where progress is reported.
+    pub(crate) progress: &'a dyn Progress,
+    /// Cancellation flag.
+    pub(crate) cancel: &'a CancelToken,
+}
+
+/// Both graphs of one comparison and the cache keys they belong to.
+#[derive(Clone)]
+pub(crate) struct Sides {
+    /// The graph of the base side.
+    pub(crate) base: Arc<RevisionGraph>,
+    /// Its key; `None` when the source has no content id.
+    pub(crate) base_key: Option<AnalysisKey>,
+    /// The graph of the head side.
+    pub(crate) head: Arc<RevisionGraph>,
+    /// Its key; `None` when the source has no content id.
+    pub(crate) head_key: Option<AnalysisKey>,
+    /// The procedural-macro crates either graph may be missing, sorted and
+    /// without duplicates.
+    pub(crate) missing_macros: Vec<String>,
+}
+
+/// A project loaded into rust-analyzer.
+pub(crate) struct Loaded {
+    /// The loaded project.
+    workspace: blastr_ra::Workspace,
+    /// The procedural-macro crates it could not use, sorted and without
+    /// duplicates. They do not change while the project stays loaded.
+    pub(crate) missing_macros: Vec<String>,
+}
+
+impl Loaded {
+    /// Wraps a freshly loaded project.
+    pub(crate) fn new(workspace: blastr_ra::Workspace) -> Loaded {
+        let mut missing_macros = workspace.missing_proc_macros().to_vec();
+        missing_macros.sort();
+        missing_macros.dedup();
+        Loaded {
+            workspace,
+            missing_macros,
+        }
+    }
+
+    /// Extracts the graph of the project as it is loaded now.
+    pub(crate) fn extract(&self, run: &Run<'_>, phase: &str) -> Result<RevisionGraph> {
+        run.progress.report(&format!("extract {phase}"), 0, None);
+        let graph = self.workspace.extract(run.progress, run.cancel)?;
+        run.cancel.check()?;
+        Ok(graph)
+    }
+
+    /// Gives the loaded project the text `head` has for `changed_files` and
+    /// extracts it.
+    ///
+    /// A file that no longer differs keeps whatever text it was last given, so
+    /// the project must have been loaded from the base side or from `head`.
+    pub(crate) fn overlay(
+        &mut self,
+        run: &Run<'_>,
+        head: &Source,
+        changed_files: &[ChangedFile],
+    ) -> Result<RevisionGraph> {
+        let edits = file_edits(run.repo, head, changed_files)?;
+        run.cancel.check()?;
+        run.progress.report("apply", edits.len() as u64, None);
+        self.workspace.apply(&edits)?;
+        run.cancel.check()?;
+        self.extract(run, "head")
+    }
+}
+
+/// Classifies the changes between the two graphs, hands them to `on_changes`
+/// and traces their impact.
+pub(crate) fn pipeline(
+    run: &Run<'_>,
+    comparison: &Comparison,
+    changed_files: Vec<ChangedFile>,
+    sides: &Sides,
+    params: &AnalysisParams,
+    on_changes: &mut dyn FnMut(&DiffResult),
+) -> Result<Analysis> {
+    run.progress.report("classify", 0, None);
+    let mut changes = crate::diff::classify(
+        &sides.base,
+        &sides.head,
+        &changed_files,
+        &crate::diff::MatchParams::default(),
+    );
+    changes.extend(manifest_changes(run.repo, comparison, &changed_files)?);
+    let lines = changed_lines_of(run.repo, comparison, &changed_files)?;
+    let limits = collect_limits(run, &sides.head, &lines, &sides.missing_macros)?;
+    let diff = DiffResult {
+        comparison: comparison.clone(),
+        base_key: sides.base_key.clone(),
+        head_key: sides.head_key.clone(),
+        changed_files,
+        changes,
+        limits,
+    };
+    on_changes(&diff);
+    trace(diff, &sides.base, &sides.head, params, run)
+}
+
+/// Traces the impact of `diff.changes` and completes the analysis.
+pub(crate) fn trace(
+    diff: DiffResult,
+    base: &RevisionGraph,
+    head: &RevisionGraph,
+    params: &AnalysisParams,
+    run: &Run<'_>,
+) -> Result<Analysis> {
+    run.progress.report("impact", 0, None);
+    let ignore = IgnoreSet::new(&params.ignore)?;
+    let output = crate::impact::analyze(
+        &ImpactInput {
+            base,
+            head,
+            changes: &diff.changes,
+            params,
+            ignore: &ignore,
+        },
+        run.cancel,
+    )?;
+    run.cancel.check()?;
+    Ok(Analysis {
+        diff,
+        items: output.items,
+        tests: output.tests,
+        limits: output.limits,
+        params: params.clone(),
+    })
+}
+
+/// The edits that give a project the text `head` has for `changed_files`.
+fn file_edits(
+    repo: &Repo,
+    head: &Source,
+    changed_files: &[ChangedFile],
+) -> Result<Vec<blastr_ra::FileEdit>> {
+    let mut edits = Vec::new();
+    for file in changed_files {
+        // A rename is the removal of the old path and the addition of the new one.
+        if let Some(old_path) = &file.old_path {
+            edits.push(blastr_ra::FileEdit {
+                path: old_path.clone(),
+                content: None,
+            });
+        }
+        if file.status == FileStatus::Deleted {
+            edits.push(blastr_ra::FileEdit {
+                path: file.path.clone(),
+                content: None,
+            });
+            continue;
+        }
+        // Text that is not UTF-8 cannot be a Rust source file and
+        // rust-analyzer would drop it as well, so the old text is left alone.
+        if let Some(text) = read_utf8(repo.read_file(head, &file.path)?) {
+            edits.push(blastr_ra::FileEdit {
+                path: file.path.clone(),
+                content: Some(text),
+            });
+        }
+    }
+    Ok(edits)
+}
+
+/// Invalid UTF-8 counts as an absent file.
+fn read_utf8(bytes: Option<Vec<u8>>) -> Option<String> {
+    bytes.and_then(|bytes| String::from_utf8(bytes).ok())
+}
+
+/// Feature and dependency changes of the `Cargo.toml` files that changed.
+fn manifest_changes(
+    repo: &Repo,
+    comparison: &Comparison,
+    changed_files: &[ChangedFile],
+) -> Result<Vec<Change>> {
+    let mut changes = Vec::new();
+    for file in changed_files {
+        if file.path.as_str().rsplit('/').next() != Some(MANIFEST_FILE) {
+            continue;
+        }
+        let old_path = file.old_path.as_ref().unwrap_or(&file.path);
+        let old = read_utf8(repo.read_file(&comparison.base, old_path)?);
+        let new = read_utf8(repo.read_file(&comparison.head, &file.path)?);
+        changes.extend(crate::diff::manifest_changes(
+            &file.path,
+            old.as_deref(),
+            new.as_deref(),
+        ));
+    }
+    Ok(changes)
+}
+
+/// The head-side lines that differ from the base side, per changed file.
+///
+/// Files that did not change in content are absent, and so are files that are
+/// not UTF-8 text, which the pipeline cannot compare.
+fn changed_lines_of(
+    repo: &Repo,
+    comparison: &Comparison,
+    changed_files: &[ChangedFile],
+) -> Result<BTreeMap<RelPath, Vec<RangeInclusive<u32>>>> {
+    let mut lines = BTreeMap::new();
+    for file in changed_files {
+        if !matches!(file.status, FileStatus::Added | FileStatus::Modified) {
+            continue;
+        }
+        let Some(head) = read_utf8(repo.read_file(&comparison.head, &file.path)?) else {
+            continue;
+        };
+        let base = if file.status == FileStatus::Added {
+            None
+        } else {
+            let old = file.old_path.as_ref().unwrap_or(&file.path);
+            read_utf8(repo.read_file(&comparison.base, old)?)
+        };
+        let ranges = changed_lines(base.as_deref(), &head);
+        if !ranges.is_empty() {
+            lines.insert(file.path.clone(), ranges);
+        }
+    }
+    Ok(lines)
+}
+
+/// What limits the completeness of a comparison.
+pub(crate) fn collect_limits(
+    run: &Run<'_>,
+    head: &RevisionGraph,
+    changed_lines: &BTreeMap<RelPath, Vec<RangeInclusive<u32>>>,
+    missing_macros: &[String],
+) -> Result<Vec<Limit>> {
+    let mut limits = Vec::new();
+    if run.options.exec == ExecMode::Restricted {
+        limits.push(Limit::Restricted);
+    }
+    if !missing_macros.is_empty() {
+        limits.push(Limit::MacrosNotExpanded {
+            crates: missing_macros.to_vec(),
+        });
+    }
+    if run.repo.has_submodules()? {
+        limits.push(Limit::Submodules);
+    }
+    if run.repo.uses_lfs()? {
+        limits.push(Limit::Lfs);
+    }
+    if !head.unresolved.is_empty() {
+        limits.push(Limit::Unresolved {
+            count: u32::try_from(head.unresolved.len()).unwrap_or(u32::MAX),
+        });
+    }
+    // Only inactive code that the comparison actually touched is a limit; an
+    // inactive block elsewhere in a changed file is not.
+    limits.extend(
+        head.inactive
+            .iter()
+            .filter(|location| {
+                changed_lines.get(&location.file).is_some_and(|ranges| {
+                    overlaps(ranges, location.span.start_line, location.span.end_line)
+                })
+            })
+            .cloned()
+            .map(Limit::ChangedButInactive),
+    );
+    Ok(limits)
+}
+
+/// The union of two lists of crates that did not bring their macros, sorted and
+/// without duplicates.
+pub(crate) fn union_of(left: &[String], right: &[String]) -> Vec<String> {
+    let mut union: Vec<String> = left.iter().chain(right).cloned().collect();
+    union.sort();
+    union.dedup();
+    union
+}

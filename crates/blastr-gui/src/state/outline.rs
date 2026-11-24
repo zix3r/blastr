@@ -708,14 +708,12 @@ mod tests {
             location: location("src/lib.rs", 9),
             class,
             confidence,
-            score: 0.5,
             distance: 1,
             paths: vec![EvidencePath {
                 change: 0,
                 reason: Reason::CallsChanged,
                 class,
                 steps: vec![step(path, "k::changed")],
-                score: 0.5,
             }],
             path_count: 1,
             tags: ImpactTags {

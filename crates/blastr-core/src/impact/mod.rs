@@ -1,17 +1,17 @@
 //! Impact analysis: from the structural changes between two graphs to the
-//! items they can affect, ranked, with the evidence for each.
+//! items and tests they can affect, with the evidence for each.
 
 mod propagate;
 mod rules;
 mod select;
-pub mod whatif;
+pub(crate) mod whatif;
+
+use std::collections::HashSet;
 
 use blastr_model::{
-    AnalysisParams, CancelToken, Cancelled, Change, ImpactItem, ImpactLimits, RevisionGraph,
-    TestSelection,
+    AnalysisParams, CancelToken, Cancelled, Change, IgnoreSet, ImpactItem, ImpactLimits,
+    RevisionGraph, SymbolId, TestSelection,
 };
-
-use blastr_model::IgnoreSet;
 
 /// Everything an impact analysis reads.
 #[derive(Debug, Clone, Copy)]
@@ -22,7 +22,7 @@ pub struct ImpactInput<'a> {
     pub head: &'a RevisionGraph,
     /// The structural changes between the two.
     pub changes: &'a [Change],
-    /// Depth, weights and filters.
+    /// Depth and filters.
     pub params: &'a AnalysisParams,
     /// Files whose items are never listed.
     pub ignore: &'a IgnoreSet,
@@ -42,17 +42,23 @@ pub struct ImpactOutput {
 /// The items the changes reach, before tests are selected.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Propagation {
-    /// The affected items, best first.
+    /// The affected items within the depth, best first.
     pub items: Vec<ImpactItem>,
+    /// The head tests the changes reach at any depth.
+    pub tests: HashSet<SymbolId>,
     /// What the result leaves out.
     pub limits: ImpactLimits,
 }
 
 /// Computes what `input.changes` can affect.
 pub fn analyze(input: &ImpactInput<'_>, cancel: &CancelToken) -> Result<ImpactOutput, Cancelled> {
-    let Propagation { items, limits } = propagate::propagate(input, cancel)?;
+    let Propagation {
+        items,
+        tests,
+        limits,
+    } = propagate::propagate(input, cancel)?;
     cancel.check()?;
-    let tests = select::select_tests(input.head, input.changes, &items);
+    let tests = select::select_tests(input.head, input.changes, &tests);
     Ok(ImpactOutput {
         items,
         tests,

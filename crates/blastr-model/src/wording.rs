@@ -1,68 +1,25 @@
 //! The words every front end uses for a result.
 //!
 //! The window and a later agent interface describe the same analysis, so the
-//! short phrases live here once: how a symbol path is shortened, what a
+//! short phrases live here once: how a symbol is named, what a
 //! reason, a limit or a test target is called, and where an item is.
 //! Everything is a pure function of the data it is given.
 
 use crate::{
-    Analysis, AnalysisOptions, Certainty, Change, ChangeDetail, ChangeKind, Delta, EdgeKind,
-    EvidencePath, EvidenceStep, ImpactClass, ImpactItem, ImpactTags, Limit, Location, Reason,
-    TargetKind, TestCommand, TestReason, Visibility,
+    Analysis, Certainty, Change, ChangeDetail, ChangeKind, Delta, EdgeKind, EvidencePath,
+    EvidenceStep, ImpactClass, ImpactItem, ImpactTags, Limit, Location, Reason, TargetKind,
+    TestCommand, TestReason, Visibility,
 };
-
-/// Widest a symbol may get before its path is shortened from the left.
-pub const SYMBOL_WIDTH: usize = 64;
 
 /// What is said about a path that runs through an uncertain step.
 pub const CANDIDATE_PATH_LIMIT: &str = "this path goes through a step that could not be resolved \
                                         to one target, so the item may not be affected.";
 
-/// Shortens a symbol path to at most [`SYMBOL_WIDTH`] characters.
-///
-/// The end of a path says the most, so the function first simplifies the
-/// `<impl …>` segments of a long path, then replaces leading module names with
-/// a `…::` marker, and only cuts characters as a last resort.
-pub fn shorten(symbol: &str) -> String {
-    if symbol.chars().count() <= SYMBOL_WIDTH {
-        return symbol.to_owned();
-    }
-
-    let segments: Vec<String> = path_segments(symbol)
-        .into_iter()
-        .map(simplified_segment)
-        .collect();
-    let simplified = segments.join("::");
-    if simplified.chars().count() <= SYMBOL_WIDTH {
-        return simplified;
-    }
-
-    // Drop leading module names one at a time. The final item name stays, and
-    // so does the segment before it, which names the type the item belongs to.
-    let mut shortest = simplified;
-    if segments.len() > 2 {
-        for start in 1..=segments.len() - 2 {
-            let candidate = format!("…::{}", segments[start..].join("::"));
-            if candidate.chars().count() <= SYMBOL_WIDTH {
-                return candidate;
-            }
-            shortest = candidate;
-        }
-    }
-
-    // Nothing fits: cut characters from the left, keeping the end.
-    let body = shortest.strip_prefix('…').unwrap_or(&shortest);
-    let keep = SYMBOL_WIDTH.saturating_sub(1);
-    let length = body.chars().count();
-    let tail: String = body.chars().skip(length.saturating_sub(keep)).collect();
-    format!("…{tail}")
-}
-
 /// Splits a path at the `::` separators that are not inside angle brackets.
 ///
 /// An `<impl …>` segment holds separators of its own, which must stay inside
 /// that segment.
-pub fn path_segments(path: &str) -> Vec<&str> {
+fn path_segments(path: &str) -> Vec<&str> {
     let mut segments = Vec::new();
     let mut depth = 0usize;
     let mut start = 0usize;
@@ -165,25 +122,6 @@ fn impl_owner(segment: &str) -> String {
     target.rsplit("::").next().unwrap_or(target).to_owned()
 }
 
-/// Simplifies one path segment.
-///
-/// An `<impl …>` segment keeps its brackets but loses the generic arguments
-/// and the module paths of the trait and the type it names.
-fn simplified_segment(segment: &str) -> String {
-    let Some(rest) = segment.strip_prefix("<impl ") else {
-        return segment.to_owned();
-    };
-    let Some(inner) = rest.strip_suffix('>') else {
-        return segment.to_owned();
-    };
-    let inner = strip_generics(inner);
-    let words: Vec<&str> = inner
-        .split_whitespace()
-        .map(|word| word.rsplit("::").next().unwrap_or(word))
-        .collect();
-    format!("<impl {}>", words.join(" "))
-}
-
 /// Removes generic argument lists from text, counting nested brackets.
 fn strip_generics(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -268,19 +206,8 @@ pub fn visibility_text(visibility: &Visibility) -> &'static str {
     }
 }
 
-/// How the analysed features are spelled in a header.
-pub fn features_text(options: &AnalysisOptions) -> String {
-    if options.all_features {
-        return "all".to_owned();
-    }
-    if options.features.is_empty() {
-        return "default".to_owned();
-    }
-    options.features.join(", ")
-}
-
 /// Describes one limit of a result.
-pub fn limit_text(limit: &Limit) -> String {
+fn limit_text(limit: &Limit) -> String {
     match limit {
         Limit::ChangedButInactive(location) => {
             let file = &location.file;
@@ -353,17 +280,6 @@ pub fn limit_parts(analysis: &Analysis) -> Vec<String> {
         let count = limits.coarse_rules;
         let noun = count_noun(count, "coarse rule", "coarse rules");
         parts.push(format!("{count} {noun}"));
-    }
-    if limits.beyond_depth > 0 {
-        let count = limits.beyond_depth;
-        let depth = analysis.params.depth;
-        let noun = count_noun(count, "item", "items");
-        parts.push(format!("{count} {noun} beyond depth {depth}"));
-    }
-    if limits.below_floor > 0 {
-        let count = limits.below_floor;
-        let noun = count_noun(count, "item", "items");
-        parts.push(format!("{count} {noun} below the score floor"));
     }
     if limits.below_confidence > 0 {
         let count = limits.below_confidence;
@@ -525,7 +441,7 @@ pub fn step_text(
 }
 
 /// How an edge kind reads in a step line.
-pub fn edge_phrase(edge: EdgeKind) -> &'static str {
+fn edge_phrase(edge: EdgeKind) -> &'static str {
     match edge {
         EdgeKind::Calls => "calls",
         EdgeKind::TakesAsValue => "passes as a value",
@@ -658,16 +574,6 @@ mod tests {
             }),
             detail,
         }
-    }
-
-    #[test]
-    fn short_paths_are_left_alone_and_long_ones_keep_their_end() {
-        assert_eq!(shorten("billing::tax::vat_rate"), "billing::tax::vat_rate");
-        let long = format!("crate::{}tail", "segment::".repeat(12));
-        let short = shorten(&long);
-        assert!(short.chars().count() <= SYMBOL_WIDTH, "{short}");
-        assert!(short.starts_with("…::"), "{short}");
-        assert!(short.ends_with("::tail"), "{short}");
     }
 
     #[test]

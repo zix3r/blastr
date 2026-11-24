@@ -25,8 +25,8 @@ use blastr_model::{
     RevisionGraph, SymbolPath,
 };
 
-use crate::engine::{Engine, build_id};
-use crate::session::{Session, SessionRequest};
+use crate::engine::{AnalysisRequest, Engine, build_id};
+use crate::session::Session;
 use blastr_model::protocol::{
     self, CacheStatus, Commit, Failure, JobId, OpenedRepository, Report, Repository, Request,
     Response,
@@ -388,15 +388,13 @@ impl<W: Write + Send> Server<W> {
                     diff: diff.clone(),
                 });
             };
-            match engine.analyze_with(
+            let request = AnalysisRequest {
                 repo_root,
                 spec,
                 options,
                 params,
-                &progress,
-                cancel,
-                &mut on_changes,
-            ) {
+            };
+            match engine.analyze(&request, &progress, cancel, &mut on_changes) {
                 Ok(analysis) => {
                     if cancel.is_cancelled() {
                         return Ok(Interrupted::Stopped);
@@ -434,17 +432,13 @@ impl<W: Write + Send> Server<W> {
                     diff: diff.clone(),
                 });
             };
-            match engine.session_with(
-                SessionRequest {
-                    repo_root,
-                    spec,
-                    options,
-                    params,
-                },
-                &progress,
-                cancel,
-                &mut on_changes,
-            ) {
+            let request = AnalysisRequest {
+                repo_root,
+                spec,
+                options,
+                params,
+            };
+            match engine.session(&request, &progress, cancel, &mut on_changes) {
                 Ok(session) => session,
                 Err(error) => {
                     if !cancel.is_cancelled() {
@@ -518,14 +512,14 @@ impl<W: Write + Send> Server<W> {
                     diff: diff.clone(),
                 });
             };
-            match session.refresh_with(&progress, cancel, &mut on_changes) {
-                Ok(refresh) => {
+            match session.refresh(&progress, cancel, &mut on_changes) {
+                Ok(analysis) => {
                     if cancel.is_cancelled() {
                         return Ok(Interrupted::Stopped);
                     }
                     self.send(&Response::Result {
                         id,
-                        analysis: Box::new(refresh.analysis),
+                        analysis: Box::new(analysis.clone()),
                         graph: Some(Box::new(head_graph(session))),
                         elapsed_ms: elapsed_ms(started),
                     })?;

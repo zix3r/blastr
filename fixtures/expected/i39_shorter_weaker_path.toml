@@ -2,18 +2,9 @@
 # strong path is the longer one: `hub` is two resolved calls from the `leaf`
 # change, so the hub reports that path, at distance 2. The weak path is the
 # shorter one: `hub` takes the changed `hook` as a value, one candidate step from
-# that change. Score and distance are two things to keep, not one, so the hub is
-# expanded with both: `caller` and the test are reached by the strong path either
-# way, and the short path adds the evidence that they also depend on `hook`.
-#
-# The two paths here are two and one steps long rather than at the depth limit.
-# At the defaults (depth 8, decay 0.8, candidate weight 0.5) the strong path scores
-# 0.8 x 0.8 = 0.64 at the hub and the short candidate one 0.8 x 0.5 = 0.4, so a
-# resolved step keeps enough of the score that a resolved path can be up to four
-# steps long and still beat a candidate path of one. What this case separates is
-# which of two paths the hub keeps and expands; the case that separates them by
-# depth is the unit test in `crates/blastr-core/src/impact/propagate.rs`, which
-# builds eight- and five-step chains on the same defaults.
+# that change. The search keeps both, the shortest resolved path and the shortest
+# path of any certainty, so `caller` and the test are reached by the strong path
+# and the short path adds the evidence that they also depend on `hook`.
 crates = ["i39_shorter_weaker_path"]
 exact_changes = true
 exact_impact = true
@@ -33,7 +24,7 @@ confidence = "likely"
 reason = "calls-changed"
 distance = 1
 
-# The hub reports its best-scoring path, the two-step one from `leaf`.
+# The hub reports its best path, the resolved two-step one from `leaf`.
 [[impact]]
 symbol = "i39_shorter_weaker_path::hub"
 class = "behaviour"
@@ -41,13 +32,12 @@ confidence = "likely"
 reason = "calls-changed"
 distance = 2
 
-# ... and it was expanded with the one-step candidate path as well.
+# ... and keeps the one-step candidate path as well.
 [[impact]]
 symbol = "i39_shorter_weaker_path::hub"
 reason = "takes-changed-as-value"
 
-# `caller` is the item the flaw cut: it was reached from the hub's best path, and
-# the hub's shorter path was not followed, so the `hook` evidence never arrived.
+# `caller` extends both of the hub's paths, so the `hook` evidence arrives too.
 [[impact]]
 symbol = "i39_shorter_weaker_path::caller"
 class = "behaviour"
