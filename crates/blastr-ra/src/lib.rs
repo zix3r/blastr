@@ -7,18 +7,21 @@
 //! [`Workspace::load`] loads a Cargo project into a rust-analyzer database and
 //! [`Workspace::extract`] turns the loaded project into a
 //! [`blastr_model::RevisionGraph`]. The extraction rules (which items become
-//! symbols, how their paths and hashes are built) are fixed by the stage 2
-//! contract; the modules below split the work up:
+//! symbols, how their paths and hashes are built) are documented on the model
+//! types; the modules below split the work up:
 //!
 //! - `load` discovers and loads the Cargo project,
 //! - `apply` brings edits of the source files into the loaded project,
 //! - `extract` walks the loaded crates and assembles the graph,
-//! - `pipeline` runs the phases of an extraction on several threads,
-//! - `symbols` turns one rust-analyzer definition into one symbol,
+//! - `pipeline` runs the definition maps, the walks and the inactive ranges on
+//!   several threads,
+//! - `symbols` holds a symbol before its id is known, the definition keys and
+//!   the hashes of each kind of item,
 //! - `paths` builds the canonical paths,
 //! - `hashing` hashes syntax tokens,
 //! - `locate` maps file ids and text ranges to locations,
-//! - `edges` is the hook for the dependency edges.
+//! - `edges` finds the dependency edges, classifying every reference the way
+//!   rust-analyzer's find-references does.
 
 #![forbid(unsafe_code)]
 

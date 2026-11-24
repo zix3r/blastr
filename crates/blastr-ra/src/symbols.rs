@@ -87,7 +87,7 @@ impl Raw {
 /// and then asks [`SymbolTable`] for the id this crate assigned to it:
 ///
 /// ```ignore
-/// let symbol = symbols.module_def(ModuleDef::Function(f)).map(|id| &graph.symbols[id.0 as usize]);
+/// let symbol = symbols.get(DefKey::Function(f)).map(|id| &graph.symbols[id.0 as usize]);
 /// ```
 ///
 /// Every variant is a `Copy` handle of the rust-analyzer definition, so the key
