@@ -470,6 +470,9 @@ impl<W: Write + Send> Server<W> {
         requests: &Receiver<Request>,
     ) -> io::Result<Interrupted> {
         let progress = self.progress(id);
+        // The graph the window holds: a refresh sends the graph again only when
+        // it differs, and the window keeps the last one it was sent.
+        let mut sent = Arc::clone(session.head_graph());
         loop {
             match requests.try_recv() {
                 Ok(request) => return Ok(Interrupted::Request(Box::new(request))),
@@ -505,22 +508,25 @@ impl<W: Write + Send> Server<W> {
             }
             self.send(&Response::Refreshing { id })?;
             let started = Instant::now();
-            let output = Arc::clone(&self.output);
-            let mut on_changes = |diff: &DiffResult| {
-                let _ = output.send(&Response::Changes {
-                    id,
-                    diff: diff.clone(),
-                });
-            };
-            match session.refresh(&progress, cancel, &mut on_changes) {
+            // The window keeps showing the last result until the refreshed one
+            // arrives, so the changes ahead of it would not be shown.
+            match session.refresh(&progress, cancel, &mut |_| {}) {
                 Ok(analysis) => {
                     if cancel.is_cancelled() {
                         return Ok(Interrupted::Stopped);
                     }
+                    let analysis = Box::new(analysis.clone());
+                    let head = session.head_graph();
+                    let graph = if **head == *sent {
+                        None
+                    } else {
+                        sent = Arc::clone(head);
+                        Some(Box::new(head.as_ref().clone()))
+                    };
                     self.send(&Response::Result {
                         id,
-                        analysis: Box::new(analysis.clone()),
-                        graph: Some(Box::new(head_graph(session))),
+                        analysis,
+                        graph,
                         elapsed_ms: elapsed_ms(started),
                     })?;
                 }

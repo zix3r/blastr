@@ -251,7 +251,9 @@ pub enum Response {
         id: JobId,
         /// The analysis.
         analysis: Box<Analysis>,
-        /// The graph of the newer side, for symbol search.
+        /// The graph of the newer side, for symbol search. A refresh after a
+        /// save leaves it out when it did not change: the window keeps the
+        /// last one it was sent.
         graph: Option<Box<RevisionGraph>>,
         /// How long the engine took, in milliseconds.
         elapsed_ms: u64,

@@ -721,6 +721,17 @@ mod tests {
     }
 
     #[test]
+    fn a_refresh_without_a_graph_keeps_the_last_one() {
+        let mut session = opened(true);
+        let run = session.choose(Compare::WorkingTree);
+        let graph = Arc::new(RevisionGraph::default());
+        session.result_arrived(run, analysis(&["a"]), Some(graph.clone()), SECOND, true);
+        session.result_arrived(run, analysis(&["a", "b"]), None, SECOND, true);
+        let kept = session.result.ready().and_then(|o| o.graph.clone());
+        assert!(kept.is_some_and(|kept| Arc::ptr_eq(&kept, &graph)));
+    }
+
+    #[test]
     fn a_new_comparison_cancels_the_previous_one_and_ignores_its_result() {
         let mut session = opened(true);
         let first = session.choose(Compare::WorkingTree);
