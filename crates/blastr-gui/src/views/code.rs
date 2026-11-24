@@ -150,12 +150,12 @@ impl CodePane {
             let texts = cx.background_executor().spawn(async move {
                 let base = read_source(&root, &comparison.base, &old_file).unwrap_or_default();
                 let head = read_source(&root, &comparison.head, &file).unwrap_or_default();
-                patch(&old_file, &file, &base, &head)
+                (patch(&old_file, &file, &base, &head), head)
             });
             self.content = Content::Loading;
             self.read = cx.spawn_in(window, async move |this, cx| {
-                let patch = texts.await;
-                this.update(cx, |this, cx| {
+                let (patch, head) = texts.await;
+                this.update_in(cx, |this, window, cx| {
                     let files = DiffFile::parse(&patch).unwrap_or_default();
                     let path = files
                         .first()
@@ -170,6 +170,20 @@ impl CodePane {
                         span.start_line as usize,
                         span.end_line.max(span.start_line) as usize,
                     );
+                    // A hypothetical change has no diff: show its source.
+                    if files.is_empty() {
+                        let lines = (span.start_line, span.end_line);
+                        this.show_source(
+                            head,
+                            theme::CHANGED,
+                            lines,
+                            &[],
+                            span.start_line,
+                            window,
+                            cx,
+                        );
+                        return;
+                    }
                     self_decorate(this, path.clone(), side, start, end);
                     this.diff.update(cx, |state, cx| {
                         state.set_files(files, cx);
