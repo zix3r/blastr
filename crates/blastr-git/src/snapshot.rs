@@ -32,15 +32,16 @@ impl Repo {
         }
         let repo = self.repo()?;
         let tree = find_tree(&repo, id)?;
-        let mut files = Vec::new();
-        for record in tree.traverse().breadthfirst.files().map_err(Error::git)? {
-            if !is_file(record.mode.kind()) {
-                continue;
+        write_snapshot(snapshots_dir, &destination, |directory| {
+            for record in tree.traverse().breadthfirst.files().map_err(Error::git)? {
+                if !is_file(record.mode.kind()) {
+                    continue;
+                }
+                let content = blob_bytes(&repo, record.oid)?;
+                write_file(directory, &rel_path(record.filepath), &content)?;
             }
-            let content = blob_bytes(&repo, record.oid)?;
-            files.push((rel_path(record.filepath), content));
-        }
-        write_snapshot(snapshots_dir, &destination, files)?;
+            Ok(())
+        })?;
         Ok(destination)
     }
 
@@ -54,19 +55,19 @@ impl Repo {
         let repo = self.repo()?;
         let index = repo.index_or_empty().map_err(Error::git)?;
         let state: &gix::index::State = &index;
-        let mut files = Vec::new();
-        for entry in state.entries() {
-            if entry.stage() != Stage::Unconflicted {
-                continue;
+        write_snapshot(snapshots_dir, &destination, |directory| {
+            for entry in state.entries() {
+                if entry.stage() != Stage::Unconflicted {
+                    continue;
+                }
+                if entry.mode != Mode::FILE && entry.mode != Mode::FILE_EXECUTABLE {
+                    continue;
+                }
+                let content = blob_bytes(&repo, entry.id)?;
+                write_file(directory, &rel_path(entry.path(state)), &content)?;
             }
-            if entry.mode != Mode::FILE && entry.mode != Mode::FILE_EXECUTABLE {
-                continue;
-            }
-            let path = rel_path(entry.path(state));
-            let content = blob_bytes(&repo, entry.id)?;
-            files.push((path, content));
-        }
-        write_snapshot(snapshots_dir, &destination, files)?;
+            Ok(())
+        })?;
         Ok(destination)
     }
 }
@@ -76,11 +77,12 @@ fn is_complete(dir: &Path) -> bool {
     dir.join(SNAPSHOT_MARKER).is_file()
 }
 
-/// Writes `files` into `destination` through a temporary directory that is renamed into place.
+/// Fills `destination` through a temporary directory that `write` writes the
+/// files into, one at a time, and that is renamed into place with the marker.
 fn write_snapshot(
     snapshots_dir: &Path,
     destination: &Path,
-    files: Vec<(RelPath, Vec<u8>)>,
+    write: impl FnOnce(&Path) -> Result<(), Error>,
 ) -> Result<(), Error> {
     std::fs::create_dir_all(snapshots_dir)?;
     if destination.exists() {
@@ -90,7 +92,10 @@ fn write_snapshot(
         std::fs::remove_dir_all(destination)?;
     }
     let temporary = create_temporary_dir(snapshots_dir)?;
-    let written = write_files(&temporary, &files);
+    let written = write(&temporary).and_then(|()| {
+        std::fs::write(temporary.join(SNAPSHOT_MARKER), b"")?;
+        Ok(())
+    });
     let result = written.and_then(|()| std::fs::rename(&temporary, destination).map_err(Error::Io));
     if result.is_err() {
         let _ = std::fs::remove_dir_all(&temporary);
@@ -98,16 +103,13 @@ fn write_snapshot(
     result
 }
 
-/// Writes the files and the marker into the temporary snapshot directory.
-fn write_files(directory: &Path, files: &[(RelPath, Vec<u8>)]) -> Result<(), Error> {
-    for (path, content) in files {
-        let target = directory.join(path.as_str());
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&target, content)?;
+/// Writes one file into the temporary snapshot directory.
+fn write_file(directory: &Path, path: &RelPath, content: &[u8]) -> Result<(), Error> {
+    let target = directory.join(path.as_str());
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(directory.join(SNAPSHOT_MARKER), b"")?;
+    std::fs::write(&target, content)?;
     Ok(())
 }
 
