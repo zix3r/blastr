@@ -47,7 +47,18 @@ impl EvidencePanel {
                 .map(|selection| selection.symbol.clone());
             if symbol != this.shown {
                 this.shown = symbol;
-                this.path = 0;
+                // The path from the change the graph shows comes first.
+                let workspace = workspace.read(cx);
+                let focus = workspace.focus_change();
+                this.path = workspace
+                    .selected_item()
+                    .and_then(|item| {
+                        item.paths
+                            .iter()
+                            .filter(|path| path.class == item.class)
+                            .position(|path| Some(path.change as usize) == focus)
+                    })
+                    .unwrap_or(0);
                 this.all_tests = false;
             }
             cx.notify();

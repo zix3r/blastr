@@ -194,6 +194,18 @@ impl CodePane {
                 .filter(|step| step.from == key.symbol && step.site.file == location.file)
                 .map(|step| (step.site.span.start_line, step.site.span.end_line))
                 .collect();
+            // The line of the path from the change the graph shows comes first.
+            let focus = workspace.focus_change();
+            if let Some(first) = item
+                .and_then(|item| {
+                    item.paths
+                        .iter()
+                        .find(|path| Some(path.change as usize) == focus)
+                })
+                .and_then(|path| path.steps.iter().find(|step| step.from == key.symbol))
+            {
+                lines.insert(0, (first.site.span.start_line, first.site.span.end_line));
+            }
             // A clicked evidence step marks its line; a search hit, which
             // names the whole symbol, only the gutter.
             if let (Some(site), Some(item)) = (&key.site, item)
