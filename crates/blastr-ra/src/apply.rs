@@ -20,7 +20,7 @@ use ra_ap_hir::ChangeWithProcMacros;
 use ra_ap_vfs::{Change, FileId, VfsPath};
 
 use crate::load::absolute;
-use crate::locate::lexical_rel_path;
+use crate::locate::{self, Root};
 use crate::{Error, FileEdit, Workspace};
 
 impl Workspace {
@@ -79,21 +79,11 @@ impl Workspace {
     }
 
     /// The id of every file in the virtual file system, by path relative to the root.
-    ///
-    /// The comparison is lexical: the loading code and the caller both derive
-    /// their paths from the same root directory, so the same file is spelled the
-    /// same way in both.
     fn files_by_path(&self) -> HashMap<RelPath, FileId> {
-        let mut files = HashMap::new();
-        for (file_id, path) in self.vfs.iter() {
-            let Some(absolute) = path.as_path() else {
-                continue;
-            };
-            if let Some(relative) = lexical_rel_path(&self.root, absolute.as_ref()) {
-                files.insert(relative, file_id);
-            }
-        }
-        files
+        locate::paths(&self.vfs, &Root::new(&self.root))
+            .into_iter()
+            .map(|(file, path)| (path, file))
+            .collect()
     }
 }
 

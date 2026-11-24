@@ -25,7 +25,6 @@ use ra_ap_hir::{
     Visibility as HirVisibility, attach_db, db::HirDatabase,
 };
 use ra_ap_ide_db::RootDatabase;
-use ra_ap_ide_db::base_db::SourceDatabase;
 use ra_ap_syntax::ast;
 use ra_ap_syntax::{AstNode, SyntaxNode, TextRange, TextSize};
 use ra_ap_vfs::FileId;
@@ -35,8 +34,8 @@ use crate::hashing;
 use crate::load::MemberCrate;
 use ra_ap_ide_db::base_db::Crate as BaseCrate;
 
-use crate::locate::Locator;
-use crate::pipeline::{self, Crates, Threads};
+use crate::locate::{self, Locator, Root};
+use crate::pipeline::Pipeline;
 use crate::symbols::{self, DefKey, Hashes, Raw, SymbolTable};
 use crate::{Error, ExtractOptions, Workspace, check_cancel, paths};
 
@@ -57,48 +56,26 @@ impl Workspace {
         progress: &dyn Progress,
         cancel: &CancelToken,
     ) -> Result<RevisionGraph, Error> {
+        let _span = tracing::info_span!("extract").entered();
         let database = self.host.raw_database();
         let db: &dyn HirDatabase = database;
-        let source_db: &dyn SourceDatabase = database;
-        let locator = Locator::new(source_db, &self.vfs, &self.root);
-        let threads = Threads::new(database, options.threads);
+        let paths = locate::paths(&self.vfs, &Root::new(&self.root));
+        let locator = Locator::new(database, &paths);
+        let pipeline = Pipeline {
+            database,
+            threads: options.threads,
+            paths: &paths,
+            cancel,
+            progress,
+        };
         attach_db(db, || {
             let members = self.members(db);
-            let phases = Crates::new(
-                db,
-                &members
-                    .iter()
-                    .enumerate()
-                    .map(|(index, member)| (member.resolved.krate, index))
-                    .collect::<Vec<_>>(),
-                members.len(),
-            );
-            let mut walked: Vec<Option<Extractor<'_>>> = (0..members.len()).map(|_| None).collect();
-            let inactive = pipeline::run(
-                pipeline::Input {
-                    db,
-                    crates: &phases,
-                    threads: &threads,
-                    paths: locator.paths(),
-                    cancel,
-                    progress,
-                },
-                &mut walked,
-                |index| {
-                    let extractor = Extractor::new(db, &locator, cancel, self, &members[index]);
-                    let extractor = extractor.run()?;
-                    let modules = extractor.modules.clone();
-                    Ok((extractor, modules))
-                },
-            )?;
-            let mut walks = Vec::with_capacity(walked.len());
-            for walk in walked {
-                walks.push(
-                    walk.ok_or_else(|| {
-                        Error::Internal("a member crate was not walked".to_owned())
-                    })?,
-                );
-            }
+            let (walks, inactive) = pipeline.run(members.len(), |index| {
+                let extractor = Extractor::new(db, &locator, cancel, self, &members[index]);
+                let extractor = extractor.run()?;
+                let modules = extractor.modules.clone();
+                Ok((extractor, modules))
+            })?;
             let workspace_crates = members
                 .iter()
                 .map(|member| member.resolved.krate.base())
@@ -1122,6 +1099,7 @@ impl<'a> Assembler<'a> {
         };
 
         let sema = Semantics::new(self.db);
+        let _span = tracing::info_span!("edges").entered();
         let output = edges::collect(EdgeInput {
             db: self.db,
             sema: &sema,
