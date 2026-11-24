@@ -100,14 +100,19 @@ sudo apt-get install -y build-essential cmake clang lld pkg-config libzstd-dev l
 ### Use
 
 Start `blastr` inside a repository, pass it a folder (`blastr path/to/project`), or open one from
-the start screen. Uncommitted changes are compared against `HEAD` straight away; pick any commit, or
-shift-click a range, to compare that instead. With the working tree selected, every save refreshes
-the result in about a second.
+the start screen. Uncommitted changes are compared against `HEAD` straight away; open the compare
+chip in the title bar to pick a commit, or shift-click a second one for a range. With the working
+tree selected, every save refreshes the result in about a second.
+
+Select a change to see its diff and a graph of where it reaches; select an affected item to see its
+source with the evidence lines marked and the path that reaches it. *What if…* in the evidence panel
+traces what a change of the selected symbol would reach.
 
 | Keys | |
 |---|---|
 | <kbd>Ctrl</kbd> <kbd>P</kbd> | Find any symbol |
-| <kbd>Ctrl</kbd> <kbd>1</kbd> / <kbd>2</kbd> / <kbd>3</kbd> | Graph, source, before and after |
+| <kbd>Ctrl</kbd> <kbd>F</kbd> | Filter the changes and impact |
+| <kbd>Ctrl</kbd> <kbd>M</kbd> | Give the code pane the whole centre, or the graph back |
 | <kbd>Alt</kbd> <kbd>←</kbd> / <kbd>→</kbd> | Back and forward through the selection |
 | <kbd>Ctrl</kbd> <kbd>E</kbd> | Open the selected location in your editor |
 | <kbd>Ctrl</kbd> <kbd>,</kbd> | Settings |
@@ -134,14 +139,16 @@ load never freezes or crashes the window.
 There is no configuration file in the repository. Everything is set in the window, from the gear
 in the title bar or <kbd>Ctrl</kbd> <kbd>,</kbd>:
 
-- **Editor** — which editor *open in editor* starts, picked from the ones found on this machine, or
-  a command of your own with `{file}`, `{line}` and `{column}` placeholders.
-- **Analysis** — how far impact is followed, the lowest confidence that is listed, and whether a
-  comparison of the working tree runs again when a file is saved.
+- **Editor** — the command *open in editor* runs, with `{file}`, `{line}` and `{column}`
+  placeholders; it starts as the first editor found on this machine. Empty opens the file with the
+  program the system associates with it.
+- **Analysis** — how far impact is followed, and whether a comparison of the working tree runs
+  again when a file is saved.
 - **This repository** — its Cargo features or all of them, a target triple, ignore patterns, and
   whether build scripts and procedural macros may run.
 
-A change applies at once; anything the analysis depends on runs the comparison again. The settings
+Which confidence is listed is chosen above the list itself. A change applies at once; one the
+analysis depends on offers to run the comparison again. The settings
 are kept in your user configuration directory (`%APPDATA%\blastr` on Windows, `~/.config/blastr` on
 Linux, `~/Library/Application Support/blastr` on macOS), beside the cache, so nothing about your
 machine ends up in a commit.
