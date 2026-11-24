@@ -317,7 +317,19 @@ pub fn class_text(class: ImpactClass) -> &'static str {
 ///
 /// The changed thing is named by the last segment of its path.
 pub fn reason_text(reason: Reason, change: &Change) -> String {
-    let name = change.symbol.name();
+    reason_phrase(reason, change, change.symbol.name(), |from| {
+        from.name().to_owned()
+    })
+}
+
+/// [`reason_text`] with the changed thing called `name`, and the old name of
+/// a renamed one given by `old`.
+fn reason_phrase(
+    reason: Reason,
+    change: &Change,
+    name: &str,
+    old: impl Fn(&crate::SymbolPath) -> String,
+) -> String {
     match reason {
         Reason::CallsChanged => format!("calls {name}"),
         Reason::TakesChangedAsValue => format!("passes {name} as a value"),
@@ -327,7 +339,7 @@ pub fn reason_text(reason: Reason, change: &Change) -> String {
         Reason::NoLongerVisible => format!("can no longer see {name}"),
         Reason::RefersToRemoved => format!("uses removed {name}"),
         Reason::RefersToRenamed => match &change.detail {
-            ChangeDetail::Renamed { from } => format!("uses {}, now {name}", from.name()),
+            ChangeDetail::Renamed { from } => format!("uses {}, now {name}", old(from)),
             _ => format!("uses {name} by its old name"),
         },
         Reason::UsesChangedField => format!("uses field {name}"),
@@ -357,6 +369,174 @@ pub fn reason_text(reason: Reason, change: &Change) -> String {
         Reason::InvokesChangedMacro => format!("invokes {name}!"),
         Reason::AttributeChanged => format!("calls {name}, whose attributes changed"),
     }
+}
+
+/// A sentence with the symbol names in it marked, so that a front end can set
+/// them in another face.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Sentence {
+    /// The words.
+    pub text: String,
+    /// The byte ranges of `text` that are symbol names.
+    pub names: Vec<std::ops::Range<usize>>,
+}
+
+impl Sentence {
+    fn plain(&mut self, words: &str) -> &mut Self {
+        self.text.push_str(words);
+        self
+    }
+
+    /// Appends `words`, marking every place `name` appears in them.
+    fn naming(&mut self, words: &str, name: &str) -> &mut Self {
+        let offset = self.text.len();
+        if !name.is_empty() {
+            for (at, _) in words.match_indices(name) {
+                self.names.push(offset + at..offset + at + name.len());
+            }
+        }
+        self.text.push_str(words);
+        self
+    }
+}
+
+/// What a change did to its symbol, as the end of a `whose …` clause.
+fn what_changed(change: &Change) -> &'static str {
+    match change.kind {
+        ChangeKind::Body => "body changed",
+        ChangeKind::Signature => "signature changed",
+        ChangeKind::Visibility => "visibility changed",
+        ChangeKind::Added => "definition is new",
+        ChangeKind::Removed => "definition was removed",
+        ChangeKind::Renamed => "name changed",
+        ChangeKind::NonSemantic => "formatting changed",
+        ChangeKind::Field | ChangeKind::Variant | ChangeKind::TraitItem | ChangeKind::Impl => {
+            "members changed"
+        }
+        ChangeKind::ConstValue => "value changed",
+        ChangeKind::TypeAlias => "type changed",
+        ChangeKind::MacroDef => "expansion changed",
+        ChangeKind::Attribute => "attributes changed",
+        ChangeKind::Manifest => "manifest changed",
+    }
+}
+
+/// Whether a reason only says that the item uses the changed thing, so that
+/// an explanation has to add what happened to it.
+fn reason_is_plain_use(reason: Reason) -> bool {
+    matches!(
+        reason,
+        Reason::CallsChanged
+            | Reason::TakesChangedAsValue
+            | Reason::DispatchesToChanged
+            | Reason::UsesChangedField
+            | Reason::UsesChangedVariant
+            | Reason::UsesChangedTraitItem
+            | Reason::InheritsChangedDefault
+            | Reason::UsesChangedValue
+            | Reason::UsesChangedAlias
+            | Reason::InvokesChangedMacro
+    )
+}
+
+/// The sentence that explains why `item` is listed, following `path`.
+///
+/// Symbols are named by their short names, as the lists show them.
+pub fn explanation(item: &ImpactItem, path: &EvidencePath, analysis: &Analysis) -> Sentence {
+    let mut sentence = Sentence::default();
+    let editing = item.class == ImpactClass::Adaptation;
+    let (lead, closing) = if editing {
+        ("It ", "so it needs editing.")
+    } else {
+        (
+            "Its own code did not change, but it ",
+            "so it may behave differently.",
+        )
+    };
+    match analysis.diff.changes.get(path.change as usize) {
+        Some(change) => {
+            let short = short_name(&change.symbol.path).name;
+            let what = what_changed(change);
+            if path.steps.len() <= 1 {
+                let mut reason = reason_phrase(path.reason, change, &short, |from| {
+                    short_name(&from.path).name
+                });
+                if reason_is_plain_use(path.reason) {
+                    reason.push_str(&format!(", whose {what}"));
+                }
+                sentence
+                    .plain(lead)
+                    .naming(&reason, &short)
+                    .plain(", ")
+                    .plain(closing);
+            } else {
+                let steps = path.steps.len();
+                sentence
+                    .plain(lead)
+                    .plain(&format!("is {steps} steps from "))
+                    .naming(&short, &short)
+                    .plain(&format!(", whose {what}, {closing}"));
+            }
+        }
+        None => {
+            sentence.plain(if editing {
+                "It refers to something whose shape changed, so it needs editing."
+            } else {
+                "Its own code did not change, but something it reaches did, so it may behave \
+                 differently."
+            });
+        }
+    }
+    if item.confidence == crate::Confidence::Possible {
+        sentence.plain(
+            " One step is a candidate: at least one target could not be resolved to a single \
+             definition.",
+        );
+    }
+    sentence
+}
+
+/// One sentence saying what a change did.
+pub fn change_note(change: &Change) -> String {
+    let member = match &change.detail {
+        ChangeDetail::Member(delta) => Some(match delta {
+            Delta::Added => "a member was added",
+            Delta::Removed => "a member was removed",
+            Delta::Modified => "a member changed",
+        }),
+        ChangeDetail::DefaultBody => Some("only the default body changed"),
+        ChangeDetail::Renamed { .. } => Some("it was renamed"),
+        ChangeDetail::Visibility { .. } => Some("its visibility changed"),
+        ChangeDetail::Retyped => Some("its declared type changed"),
+        ChangeDetail::Manifest(text) => return text.clone(),
+        ChangeDetail::None => None,
+    };
+    if let Some(member) = member {
+        let text = format!("{}: {member}.", change.kind.as_str());
+        let mut characters = text.chars();
+        return match characters.next() {
+            Some(first) => first.to_uppercase().chain(characters).collect(),
+            None => String::new(),
+        };
+    }
+    match change.kind {
+        ChangeKind::Body => "The body changed; the signature did not.",
+        ChangeKind::Signature => "The signature changed; the body did not.",
+        ChangeKind::Visibility => "How visible it is changed; nothing else did.",
+        ChangeKind::Added => "It is new in this revision.",
+        ChangeKind::Removed => "It is gone from this revision.",
+        ChangeKind::Renamed => "It has a new name.",
+        ChangeKind::NonSemantic => "Only formatting and comments changed.",
+        ChangeKind::Field | ChangeKind::Variant | ChangeKind::TraitItem | ChangeKind::Impl => {
+            "A member of it changed."
+        }
+        ChangeKind::ConstValue => "Its value changed; its type did not.",
+        ChangeKind::TypeAlias => "What the alias names changed.",
+        ChangeKind::MacroDef => "The expansion it produces changed.",
+        ChangeKind::Attribute => "An attribute on it changed.",
+        ChangeKind::Manifest => "The manifest changed.",
+    }
+    .to_owned()
 }
 
 /// Why an item is listed, in one short phrase.
@@ -610,5 +790,123 @@ mod tests {
             ChangeDetail::None,
         );
         assert_eq!(reason_text(Reason::CallsChanged, &body), "calls vat_rate");
+    }
+
+    fn explained(kind: ChangeKind, reason: Reason, class: ImpactClass, steps: usize) -> Sentence {
+        let step = EvidenceStep {
+            from: crate::SymbolPath::new("billing::caller", SymbolKind::Function),
+            to: crate::SymbolPath::new("billing::Invoice::total", SymbolKind::Method),
+            edge: EdgeKind::Calls,
+            certainty: Certainty::Resolved,
+            detail: crate::EdgeDetail::None,
+            site: Location {
+                file: RelPath::new("src/lib.rs"),
+                span: Span {
+                    start: 0,
+                    end: 1,
+                    start_line: 2,
+                    end_line: 2,
+                },
+            },
+        };
+        let path = EvidencePath {
+            change: 0,
+            reason,
+            class,
+            steps: vec![step; steps],
+        };
+        let item = ImpactItem {
+            symbol: crate::SymbolPath::new("billing::caller", SymbolKind::Function),
+            location: path.steps[0].site.clone(),
+            class,
+            confidence: crate::Confidence::Likely,
+            distance: steps as u32,
+            paths: vec![path.clone()],
+            path_count: 1,
+            tags: ImpactTags::default(),
+        };
+        let analysis = Analysis {
+            diff: crate::DiffResult {
+                comparison: crate::Comparison {
+                    base: crate::Source::Worktree,
+                    head: crate::Source::Worktree,
+                },
+                base_key: None,
+                head_key: None,
+                changed_files: Vec::new(),
+                changes: vec![change(kind, "billing::Invoice::total", ChangeDetail::None)],
+                limits: Vec::new(),
+            },
+            items: vec![item.clone()],
+            tests: crate::TestSelection::default(),
+            limits: crate::ImpactLimits::default(),
+            params: crate::AnalysisParams::default(),
+        };
+        explanation(&item, &path, &analysis)
+    }
+
+    #[test]
+    fn an_explanation_says_what_happened_to_what_is_used() {
+        let sentence = explained(
+            ChangeKind::Body,
+            Reason::CallsChanged,
+            ImpactClass::Behaviour,
+            1,
+        );
+        assert_eq!(
+            sentence.text,
+            "Its own code did not change, but it calls Invoice::total, whose body changed, so \
+             it may behave differently."
+        );
+        let named: Vec<&str> = sentence
+            .names
+            .iter()
+            .map(|range| &sentence.text[range.clone()])
+            .collect();
+        assert_eq!(named, vec!["Invoice::total"]);
+    }
+
+    #[test]
+    fn a_reason_that_says_what_changed_is_not_repeated() {
+        let sentence = explained(
+            ChangeKind::Signature,
+            Reason::SignatureChanged,
+            ImpactClass::Adaptation,
+            1,
+        );
+        assert_eq!(
+            sentence.text,
+            "It calls Invoice::total, whose signature changed, so it needs editing."
+        );
+    }
+
+    #[test]
+    fn a_long_path_counts_its_steps() {
+        let sentence = explained(
+            ChangeKind::Body,
+            Reason::CallsChanged,
+            ImpactClass::Behaviour,
+            3,
+        );
+        assert!(
+            sentence
+                .text
+                .contains("is 3 steps from Invoice::total, whose body changed")
+        );
+    }
+
+    #[test]
+    fn a_change_note_says_what_happened() {
+        let body = change(ChangeKind::Body, "billing::a", ChangeDetail::None);
+        assert_eq!(
+            change_note(&body),
+            "The body changed; the signature did not."
+        );
+        let field = change(
+            ChangeKind::Field,
+            "billing::A::b",
+            ChangeDetail::Member(Delta::Added),
+        );
+        assert_eq!(change_note(&field), "Field: a member was added.");
     }
 }
