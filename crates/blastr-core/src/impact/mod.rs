@@ -4,7 +4,7 @@
 mod propagate;
 mod rules;
 mod select;
-pub mod whatif;
+pub(crate) mod whatif;
 
 use std::collections::HashSet;
 

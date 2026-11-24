@@ -8,22 +8,21 @@
 
 #![forbid(unsafe_code)]
 
-mod base;
 mod cache;
 mod codec;
-pub mod diff;
+mod diff;
 mod engine;
 mod error;
 mod hunks;
-pub mod impact;
+mod impact;
+mod pipeline;
 pub mod service;
 mod session;
 
 /// The version of the rust-analyzer libraries this build uses.
 pub const RUST_ANALYZER_VERSION: &str = blastr_ra::RUST_ANALYZER_VERSION;
 
-pub use base::{FileEdit, ProjectBase, Variant};
 pub use blastr_model::{CancelToken, NoProgress, Progress, VERSION};
-pub use engine::{DiffOutput, Engine, build_id};
+pub use engine::{AnalysisRequest, Engine, build_id};
 pub use error::{Error, Result};
-pub use session::{Refresh, Session, SessionRequest};
+pub use session::Session;

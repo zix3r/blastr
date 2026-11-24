@@ -9,7 +9,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use blastr_core::Engine;
+use blastr_core::{AnalysisRequest, Engine};
 use blastr_model::{AnalysisOptions, AnalysisParams, CancelToken, Limit, NoProgress, RevSpec};
 
 /// Writes one file, creating the directories it needs.
@@ -100,14 +100,13 @@ fn an_incomplete_graph_is_reported_and_not_cached() {
         ..RevSpec::default()
     };
 
-    let analysis = match engine.analyze(
-        &dir,
-        &spec,
-        &AnalysisOptions::default(),
-        &AnalysisParams::default(),
-        &NoProgress,
-        &cancel,
-    ) {
+    let request = AnalysisRequest {
+        repo_root: &dir,
+        spec: &spec,
+        options: &AnalysisOptions::default(),
+        params: &AnalysisParams::default(),
+    };
+    let analysis = match engine.analyze(&request, &NoProgress, &cancel, &mut |_| {}) {
         Ok(analysis) => analysis,
         // A toolchain without `rust-src` cannot load a project at all.
         Err(error) if format!("{error}").contains("standard library") => {
@@ -137,14 +136,7 @@ fn an_incomplete_graph_is_reported_and_not_cached() {
     assert_eq!(engine.cache_status().unwrap().results, 0);
 
     let again = engine
-        .analyze(
-            &dir,
-            &spec,
-            &AnalysisOptions::default(),
-            &AnalysisParams::default(),
-            &NoProgress,
-            &cancel,
-        )
+        .analyze(&request, &NoProgress, &cancel, &mut |_| {})
         .expect("the second analysis runs");
     assert_eq!(
         missing_macros(&again),

@@ -7,20 +7,23 @@
 //! must select (`selected_test`, `no_selected_test`) and which `cargo test`
 //! command lines it must produce (`test_command`).
 //!
+//! The two workspaces are committed one after the other into a temporary
+//! repository, and the engine analyses the last commit.
+//!
 //! Deliberately one test: loading the two fixture workspaces is slow and the
 //! CI runner gives every test its own process, so a static would not share it.
 
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
-use blastr_core::Engine;
-use blastr_core::impact::{ImpactInput, ImpactOutput, analyze};
-use blastr_model::IgnoreSet;
+use blastr_core::{AnalysisRequest, Engine};
 use blastr_model::{
-    AnalysisOptions, AnalysisParams, CancelToken, Certainty, Change, ChangeDetail, ChangeKind,
-    Confidence, Delta, Edge, EdgeDetail, EdgeKind, GraphIndex, ImpactClass, ImpactItem, NoProgress,
-    Reason, RevisionGraph, SelectedTest, SymbolId, SymbolKind, TestReason, Visibility,
+    Analysis, AnalysisOptions, AnalysisParams, CancelToken, Certainty, Change, ChangeDetail,
+    ChangeKind, Confidence, Delta, Edge, EdgeDetail, EdgeKind, GraphIndex, ImpactClass, ImpactItem,
+    NoProgress, Reason, RevSpec, RevisionGraph, SelectedTest, SymbolId, SymbolKind, TestReason,
+    Visibility,
 };
 use serde::Deserialize;
 
@@ -288,7 +291,7 @@ struct Context<'a> {
     /// Reported changes.
     changes: &'a [Change],
     /// What the changes can affect.
-    impact: &'a ImpactOutput,
+    impact: &'a Analysis,
 }
 
 impl<'a> Context<'a> {
@@ -1151,66 +1154,132 @@ fn detail_matches(expected: &str, from: Option<&str>, actual: &ChangeDetail) -> 
     }
 }
 
+/// Copies the fixture workspace in `from` into `to`, leaving out what a load
+/// writes into it.
+fn copy_workspace(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap_or_else(|error| panic!("create {}: {error}", to.display()));
+    for entry in
+        fs::read_dir(from).unwrap_or_else(|error| panic!("read {}: {error}", from.display()))
+    {
+        let entry = entry.expect("read a directory entry");
+        let name = entry.file_name();
+        if name == "target" || name == "Cargo.lock" {
+            continue;
+        }
+        let target = to.join(&name);
+        if entry.file_type().expect("read a file type").is_dir() {
+            copy_workspace(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), &target)
+                .unwrap_or_else(|error| panic!("copy {}: {error}", entry.path().display()));
+        }
+    }
+}
+
+/// Runs one Git command in `dir`, committing files byte for byte.
+fn git(dir: &Path, arguments: &[&str]) {
+    let status = Command::new("git")
+        .current_dir(dir)
+        .args([
+            "-c",
+            "core.autocrlf=false",
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+        ])
+        .args(arguments)
+        .status()
+        .expect("git runs");
+    assert!(status.success(), "git {arguments:?} failed");
+}
+
+/// A repository whose last two commits hold the two fixture workspaces.
+fn fixture_repository(fixtures: &Path, dir: &Path) {
+    copy_workspace(&fixtures.join("before"), dir);
+    fs::write(dir.join(".gitignore"), "target\nCargo.lock\n").expect("write the ignore file");
+    git(dir, &["init", "--quiet", "."]);
+    git(dir, &["add", "-A"]);
+    git(dir, &["commit", "-qm", "before"]);
+    for entry in fs::read_dir(dir).expect("read the repository") {
+        let entry = entry.expect("read a directory entry");
+        if entry.file_name() == ".git" || entry.file_name() == ".gitignore" {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            fs::remove_dir_all(&path).expect("remove a directory");
+        } else {
+            fs::remove_file(&path).expect("remove a file");
+        }
+    }
+    copy_workspace(&fixtures.join("after"), dir);
+    git(dir, &["add", "-A"]);
+    git(dir, &["commit", "-qm", "after"]);
+}
+
 /// Loads the two fixture workspaces, compares them and checks every expectation file.
 #[test]
 fn fixtures() {
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
-    let before_dir = fixtures.join("before");
-    let after_dir = fixtures.join("after");
     let expected_dir = fixtures.join("expected");
 
     let temp = tempfile::tempdir().expect("create a temporary directory");
+    let repo = temp.path().join("repo");
+    fixture_repository(&fixtures, &repo);
     let paths = blastr_model::Paths {
-        cache_dir: temp.path().to_path_buf(),
+        cache_dir: temp.path().join("cache"),
         config_dir: temp.path().join("config"),
     };
     let engine = Engine::with_paths(paths);
 
-    let output = engine
-        .diff_dirs(
-            &before_dir,
-            &after_dir,
-            &AnalysisOptions::default(),
-            &NoProgress,
-            &CancelToken::new(),
-        )
-        .unwrap_or_else(|error| {
-            let hint = error
-                .hint()
-                .map(|hint| format!("\nhint: {hint}"))
-                .unwrap_or_default();
-            panic!("diffing the fixture workspaces failed: {error}{hint}")
-        });
+    let spec = RevSpec {
+        rev: Some("HEAD~1..HEAD".to_owned()),
+        ..RevSpec::default()
+    };
+    let options = AnalysisOptions::default();
+    let request = AnalysisRequest {
+        repo_root: &repo,
+        spec: &spec,
+        options: &options,
+        params: &AnalysisParams::default(),
+    };
+    let fail = |error: blastr_core::Error| -> ! {
+        let hint = error
+            .hint()
+            .map(|hint| format!("\nhint: {hint}"))
+            .unwrap_or_default();
+        panic!("analysing the fixture workspaces failed: {error}{hint}")
+    };
+    let analysis = engine
+        .analyze(&request, &NoProgress, &CancelToken::new(), &mut |_| {})
+        .unwrap_or_else(|error| fail(error));
+    // Both graphs come from the cache the analysis filled.
+    let [base, head] = [
+        &analysis.diff.comparison.base,
+        &analysis.diff.comparison.head,
+    ]
+    .map(|source| {
+        engine
+            .graph(&repo, source, &options, &NoProgress, &CancelToken::new())
+            .unwrap_or_else(|error| fail(error))
+    });
 
-    let params = AnalysisParams::default();
-    let ignore = IgnoreSet::empty();
-    let impact = analyze(
-        &ImpactInput {
-            base: &output.base,
-            head: &output.head,
-            changes: &output.result.changes,
-            params: &params,
-            ignore: &ignore,
-        },
-        &CancelToken::new(),
-    )
-    .expect("the analysis is not cancelled");
-
-    let before_index = GraphIndex::new(&output.base);
-    let after_index = GraphIndex::new(&output.head);
+    let before_index = GraphIndex::new(&base);
+    let after_index = GraphIndex::new(&head);
     let context = Context {
         before: GraphSide {
             label: "before",
-            graph: output.base.as_ref(),
+            graph: base.as_ref(),
             index: &before_index,
         },
         after: GraphSide {
             label: "after",
-            graph: output.head.as_ref(),
+            graph: head.as_ref(),
             index: &after_index,
         },
-        changes: &output.result.changes,
-        impact: &impact,
+        changes: &analysis.diff.changes,
+        impact: &analysis,
     };
 
     let mut files: Vec<PathBuf> = fs::read_dir(&expected_dir)
@@ -1250,12 +1319,12 @@ fn fixtures() {
     println!(
         "fixtures: {} cases, {} symbols before / {} after, {} edges before / {} after, {} changes, {} impact items, {} selected tests",
         files.len(),
-        output.base.symbols.len(),
-        output.head.symbols.len(),
-        output.base.edges.len(),
-        output.head.edges.len(),
-        output.result.changes.len(),
-        impact.items.len(),
-        impact.tests.selected.len(),
+        base.symbols.len(),
+        head.symbols.len(),
+        base.edges.len(),
+        head.edges.len(),
+        analysis.diff.changes.len(),
+        analysis.items.len(),
+        analysis.tests.selected.len(),
     );
 }

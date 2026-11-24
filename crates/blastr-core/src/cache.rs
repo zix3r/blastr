@@ -60,11 +60,6 @@ impl Cache {
         }
     }
 
-    /// Whether anything is stored under `key`.
-    pub(crate) fn contains(&self, kind: Kind, key: &str) -> bool {
-        self.file(kind, key).is_file()
-    }
-
     /// Stores `bytes` under `key`, replacing what was there.
     pub(crate) fn put(&self, kind: Kind, key: &str, bytes: &[u8]) -> io::Result<()> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -129,7 +124,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache = Cache::new(dir.path());
         assert_eq!(cache.get(Kind::Graph, "a").unwrap(), None);
-        assert!(!cache.contains(Kind::Graph, "a"));
 
         cache.put(Kind::Graph, "a", b"graph").unwrap();
         cache.put(Kind::Graph, "a", b"graph2").unwrap();
@@ -138,8 +132,7 @@ mod tests {
             cache.get(Kind::Graph, "a").unwrap().as_deref(),
             Some(&b"graph2"[..])
         );
-        assert!(cache.contains(Kind::Result, "b"));
-        assert!(!cache.contains(Kind::Graph, "b"));
+        assert_eq!(cache.get(Kind::Graph, "b").unwrap(), None);
         assert_eq!(cache.stats(Kind::Graph).unwrap(), (1, 6));
         assert_eq!(cache.stats(Kind::Result).unwrap(), (1, 6));
 

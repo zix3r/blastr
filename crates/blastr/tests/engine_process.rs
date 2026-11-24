@@ -9,7 +9,7 @@ use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::Duration;
 
-use blastr_core::Engine;
+use blastr_core::{AnalysisRequest, Engine};
 use blastr_model::protocol::{self, Failure, JobId, JobKind, Request, Response};
 use blastr_model::{Analysis, AnalysisOptions, AnalysisParams, CancelToken, NoProgress, RevSpec};
 
@@ -198,12 +198,15 @@ fn the_engine_process_computes_what_a_direct_call_computes() {
     let cache = tempfile::tempdir().expect("a cache directory");
     let direct = Engine::with_paths(blastr_model::Paths::under(cache.path()))
         .analyze(
-            temp.path(),
-            &spec,
-            &AnalysisOptions::default(),
-            &AnalysisParams::default(),
+            &AnalysisRequest {
+                repo_root: temp.path(),
+                spec: &spec,
+                options: &AnalysisOptions::default(),
+                params: &AnalysisParams::default(),
+            },
             &NoProgress,
             &CancelToken::new(),
+            &mut |_| {},
         )
         .expect("a direct analysis");
 

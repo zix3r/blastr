@@ -7,18 +7,19 @@
 //! flags, hashes, sketch, parent and impl info, plus the same edges, unresolved
 //! references and inactive ranges.
 //!
-//! `blastr_git` cannot create commits, so the two revisions are two directories
-//! written into a temporary directory: the overlay side goes through
-//! [`Engine::overlay_dirs`], which is the code path [`Engine::analyze`] uses for a
-//! repository, and the full side through [`Engine::diff_dirs`].
+//! The two revisions are two commits of a temporary repository. One engine
+//! analyses the comparison, which takes the overlay path; a second engine with
+//! a cache of its own asks for each graph on its own, which loads each side.
 
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 use std::sync::Mutex;
 
-use blastr_core::Engine;
+use blastr_core::{AnalysisRequest, Engine};
 use blastr_model::{
-    AnalysisOptions, CancelToken, EdgeKind, Progress, RevisionGraph, SymbolKind, SymbolPath,
+    AnalysisOptions, AnalysisParams, CancelToken, Comparison, EdgeKind, Progress, RevSpec,
+    RevisionGraph, SymbolKind, SymbolPath,
 };
 
 /// The crate of the base revision, as `(path, text)` pairs.
@@ -69,47 +70,87 @@ const HEAD: &[(&str, &str)] = &[
     ),
 ];
 
-/// Runs the two paths over one pair of directories and compares the graphs.
+/// The comparison of the last commit with its parent.
+fn last_commit() -> RevSpec {
+    RevSpec {
+        rev: Some("HEAD~1..HEAD".to_owned()),
+        ..RevSpec::default()
+    }
+}
+
+/// Analyses the last commit of `repo` with `params`, recording the phases, and
+/// returns the comparison.
+fn analyze(engine: &Engine, repo: &Path, params: &AnalysisParams, phases: &Phases) -> Comparison {
+    let request = AnalysisRequest {
+        repo_root: repo,
+        spec: &last_commit(),
+        options: &AnalysisOptions::default(),
+        params,
+    };
+    engine
+        .analyze(&request, phases, &CancelToken::new(), &mut |_| {})
+        .expect("the analysis runs")
+        .diff
+        .comparison
+}
+
+/// The graphs of both sides of `comparison`, each fetched on its own.
+fn graphs(
+    engine: &Engine,
+    repo: &Path,
+    comparison: &Comparison,
+    phases: &Phases,
+) -> [RevisionGraph; 2] {
+    [&comparison.base, &comparison.head].map(|source| {
+        let options = AnalysisOptions::default();
+        engine
+            .graph(repo, source, &options, phases, &CancelToken::new())
+            .expect("the graph is fetched")
+            .as_ref()
+            .clone()
+    })
+}
+
+/// Runs the two paths over one pair of revisions and compares the graphs.
 #[test]
 fn overlay_and_two_loads_extract_the_same_graphs() {
     let dir = tempfile::tempdir().expect("a temporary directory");
-    let base = dir.path().join("base");
-    let head = dir.path().join("head");
-    write_project(&base, BASE);
-    write_project(&head, HEAD);
-
-    let engine = engine(dir.path());
-    let options = AnalysisOptions::default();
-    let cancel = CancelToken::new();
-
-    // First, because a load writes a `Cargo.lock` into the directory it loads.
-    let overlay_phases = Phases::default();
-    let (overlay_base, overlay_head) = engine
-        .overlay_dirs(&base, &head, &options, &overlay_phases, &cancel)
-        .expect("the overlay runs")
-        .expect("both directories are the same project");
+    let repo = dir.path().join("repo");
+    repository(&repo, BASE, HEAD);
+    let params = AnalysisParams::default();
 
     // The overlay loads the project once: no `load head` phase.
-    assert!(overlay_phases.has("load base"), "{overlay_phases:?}");
-    assert!(overlay_phases.has("extract base"), "{overlay_phases:?}");
-    assert!(overlay_phases.has("extract head"), "{overlay_phases:?}");
-    assert!(!overlay_phases.has("load head"), "{overlay_phases:?}");
+    let overlay = engine(&dir.path().join("overlay"));
+    let phases = Phases::default();
+    let comparison = analyze(&overlay, &repo, &params, &phases);
+    assert!(phases.has("load base"), "{phases:?}");
+    assert!(phases.has("extract base"), "{phases:?}");
+    assert!(phases.has("extract head"), "{phases:?}");
+    assert!(!phases.has("load head"), "{phases:?}");
 
-    let load_phases = Phases::default();
-    let full = engine
-        .diff_dirs(&base, &head, &options, &load_phases, &cancel)
-        .expect("the two loads run");
-    assert!(load_phases.has("load base"), "{load_phases:?}");
-    assert!(load_phases.has("load head"), "{load_phases:?}");
+    // Both graphs were stored: reading them, or analysing the comparison again
+    // under other parameters, loads nothing.
+    let cached = Phases::default();
+    let [overlay_base, overlay_head] = graphs(&overlay, &repo, &comparison, &cached);
+    let deeper = AnalysisParams {
+        depth: params.depth + 1,
+        ..params.clone()
+    };
+    analyze(&overlay, &repo, &deeper, &cached);
+    assert!(!cached.has("snapshot"), "{cached:?}");
+    assert!(cached.has("impact"), "{cached:?}");
 
-    assert_same_graph(&overlay_base, &full.base, "base");
-    assert_same_graph(&overlay_head, &full.head, "head");
+    // An engine with an empty cache of its own loads each side on its own.
+    let full = engine(&dir.path().join("full"));
+    let phases = Phases::default();
+    let [full_base, full_head] = graphs(&full, &repo, &comparison, &phases);
+    assert!(phases.has("load head"), "{phases:?}");
+
+    assert_same_graph(&overlay_base, &full_base, "base");
+    assert_same_graph(&overlay_head, &full_head, "head");
 
     // The comparison above would also pass on two empty graphs, so check that the
     // overlay really saw the changed, added, deleted and whitespace-only text.
-    assert_eq!(overlay_base.symbols.len(), full.base.symbols.len());
-    assert_eq!(overlay_head.symbols.len(), full.head.symbols.len());
-
     let added = path("overlay_app::added::added_value");
     assert!(
         !has_symbol(&overlay_base, &added),
@@ -164,9 +205,7 @@ fn overlay_and_two_loads_extract_the_same_graphs() {
 #[test]
 fn a_different_manifest_takes_the_full_path() {
     let dir = tempfile::tempdir().expect("a temporary directory");
-    let base = dir.path().join("base");
-    let head = dir.path().join("head");
-    write_project(&base, BASE);
+    let repo = dir.path().join("repo");
     // The same crate with one more line in its manifest: the project model of
     // the base side no longer describes the head side.
     let mut changed = Vec::from(HEAD);
@@ -174,29 +213,13 @@ fn a_different_manifest_takes_the_full_path() {
         "Cargo.toml",
         "[package]\nname = \"overlay_app\"\nversion = \"0.2.0\"\nedition = \"2024\"\n",
     );
-    write_project(&head, &changed);
+    repository(&repo, BASE, &changed);
 
-    let engine = engine(dir.path());
-    let options = AnalysisOptions::default();
-    let cancel = CancelToken::new();
-
-    let overlay = engine
-        .overlay_dirs(&base, &head, &options, &Phases::default(), &cancel)
-        .expect("the overlay attempt runs");
-    assert!(
-        overlay.is_none(),
-        "the overlay must not be used when `Cargo.toml` differs"
-    );
-
-    // The fallback the engine takes instead loads both sides.
     let phases = Phases::default();
-    let full = engine
-        .diff_dirs(&base, &head, &options, &phases, &cancel)
-        .expect("the two loads run");
+    let engine = engine(&dir.path().join("cache"));
+    analyze(&engine, &repo, &AnalysisParams::default(), &phases);
     assert!(phases.has("load base"), "{phases:?}");
     assert!(phases.has("load head"), "{phases:?}");
-    assert!(!full.base.symbols.is_empty(), "the base graph is not empty");
-    assert!(!full.head.symbols.is_empty(), "the head graph is not empty");
 }
 
 /// Compares two graphs field by field, so that a failure names the part that differs.
@@ -241,8 +264,19 @@ fn symbol<'a>(graph: &'a RevisionGraph, path: &SymbolPath) -> &'a blastr_model::
         .expect("the symbol exists")
 }
 
+/// A repository whose last two commits hold `base` and then `head`.
+fn repository(dir: &Path, base: &[(&str, &str)], head: &[(&str, &str)]) {
+    write_files(dir, base);
+    fs::write(dir.join(".gitignore"), "target\nCargo.lock\n").expect("the ignore file is written");
+    git(dir, &["init", "--quiet", "."]);
+    commit(dir, "base");
+    fs::remove_dir_all(dir.join("src")).expect("the sources are removed");
+    write_files(dir, head);
+    commit(dir, "head");
+}
+
 /// Writes the files of one revision below `root`.
-fn write_project(root: &Path, files: &[(&str, &str)]) {
+fn write_files(root: &Path, files: &[(&str, &str)]) {
     for (path, text) in files {
         let file = root.join(path);
         if let Some(parent) = file.parent() {
@@ -252,14 +286,30 @@ fn write_project(root: &Path, files: &[(&str, &str)]) {
     }
 }
 
+/// Commits everything in `dir`.
+fn commit(dir: &Path, message: &str) {
+    git(dir, &["add", "-A"]);
+    let identity = ["-c", "user.name=t", "-c", "user.email=t@t"];
+    git(dir, &[&identity[..], &["commit", "-qm", message]].concat());
+}
+
+/// Runs one Git command in `dir`.
+fn git(dir: &Path, arguments: &[&str]) {
+    let status = Command::new("git")
+        .current_dir(dir)
+        .args(arguments)
+        .status()
+        .expect("git runs");
+    assert!(status.success(), "git {arguments:?} failed");
+}
+
 /// An engine whose cache and target directory live in `dir`, so that the tests
 /// do not share one.
 fn engine(dir: &Path) -> Engine {
-    let paths = blastr_model::Paths {
+    Engine::with_paths(blastr_model::Paths {
         cache_dir: dir.join("cache"),
         config_dir: dir.join("config"),
-    };
-    Engine::with_paths(paths)
+    })
 }
 
 /// Records the progress phases the engine reports.
