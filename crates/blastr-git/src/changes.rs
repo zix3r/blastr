@@ -206,6 +206,83 @@ fn index_entries(repo: &gix::Repository) -> Result<BTreeMap<RelPath, FileEntry>,
 ///
 /// Files that Git ignores are left out.
 fn worktree_entries(repo: &gix::Repository) -> Result<BTreeMap<RelPath, FileEntry>, Error> {
+    let mut out = BTreeMap::new();
+    let hash = repo.object_hash();
+    walk_worktree(repo, &mut |path, full, _| {
+        let bytes = std::fs::read(full)?;
+        // A file with carriage returns may differ from the committed one
+        // in line endings alone, which only a look at the text can tell.
+        let content = if bytes.contains(&b'\r') {
+            Content::Bytes(bytes)
+        } else {
+            Content::Object(
+                gix::objs::compute_hash(hash, gix::objs::Kind::Blob, &bytes).map_err(Error::git)?,
+            )
+        };
+        let file = FileEntry {
+            content,
+            kind: None,
+        };
+        out.insert(RelPath::new(path), file);
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// How recently a file must have been written for its stat to be distrusted.
+const RACY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// A cheap fingerprint of the working tree: the commit `HEAD` names, the index
+/// file, and the path, size and modification time of every file Git does not
+/// ignore. No file is read, so it is fast enough to ask several times a second;
+/// when it changes, the content may have changed.
+pub(crate) fn worktree_stamp(repo: &gix::Repository) -> Result<String, Error> {
+    let mut hasher = blake3::Hasher::new();
+    if let Ok(id) = repo.head_id() {
+        hasher.update(id.detach().as_bytes());
+    }
+    hasher.update(b"\0");
+    let stat = |hasher: &mut blake3::Hasher, metadata: &std::fs::Metadata| {
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        hasher.update(&metadata.len().to_le_bytes());
+        hasher.update(&modified.to_le_bytes());
+    };
+    if let Ok(metadata) = std::fs::metadata(repo.index_path()) {
+        stat(&mut hasher, &metadata);
+    }
+    let now = std::time::SystemTime::now();
+    let mut racy = false;
+    walk_worktree(repo, &mut |path, _, metadata| {
+        hasher.update(path.as_bytes());
+        hasher.update(b"\0");
+        stat(&mut hasher, metadata);
+        // A file written in the last moments may be written again within the
+        // same tick of the clock, without its time or size moving.
+        racy |= metadata
+            .modified()
+            .is_ok_and(|time| now.duration_since(time).map_or(true, |age| age < RACY));
+        Ok(())
+    })?;
+    if racy {
+        // A stamp that never repeats sends the caller to the content.
+        let nanos = now
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        hasher.update(&nanos.to_le_bytes());
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+/// Calls `on_file` with the path, full path and metadata of every file in the
+/// working tree that Git does not ignore, in path order.
+fn walk_worktree(
+    repo: &gix::Repository,
+    on_file: &mut dyn FnMut(String, &Path, &std::fs::Metadata) -> Result<(), Error>,
+) -> Result<(), Error> {
     let Some(root) = repo.workdir() else {
         return Err(Error::Bare {
             path: repo.path().to_path_buf(),
@@ -220,19 +297,15 @@ fn worktree_entries(repo: &gix::Repository) -> Result<BTreeMap<RelPath, FileEntr
             gix::worktree::stack::state::ignore::Source::WorktreeThenIdMappingIfNotSkipped,
         )
         .map_err(Error::git)?;
-    let mut out = BTreeMap::new();
-    let hash = repo.object_hash();
-    collect_worktree(root, "", hash, &mut excludes, &mut out)?;
-    Ok(out)
+    collect_worktree(root, "", &mut excludes, on_file)
 }
 
-/// Walks one directory of the working tree, collecting the files it holds.
+/// Walks one directory of the working tree, handing each file it holds to `on_file`.
 fn collect_worktree(
     dir: &Path,
     prefix: &str,
-    hash: gix::hash::Kind,
     excludes: &mut gix::AttributeStack<'_>,
-    out: &mut BTreeMap<RelPath, FileEntry>,
+    on_file: &mut dyn FnMut(String, &Path, &std::fs::Metadata) -> Result<(), Error>,
 ) -> Result<(), Error> {
     let mut entries = std::fs::read_dir(dir)?.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(|entry| entry.file_name());
@@ -252,27 +325,13 @@ fn collect_worktree(
             if is_excluded(excludes, &path, Mode::DIR)? {
                 continue;
             }
-            collect_worktree(&full, &path, hash, excludes, out)?;
+            collect_worktree(&full, &path, excludes, on_file)?;
         } else if file_type.is_file() {
             if is_excluded(excludes, &path, Mode::FILE)? {
                 continue;
             }
-            let bytes = std::fs::read(&full)?;
-            // A file with carriage returns may differ from the committed one
-            // in line endings alone, which only a look at the text can tell.
-            let content = if bytes.contains(&b'\r') {
-                Content::Bytes(bytes)
-            } else {
-                Content::Object(
-                    gix::objs::compute_hash(hash, gix::objs::Kind::Blob, &bytes)
-                        .map_err(Error::git)?,
-                )
-            };
-            let file = FileEntry {
-                content,
-                kind: None,
-            };
-            out.insert(RelPath::new(path), file);
+            let metadata = entry.metadata()?;
+            on_file(path, &full, &metadata)?;
         }
     }
     Ok(())

@@ -9,9 +9,14 @@ use gix::objs::tree::EntryKind;
 use crate::{Error, RepoRoot};
 
 /// An opened repository.
+///
+/// The handle is opened once and kept: Git reads references, the index and new
+/// objects from disk as they change, so a long-lived `Repo` still sees commits,
+/// checkouts and saves made after it was opened.
 #[derive(Debug, Clone)]
 pub struct Repo {
     root: PathBuf,
+    shared: gix::ThreadSafeRepository,
 }
 
 impl Repo {
@@ -25,6 +30,7 @@ impl Repo {
         }
         Ok(Repo {
             root: root.path().to_path_buf(),
+            shared: repo.into_sync(),
         })
     }
 
@@ -33,9 +39,9 @@ impl Repo {
         &self.root
     }
 
-    /// A fresh handle on the repository on disk.
+    /// A handle on the repository for this thread.
     pub(crate) fn repo(&self) -> Result<gix::Repository, Error> {
-        gix::open(&self.root).map_err(Error::git)
+        Ok(self.shared.to_thread_local())
     }
 
     /// Turns what the user typed into the two sides to compare.

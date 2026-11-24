@@ -58,6 +58,16 @@ impl Repo {
         }
     }
 
+    /// A cheap fingerprint of the working tree that changes whenever a file is
+    /// saved, added or removed, or `HEAD` or the index move.
+    ///
+    /// It reads no file content, only sizes and modification times, so it can
+    /// be asked often; when it changes, [`Repo::content_id`] tells whether the
+    /// content did.
+    pub fn worktree_stamp(&self) -> Result<String, Error> {
+        crate::changes::worktree_stamp(&self.repo()?)
+    }
+
     /// BLAKE3 over the `HEAD` tree id and the content of every file that differs from it.
     ///
     /// Paths are fed in sorted order, so the result is deterministic.
@@ -193,6 +203,28 @@ mod tests {
         assert!(before.is_some());
         assert_eq!(before, again);
         assert_ne!(before, after);
+    }
+
+    #[test]
+    fn the_worktree_stamp_follows_saves_and_ignores_ignored_files() {
+        let mut test = TestRepo::new();
+        test.commit(&[("a.txt", "one"), (".gitignore", "target/\n")], "first");
+        let repo = test.open();
+
+        // A file written in the last moments is distrusted; wait them out.
+        std::thread::sleep(std::time::Duration::from_millis(2100));
+        let before = repo.worktree_stamp().expect("a stamp");
+        assert_eq!(before, repo.worktree_stamp().expect("a stamp"));
+
+        test.write("target/out.txt", "ignored");
+        assert_eq!(before, repo.worktree_stamp().expect("a stamp"));
+
+        test.write("a.txt", "one, longer");
+        let saved = repo.worktree_stamp().expect("a stamp");
+        assert_ne!(before, saved);
+
+        test.write("b.txt", "new");
+        assert_ne!(saved, repo.worktree_stamp().expect("a stamp"));
     }
 
     #[test]
