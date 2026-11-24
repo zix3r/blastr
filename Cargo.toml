@@ -29,6 +29,7 @@ ra_ap_vfs = "=0.0.358"
 
 gpui-kit = "=0.9.1"
 
+async-channel = "2"
 blake3 = "1"
 directories = "6"
 # Only what blastr-git uses: discovery, rev-parse and log walks (`revision`),

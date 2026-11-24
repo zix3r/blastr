@@ -1,11 +1,17 @@
 //! Blastr's desktop interface.
+//!
+//! [`workspace::Workspace`] holds the state every view reads: the session, the
+//! settings and the connection to the analysis engine. The views in [`views`]
+//! are separate entities that read it and call its transitions.
 
 mod app;
 mod editor;
+mod engine;
 mod settings;
 mod state;
 mod theme;
 mod views;
+mod workspace;
 
 /// Opens the main window and blocks until the application quits.
 ///

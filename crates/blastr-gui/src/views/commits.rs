@@ -1,341 +1,246 @@
-//! The commit list: what is compared, chosen from the history of the branch.
+//! The compare chip of the title bar and the menu of commits behind it.
+//!
+//! A click on a commit compares it with its parent; a shift-click compares
+//! the range from the commit compared now to the one clicked.
 
-use gpui_kit::prelude::*;
-
+use blastr_model::CommitInfo;
+use blastr_model::protocol::Commit;
 use gpui_kit::component::button::Button;
-use gpui_kit::component::scroll::ScrollbarAxis;
+use gpui_kit::component::popover::Popover;
 use gpui_kit::component::{Icon, IconName, Sizable as _, h_flex, v_flex};
-use gpui_kit::{AnyElement, Context, IntoElement, ParentElement, Styled, div, px};
+use gpui_kit::prelude::*;
+use gpui_kit::{AnyElement, App, Entity, IntoElement, ParentElement, Styled, Window, div, px};
 
-use super::list;
-use super::shell::{Focus, Shell};
 use super::ui;
-use crate::state::commits::{CommitRow, relative_time};
 use crate::state::session::Compare;
 use crate::theme::{self, TEXT_MICRO, TEXT_SMALL};
+use crate::workspace::Workspace;
 
-/// The height of one row of the commit list.
-const COMMIT_ROW: f32 = 26.0;
-/// The width of the rail that holds the history dots.
-const RAIL: f32 = 30.0;
-/// The x of the line that joins the dots, at the centre of a dot of [`DOT`].
-const RAIL_X: f32 = 17.0;
-/// The size of a dot on the rail.
-const DOT: f32 = 8.0;
-
-impl Shell {
-    /// Whether the working tree has changes worth showing.
-    fn dirty(&self) -> bool {
-        self.session.repo.as_ref().is_some_and(|repo| repo.dirty)
-    }
-
-    /// The commits pane: its header and a virtualised list.
-    pub(crate) fn commits_pane(&self, cx: &mut Context<Self>) -> AnyElement {
-        let branch = self
-            .session
-            .repo
-            .as_ref()
-            .and_then(|repo| repo.branch.clone());
-        let dirty = self.dirty();
-        let count = self.commits.row_count(dirty);
-        let selected = self
-            .session
-            .compare
-            .as_ref()
-            .and_then(|compare| self.commits.selected(compare));
-
-        let header = h_flex()
-            .h(px(30.))
-            .flex_shrink_0()
-            .pl(px(10.))
-            .pr(px(8.))
-            .gap_2()
-            .items_center()
-            .child(
-                Icon::new(IconName::SquareTerminal)
-                    .size_3()
-                    .text_color(theme::FG_3),
-            )
-            .child(
-                div()
-                    .text_size(TEXT_MICRO)
-                    .text_color(theme::FG_2)
-                    .child("COMMITS"),
-            )
-            .child(div().flex_1())
-            .children(branch.map(|branch| {
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .h(px(17.))
-                    .px_1()
-                    .rounded(px(4.))
-                    .bg(theme::BG_RAISED_2)
-                    .child(
-                        Icon::new(IconName::Network)
-                            .size_2p5()
-                            .text_color(theme::FG_3),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(10.5))
-                            .text_color(theme::FG_2)
-                            .child(branch),
-                    )
-            }));
-
-        let heights = vec![COMMIT_ROW; count];
-        let viewport = f32::from(self.commits_scroll.bounds().size.height).max(60.0);
-
-        let body = if let Some(failure) = &self.commits.failure {
-            v_flex()
-                .size_full()
-                .gap_2()
-                .p_3()
-                .child(
-                    div()
-                        .text_size(TEXT_SMALL)
-                        .text_color(theme::EDIT.fg)
-                        .child("The history could not be read."),
-                )
-                .child(
-                    div()
-                        .text_size(TEXT_SMALL)
-                        .text_color(theme::FG_3)
-                        .child(failure.clone()),
-                )
-                .child(
-                    Button::new("retry-commits")
-                        .small()
-                        .outline()
-                        .label("Try again")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.request_commits(cx);
-                        })),
-                )
-                .into_any_element()
-        } else if count == 0 {
-            div()
-                .p_3()
-                .text_size(TEXT_SMALL)
-                .text_color(theme::FG_3)
-                .child(if self.commits.loading {
-                    "Reading the history…"
-                } else {
-                    "This repository has no commits yet."
-                })
-                .into_any_element()
-        } else {
-            let scroller = list::scroller(
-                "commits",
-                &self.commits_scroll,
-                &heights,
-                viewport,
-                4,
-                |index, top| self.commit_row(index, top, dirty, selected, cx),
-            )
-            .on_scroll(cx.listener(|_, _: &gpui_kit::ScrollEvent, _, cx| cx.notify()));
-            div()
-                .relative()
-                .size_full()
-                .child(scroller)
-                .child(ui::scrollbar(
-                    "commits",
-                    &self.commits_scroll,
-                    ScrollbarAxis::Vertical,
-                ))
-                .into_any_element()
-        };
-
-        v_flex()
-            .w_full()
-            .h(px(self.panes.borrow().commits))
-            .flex_shrink_0()
-            .bg(theme::BG_PANEL)
-            .border_b_1()
-            .border_color(theme::LINE)
-            .child(header)
-            .child(div().flex_1().min_h_0().child(body))
-            .into_any_element()
-    }
-
-    /// One row of the commit list.
-    fn commit_row(
-        &self,
-        index: usize,
-        top: f32,
-        dirty: bool,
-        selected: Option<(usize, usize)>,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let row = self.commits.row(index, dirty);
-        let is_selected = match row {
-            Some(CommitRow::WorkingTree) => {
-                matches!(self.session.compare, Some(Compare::WorkingTree))
-            }
-            Some(CommitRow::Commit(commit)) => {
-                selected.is_some_and(|(first, last)| commit >= first && commit <= last)
-            }
-            None => false,
-        };
-        let mut content = h_flex()
-            .relative()
-            .h(px(COMMIT_ROW))
-            .w_full()
-            .pr(px(10.))
-            .gap_2()
-            .items_center()
-            .line_height(ui::ROW_LINE);
-
-        // The rail: a hairline with a dot, so the list reads as a history. The
-        // line and the dot share one centre, which is the row's middle.
-        let working_tree = matches!(row, Some(CommitRow::WorkingTree));
-        content = content.child(
-            div()
-                .relative()
-                .w(px(RAIL))
-                .h_full()
-                .flex_shrink_0()
-                .child(
-                    div()
-                        .absolute()
-                        .left(px(RAIL_X - 0.5))
-                        .top_0()
-                        .bottom_0()
-                        .w(px(1.))
-                        .bg(theme::LINE_STRONG),
-                )
-                .child(
-                    div()
-                        .absolute()
-                        .left(px(RAIL_X - DOT / 2.0))
-                        .top(px(COMMIT_ROW / 2.0 - DOT / 2.0))
-                        .w(px(DOT))
-                        .h(px(DOT))
-                        .rounded(px(DOT / 2.0))
-                        .border_1()
-                        .border_color(if working_tree || is_selected {
-                            theme::CHANGED.solid
-                        } else {
-                            theme::FG_4
-                        })
-                        .when(working_tree || is_selected, |this| {
-                            this.bg(theme::CHANGED.solid)
-                        }),
-                ),
+/// The chip that says what is compared, and opens the commits.
+pub(crate) fn compare_chip(
+    workspace: &Entity<Workspace>,
+    _: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    let (base, head) = workspace
+        .read(cx)
+        .session
+        .compare
+        .as_ref()
+        .map_or_else(|| ("".to_owned(), "Choose".to_owned()), Compare::labels);
+    let trigger = Button::new("compare-chip")
+        .outline()
+        .small()
+        .h(ui::TOOLBAR_TARGET)
+        .gap_2()
+        .text_size(TEXT_SMALL)
+        .tooltip("Choose what to compare")
+        .child(
+            Icon::new(IconName::Replace)
+                .size_3()
+                .text_color(theme::FG_3),
+        )
+        .child(div().truncate().text_color(theme::FG_2).child(base))
+        .child(div().text_color(theme::FG_4).child("→"))
+        .child(div().truncate().text_color(theme::FG).child(head))
+        .child(
+            Icon::new(IconName::ChevronDown)
+                .size_3()
+                .text_color(theme::FG_4),
         );
-
-        match row {
-            Some(CommitRow::WorkingTree) => {
-                content = content
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(TEXT_SMALL)
-                            .text_color(theme::FG)
-                            .child("Working tree"),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_size(TEXT_MICRO)
-                            .text_color(theme::FG_3)
-                            .truncate()
-                            .child("uncommitted changes"),
-                    );
+    let workspace = workspace.clone();
+    Popover::new("compare-menu")
+        .trigger(trigger)
+        .content(move |_, _, cx| {
+            let state = workspace.read(cx);
+            let dirty = state.session.repo.as_ref().is_some_and(|repo| repo.dirty);
+            let current = state.session.compare.clone();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |time| time.as_secs() as i64);
+            let commits = &state.commits;
+            let mut list = v_flex()
+                .id("commit-list")
+                .w(px(460.))
+                .max_h(px(420.))
+                .overflow_y_scroll();
+            if dirty {
+                let selected = current == Some(Compare::WorkingTree);
+                let workspace = workspace.clone();
+                list = list.child(
+                    row("working-tree", selected, theme::CHANGED)
+                        .on_click(cx.listener(move |popover, _, window, cx| {
+                            workspace.update(cx, |workspace, cx| {
+                                workspace.choose(Compare::WorkingTree, cx)
+                            });
+                            popover.dismiss(window, cx);
+                        }))
+                        .child(div().text_color(theme::FG).child("Working tree"))
+                        .child(div().text_color(theme::FG_3).child("uncommitted changes")),
+                );
             }
-            Some(CommitRow::Commit(position)) => {
-                let Some(commit) = self.commits.commits.get(position) else {
-                    return div().into_any_element();
-                };
-                content = content
-                    .child(
-                        div()
-                            .flex_none()
-                            .font_family(ui::mono(cx))
-                            .text_size(px(11.5))
-                            .text_color(theme::FG_4)
-                            .child(commit.short_id.clone()),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_size(TEXT_SMALL)
-                            .text_color(theme::FG_2)
-                            .truncate()
-                            .child(commit.subject.clone()),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(TEXT_MICRO)
-                            .text_color(theme::FG_4)
-                            .child(relative_time(commit.time, self.now)),
-                    );
+            for (index, commit) in commits.list.iter().enumerate() {
+                let selected = in_comparison(current.as_ref(), commit);
+                let workspace = workspace.clone();
+                let clicked = commit.clone();
+                list = list.child(
+                    row(("commit", index), selected, theme::NEUTRAL)
+                        .on_click(cx.listener(
+                            move |popover, event: &gpui_kit::ClickEvent, window, cx| {
+                                let shift = event.modifiers().shift;
+                                workspace.update(cx, |workspace, cx| {
+                                    let compare = click(
+                                        workspace.session.compare.as_ref(),
+                                        &workspace.commits.list,
+                                        &clicked,
+                                        shift,
+                                    );
+                                    workspace.choose(compare, cx);
+                                });
+                                popover.dismiss(window, cx);
+                            },
+                        ))
+                        .child(
+                            div()
+                                .flex_none()
+                                .font_family(theme::mono())
+                                .text_color(theme::FG_3)
+                                .child(commit.short_id.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_color(theme::FG)
+                                .child(commit.subject.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(TEXT_MICRO)
+                                .text_color(theme::FG_4)
+                                .child(relative_time(commit.time, now)),
+                        ),
+                );
             }
-            None => return div().into_any_element(),
-        }
-
-        if is_selected {
-            // The accent of the chosen comparison, drawn over the rail.
-            content = content.child(
+            let footer = if let Some(failure) = &commits.failure {
+                Some(failure.clone())
+            } else if commits.loading {
+                Some("Reading the history…".to_owned())
+            } else if !commits.exhausted {
+                None
+            } else {
+                Some(format!("{} commits", commits.list.len()))
+            };
+            let more = (!commits.exhausted && !commits.loading).then(|| {
+                let workspace = workspace.clone();
                 div()
-                    .absolute()
-                    .left_0()
-                    .top_0()
-                    .bottom_0()
-                    .w(px(2.))
-                    .bg(theme::CHANGED.solid),
-            );
-        }
-
-        div()
-            .absolute()
-            .top(px(top))
-            .left_0()
-            .right_0()
-            .child(
-                div()
-                    .id(gpui_kit::ElementId::NamedInteger(
-                        "commit-row".into(),
-                        u64::try_from(index).unwrap_or(u64::MAX),
-                    ))
-                    .w_full()
+                    .id("more-commits")
+                    .px_2()
+                    .py_1()
+                    .text_size(TEXT_SMALL)
+                    .text_color(theme::FG_3)
                     .cursor_pointer()
-                    // The background and the hover belong to the element that
-                    // carries the id: gpui only tells a view that the pointer
-                    // entered or left an element whose state it can key, so a
-                    // hover style on an id-less box only showed up on the next
-                    // redraw, which the wheel happened to cause.
-                    .bg(if is_selected {
-                        theme::BG_SELECTED
-                    } else {
-                        theme::BG_PANEL
+                    .hover(|style| style.text_color(theme::FG))
+                    .on_click(move |_, _, cx| {
+                        workspace.update(cx, |workspace, cx| workspace.load_commits(cx))
                     })
-                    .hover(|style| style.bg(theme::BG_HOVER))
-                    .on_click(
-                        cx.listener(move |this, event: &gpui_kit::ClickEvent, _, cx| {
-                            this.pick_commit(index, event.modifiers().shift, cx);
-                        }),
-                    )
-                    .child(content),
-            )
-            .into_any_element()
-    }
+                    .child("Show older commits")
+            });
+            v_flex()
+                .gap_1()
+                .child(
+                    div()
+                        .px_2()
+                        .text_size(TEXT_MICRO)
+                        .text_color(theme::FG_4)
+                        .child(
+                            "Click to compare a commit with its parent · shift-click for a range",
+                        ),
+                )
+                .child(list)
+                .children(more)
+                .children(footer.map(|text| {
+                    div()
+                        .px_2()
+                        .text_size(TEXT_MICRO)
+                        .text_color(theme::FG_4)
+                        .child(text)
+                }))
+        })
+        .into_any_element()
+}
 
-    /// Chooses what clicking the row at `index` compares.
-    pub(crate) fn pick_commit(&mut self, index: usize, shift: bool, cx: &mut Context<Self>) {
-        self.commit_cursor = index;
-        self.focus = Focus::Commits;
-        let dirty = self.dirty();
-        let Some(row) = self.commits.row(index, dirty) else {
-            return;
-        };
-        if let Some(compare) = self.commits.click(row, shift) {
-            self.choose(compare, cx);
+/// One row of the menu.
+fn row(
+    id: impl Into<gpui_kit::ElementId>,
+    selected: bool,
+    accent: theme::Accent,
+) -> gpui_kit::Stateful<gpui_kit::Div> {
+    h_flex()
+        .id(id)
+        .h(px(28.))
+        .px_2()
+        .gap_2()
+        .items_center()
+        .rounded(theme::RADIUS_MD)
+        .text_size(TEXT_SMALL)
+        .cursor_pointer()
+        .when(selected, |row| row.bg(theme::BG_SELECTED))
+        .hover(|style| style.bg(theme::BG_HOVER))
+        .child(ui::marker(accent.solid, ui::Marker::Changed))
+}
+
+/// Whether `commit` is part of what is compared.
+fn in_comparison(compare: Option<&Compare>, commit: &CommitInfo) -> bool {
+    match compare {
+        Some(Compare::Commit(current)) => current.id == commit.id,
+        Some(Compare::Range { oldest, newest, .. }) => {
+            oldest.id == commit.id || newest.id == commit.id
         }
+        _ => false,
+    }
+}
+
+/// What a click on `clicked` compares: the commit alone, or with `shift` the
+/// range between it and the commit compared now.
+fn click(
+    current: Option<&Compare>,
+    list: &[CommitInfo],
+    clicked: &CommitInfo,
+    shift: bool,
+) -> Compare {
+    let reference = |commit: &CommitInfo| Commit {
+        id: commit.id.clone(),
+        short: commit.short_id.clone(),
+    };
+    let position = |id: &str| list.iter().position(|commit| commit.id == id);
+    if shift
+        && let Some(Compare::Commit(anchor)) = current
+        && let (Some(from), Some(to)) = (position(&anchor.id), position(&clicked.id))
+        && from != to
+    {
+        // The list is newest first: the larger index is the older commit.
+        let (oldest, newest) = (&list[from.max(to)], &list[from.min(to)]);
+        return Compare::Range {
+            oldest: reference(oldest),
+            newest: reference(newest),
+            from_parent: oldest.parents > 0,
+        };
+    }
+    Compare::Commit(reference(clicked))
+}
+
+/// How long ago a commit was made, in a few characters.
+fn relative_time(time: i64, now: i64) -> String {
+    const HOUR: i64 = 3600;
+    const DAY: i64 = 24 * HOUR;
+    match now.saturating_sub(time) {
+        age if age < HOUR => format!("{}m ago", age / 60),
+        age if age < DAY => format!("{}h ago", age / HOUR),
+        age if age < 60 * DAY => format!("{}d ago", age / DAY),
+        age if age < 365 * DAY => format!("{}mo ago", age / (30 * DAY)),
+        age => format!("{}y ago", age / (365 * DAY)),
     }
 }

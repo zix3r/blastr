@@ -20,14 +20,6 @@ impl Selection {
     pub fn symbol(symbol: SymbolPath) -> Selection {
         Selection { symbol, site: None }
     }
-
-    /// Selects a symbol at one reference inside it.
-    pub fn at_site(symbol: SymbolPath, site: Location) -> Selection {
-        Selection {
-            symbol,
-            site: Some(site),
-        }
-    }
 }
 
 /// The selections made so far, with a cursor for going back and forward.
@@ -195,7 +187,10 @@ mod tests {
             },
         };
 
-        history.select(Selection::at_site(symbol("a"), site.clone()));
+        history.select(Selection {
+            symbol: symbol("a"),
+            site: Some(site.clone()),
+        });
 
         assert!(!history.can_go_back());
         assert_eq!(history.current().and_then(|s| s.site.clone()), Some(site));

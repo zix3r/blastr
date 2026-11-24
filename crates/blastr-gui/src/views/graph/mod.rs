@@ -1,7 +1,7 @@
-//! The impact graph: its visible subgraph, its layout and its drawing.
+//! The graph of one change's propagation.
 
-pub(crate) mod layout;
-pub(crate) mod model;
+mod layout;
+mod model;
 mod view;
 
-pub(crate) use view::GraphState;
+pub(crate) use view::GraphView;

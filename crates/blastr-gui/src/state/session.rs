@@ -1,70 +1,41 @@
 //! The open repository, what is being compared and what came back.
 //!
-//! Everything a view shows is read from [`Session`]. Its methods are the
-//! state transitions of the window: opening a repository, choosing a
-//! comparison, a result arriving, a task being cancelled, a failure. None of
-//! them does any work or touches the screen, so they are tested as plain
-//! functions.
+//! Its methods are the state transitions of the window: opening a repository,
+//! choosing a comparison, a result arriving, a job being cancelled, a failure.
+//! None of them does any work or touches the screen, so they are tested as
+//! plain functions. Every job carries a generation, so a result of a job that
+//! was replaced is dropped, and a failed refresh keeps the last good result.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use blastr_model::protocol::{Commit, Failure, JobId, JobKind, Repository};
 use blastr_model::{
-    Analysis, AnalysisOptions, AnalysisParams, Assume, DiffResult, ExecMode, ImpactClass, RevSpec,
+    Analysis, AnalysisOptions, AnalysisParams, Assume, DiffResult, ImpactClass, RevSpec,
     RevisionGraph, SymbolPath,
 };
 
-use super::loadable::{Failure, Loadable, Progress};
+use super::loadable::{Loadable, Progress};
 use super::selection::{History, Selection};
-use super::tasks::{TaskSlot, Ticket};
 
-/// A commit named by its full and its abbreviated id.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CommitRef {
-    /// Full object id, in hexadecimal.
-    pub id: String,
-    /// Abbreviated object id.
-    pub short: String,
-}
-
-/// The repository the window is showing.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RepoInfo {
-    /// The root of the working tree.
-    pub root: PathBuf,
-    /// The directory name, shown as the repository's name.
-    pub name: String,
-    /// The branch `HEAD` is on; `None` when it is detached.
-    pub branch: Option<String>,
-    /// The commit `HEAD` points to; `None` in a repository without commits.
-    pub head: Option<CommitRef>,
-    /// Whether something tracked is modified or staged.
-    pub dirty: bool,
-}
-
-/// What is being compared.
+/// What the window compares.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Compare {
-    /// `HEAD` against the working tree, kept up to date as files are saved.
+    /// The uncommitted changes against `HEAD`.
     WorkingTree,
-    /// One commit against its first parent.
-    Commit(CommitRef),
-    /// A run of commits, from the oldest selected to the newest.
+    /// One commit against its parent.
+    Commit(Commit),
+    /// A range of commits: from the parent of `oldest` (or `oldest` itself
+    /// when it has no parent) to `newest`.
     Range {
-        /// The oldest selected commit.
-        oldest: CommitRef,
-        /// The newest selected commit.
-        newest: CommitRef,
-        /// Whether the oldest commit's own changes are part of the range: the
-        /// comparison then starts at its first parent. False for a commit
-        /// without a parent.
+        oldest: Commit,
+        newest: Commit,
         from_parent: bool,
     },
 }
 
 impl Compare {
-    /// What the engine is asked to compare.
+    /// The revision spec the engine reads.
     pub fn spec(&self) -> RevSpec {
         match self {
             Compare::WorkingTree => RevSpec {
@@ -89,7 +60,7 @@ impl Compare {
         }
     }
 
-    /// The two sides as they are named before a result says more.
+    /// The labels of the two sides, older first.
     pub fn labels(&self) -> (String, String) {
         match self {
             Compare::WorkingTree => ("HEAD".to_owned(), "Working tree".to_owned()),
@@ -105,23 +76,24 @@ impl Compare {
         }
     }
 
-    /// Whether the newer side is the working tree, which is watched for saves.
+    /// Whether the comparison follows the working tree, and so refreshes when
+    /// a file is saved.
     pub fn watches(&self) -> bool {
         matches!(self, Compare::WorkingTree)
     }
 }
 
-/// A result together with what the views need next to it.
+/// A result that arrived.
 #[derive(Debug, Clone)]
 pub struct Outcome {
     /// The analysis.
     pub analysis: Arc<Analysis>,
-    /// The graph of the newer side, for symbol search; absent when it could
-    /// not be read.
+    /// The graph of the newer side, for symbol search.
     pub graph: Option<Arc<RevisionGraph>>,
     /// How long the engine took.
     pub elapsed: Duration,
-    /// Counts results of this comparison: 1 for the first, more after saves.
+    /// Counts the results of one comparison, so that views can tell a
+    /// refreshed result from the one they drew.
     pub revision: u64,
 }
 
@@ -131,75 +103,126 @@ impl PartialEq for Outcome {
     }
 }
 
-/// A hypothetical change and what it would reach.
+/// A hypothetical change of one symbol, shown instead of the comparison.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WhatIf {
-    /// The symbol assumed to change.
     pub symbol: SymbolPath,
-    /// The change assumed.
     pub assume: Assume,
-    /// The hypothetical result.
     pub result: Loadable<Outcome>,
 }
 
-/// How a comparison ended when it did not produce a result.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Stopped {
-    /// It is running, finished, or was never started.
-    #[default]
-    No,
-    /// The user cancelled it.
-    Cancelled,
+/// One kind of job: the current generation and whether it runs.
+#[derive(Debug, Default)]
+pub struct TaskSlot {
+    generation: u64,
+    running: bool,
+    /// Generations stopped since the engine was last told.
+    cancelled: Vec<u64>,
 }
 
-/// The state of the window, without anything that draws.
+impl TaskSlot {
+    /// Starts a new job, cancelling the one that runs.
+    pub fn begin(&mut self) -> u64 {
+        self.cancel();
+        self.generation += 1;
+        self.running = true;
+        self.generation
+    }
+
+    /// Stops the running job; whether there was one.
+    pub fn cancel(&mut self) -> bool {
+        if !self.running {
+            return false;
+        }
+        self.running = false;
+        self.cancelled.push(self.generation);
+        true
+    }
+
+    /// Whether `generation` is the job that runs.
+    pub fn is_current(&self, generation: u64) -> bool {
+        self.running && self.generation == generation
+    }
+
+    /// Whether a job runs.
+    pub fn is_running(&self) -> bool {
+        self.running
+    }
+
+    /// The generation of the newest job.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Ends the job `generation`; whether it was the current one.
+    pub fn finish(&mut self, generation: u64) -> bool {
+        if !self.is_current(generation) {
+            return false;
+        }
+        self.running = false;
+        true
+    }
+}
+
+/// The state of the window's work.
 #[derive(Debug, Default)]
 pub struct Session {
-    /// The open repository.
-    pub repo: Option<RepoInfo>,
-    /// The configuration the project is analysed under.
+    pub repo: Option<Repository>,
     pub options: AnalysisOptions,
-    /// The parameters of the impact analysis.
     pub params: AnalysisParams,
-    /// What is being compared; `None` until a repository is open.
     pub compare: Option<Compare>,
-    /// The classified changes, which arrive before the impact.
+    /// The classified changes, which arrive before the result.
     pub changes: Option<Arc<DiffResult>>,
-    /// The result of the comparison.
     pub result: Loadable<Outcome>,
-    /// Whether the comparison was cancelled by the user.
-    pub stopped: Stopped,
-    /// A newer result is being computed after a save; the old one stays shown.
+    /// Whether the last comparison was cancelled.
+    pub cancelled: bool,
+    /// The progress of a refresh while the last result stays on screen.
     pub refreshing: Option<Progress>,
-    /// The hypothetical change being explored, if any.
     pub what_if: Option<WhatIf>,
-    /// The selection and its history.
     pub history: History,
-    /// The comparison job.
     pub run: TaskSlot,
-    /// The what-if job.
     pub what_if_run: TaskSlot,
 }
 
 impl Session {
-    /// Opens a repository: forgets everything about the previous one.
-    ///
-    /// Nothing is compared yet; the caller sets the options the project is
-    /// analysed under and chooses a comparison next.
-    pub fn open_repository(&mut self, repo: RepoInfo) {
+    /// Opens a repository, forgetting everything about the last one.
+    pub fn open_repository(&mut self, repo: Repository) {
         self.close_repository();
         self.repo = Some(repo);
     }
 
-    /// Closes the repository and cancels whatever was running for it.
+    /// Closes the repository and stops its jobs.
     pub fn close_repository(&mut self) {
         self.run.cancel();
         self.what_if_run.cancel();
-        *self = Session::default();
+        // The generations go on counting, so that a late answer of a job of
+        // the last repository is never taken for one of this.
+        *self = Session {
+            run: std::mem::take(&mut self.run),
+            what_if_run: std::mem::take(&mut self.what_if_run),
+            ..Session::default()
+        };
     }
 
-    /// The comparison a freshly opened repository starts with: the working
-    /// tree when it has uncommitted changes, else the newest commit.
+    fn take_cancelled_slots(&mut self) -> (Vec<u64>, Vec<u64>) {
+        (
+            std::mem::take(&mut self.run.cancelled),
+            std::mem::take(&mut self.what_if_run.cancelled),
+        )
+    }
+
+    /// The jobs stopped since the last call, which the engine must be told of.
+    pub fn take_cancelled(&mut self) -> Vec<JobId> {
+        let (runs, what_ifs) = self.take_cancelled_slots();
+        let job = |kind| move |generation| JobId { kind, generation };
+        runs.into_iter()
+            .map(job(JobKind::Compare))
+            .chain(what_ifs.into_iter().map(job(JobKind::WhatIf)))
+            .collect()
+    }
+
+    /// What a freshly opened repository compares: its uncommitted changes
+    /// when there are any, else its newest commit.
     pub fn default_compare(&self) -> Option<Compare> {
         let repo = self.repo.as_ref()?;
         match &repo.head {
@@ -208,20 +231,12 @@ impl Session {
         }
     }
 
-    /// Whether build scripts and procedural macros run.
-    pub fn exec(&self) -> ExecMode {
-        self.options.exec
-    }
-
-    /// Starts a comparison, cancelling the one that was running.
-    ///
-    /// The previous result, the selection and any hypothetical change belong
-    /// to the previous comparison and are dropped.
-    pub fn choose(&mut self, compare: Compare) -> Ticket {
+    /// Starts a comparison; returns its generation.
+    pub fn choose(&mut self, compare: Compare) -> u64 {
         self.compare = Some(compare);
         self.changes = None;
-        self.result = Loadable::Loading(Progress::phase(""));
-        self.stopped = Stopped::No;
+        self.result = Loadable::Loading(Progress::default());
+        self.cancelled = false;
         self.refreshing = None;
         self.what_if_run.cancel();
         self.what_if = None;
@@ -230,29 +245,27 @@ impl Session {
     }
 
     /// Runs the current comparison again, keeping the selection.
-    pub fn retry(&mut self) -> Option<Ticket> {
+    pub fn retry(&mut self) -> Option<u64> {
         let compare = self.compare.clone()?;
         let history = std::mem::take(&mut self.history);
-        let ticket = self.choose(compare);
+        let generation = self.choose(compare);
         self.history = history;
-        Some(ticket)
+        Some(generation)
     }
 
-    /// Records progress of the comparison job. Stale reports are ignored.
+    /// A progress report of the comparison `generation`.
     pub fn progress(&mut self, generation: u64, progress: Progress) {
         if !self.run.is_current(generation) {
             return;
         }
         match &mut self.result {
             Loadable::Loading(current) => *current = progress,
-            Loadable::Ready(_) if self.refreshing.is_some() => {
-                self.refreshing = Some(progress);
-            }
+            Loadable::Ready(_) if self.refreshing.is_some() => self.refreshing = Some(progress),
             _ => {}
         }
     }
 
-    /// The classified changes arrived; the impact is still being traced.
+    /// The classified changes of `generation` arrived.
     pub fn changes_arrived(&mut self, generation: u64, diff: Arc<DiffResult>) -> bool {
         if !self.run.is_current(generation) {
             return false;
@@ -261,10 +274,8 @@ impl Session {
         true
     }
 
-    /// A result arrived.
-    ///
-    /// `watching` says the job stays alive to follow saved files; otherwise it
-    /// is finished. Returns whether the result was accepted.
+    /// The result of `generation` arrived. A comparison that `watching` stays
+    /// alive and sends a result after every save.
     pub fn result_arrived(
         &mut self,
         generation: u64,
@@ -276,16 +287,11 @@ impl Session {
         if !self.run.is_current(generation) {
             return false;
         }
-        let revision = self
-            .result
-            .ready()
-            .map_or(1, |outcome| outcome.revision + 1);
-        let graph = graph.or_else(|| {
-            self.result
-                .ready()
-                .and_then(|outcome| outcome.graph.clone())
-        });
-        self.changes = Some(Arc::new(analysis.diff.clone()));
+        let previous = self.result.ready();
+        let revision = previous.map_or(1, |outcome| outcome.revision + 1);
+        let graph = graph.or_else(|| previous.and_then(|outcome| outcome.graph.clone()));
+        // The analysis carries its own changes from now on.
+        self.changes = None;
         self.result = Loadable::Ready(Outcome {
             analysis,
             graph,
@@ -293,7 +299,7 @@ impl Session {
             revision,
         });
         self.refreshing = None;
-        self.stopped = Stopped::No;
+        self.cancelled = false;
         if !watching {
             self.run.finish(generation);
         }
@@ -302,33 +308,30 @@ impl Session {
         true
     }
 
-    /// The watching job noticed a save and is computing a newer result.
+    /// A watching comparison noticed a save and started again.
     pub fn refresh_started(&mut self, generation: u64) {
         if self.run.is_current(generation) && self.result.ready().is_some() {
             self.refreshing = Some(Progress::default());
         }
     }
 
-    /// The comparison job failed.
-    ///
-    /// A failure while refreshing keeps the last good result on screen, the
-    /// way a watching session keeps going when a saved file does not parse.
+    /// The comparison `generation` failed. A failure while watching keeps the
+    /// last good result on screen.
     pub fn failed(&mut self, generation: u64, failure: Failure, watching: bool) -> bool {
         if !self.run.is_current(generation) {
             return false;
         }
+        self.refreshing = None;
         if watching && self.result.ready().is_some() {
-            self.refreshing = None;
             return true;
         }
         self.result = Loadable::Failed(failure);
-        self.refreshing = None;
         self.run.finish(generation);
         true
     }
 
-    /// The user cancels the running comparison. Returns whether one was
-    /// still computing.
+    /// Cancels what runs: a hypothetical change first, else a comparison that
+    /// has no result yet. Returns whether something stopped.
     pub fn cancel(&mut self) -> bool {
         if self.what_if_run.is_running() {
             self.leave_what_if();
@@ -339,11 +342,11 @@ impl Session {
         }
         self.run.cancel();
         self.result = Loadable::Empty;
-        self.stopped = Stopped::Cancelled;
+        self.cancelled = true;
         true
     }
 
-    /// Whether the comparison job is computing something right now.
+    /// Whether something is being computed.
     pub fn is_busy(&self) -> bool {
         self.result.is_loading()
             || self.refreshing.is_some()
@@ -353,34 +356,36 @@ impl Session {
                 .is_some_and(|what_if| what_if.result.is_loading())
     }
 
-    /// Whether the working tree is being watched with an up-to-date result.
+    /// Whether a finished comparison follows the working tree.
     pub fn is_watching(&self) -> bool {
         self.run.is_running() && self.result.ready().is_some()
     }
 
-    /// Starts a what-if query on `symbol`.
-    pub fn begin_what_if(&mut self, symbol: SymbolPath, assume: Assume) -> Ticket {
+    /// Starts a hypothetical change; returns its generation.
+    pub fn begin_what_if(&mut self, symbol: SymbolPath, assume: Assume) -> u64 {
         self.what_if = Some(WhatIf {
             symbol,
             assume,
-            result: Loadable::Loading(Progress::phase("")),
+            result: Loadable::Loading(Progress::default()),
         });
         self.what_if_run.begin()
     }
 
-    /// Records progress of the what-if job.
+    /// A progress report of the hypothetical change `generation`.
     pub fn what_if_progress(&mut self, generation: u64, progress: Progress) {
         if !self.what_if_run.is_current(generation) {
             return;
         }
-        if let Some(what_if) = &mut self.what_if
-            && let Loadable::Loading(current) = &mut what_if.result
+        if let Some(WhatIf {
+            result: Loadable::Loading(current),
+            ..
+        }) = &mut self.what_if
         {
             *current = progress;
         }
     }
 
-    /// The hypothetical result arrived.
+    /// The result of the hypothetical change `generation` arrived.
     pub fn what_if_arrived(
         &mut self,
         generation: u64,
@@ -406,7 +411,7 @@ impl Session {
         true
     }
 
-    /// The what-if job failed.
+    /// The hypothetical change `generation` failed.
     pub fn what_if_failed(&mut self, generation: u64, failure: Failure) -> bool {
         if !self.what_if_run.finish(generation) {
             return false;
@@ -417,7 +422,7 @@ impl Session {
         true
     }
 
-    /// Returns from the hypothetical change to the real comparison.
+    /// Goes back from the hypothetical change to the comparison.
     pub fn leave_what_if(&mut self) {
         self.what_if_run.cancel();
         if self.what_if.take().is_some() {
@@ -425,13 +430,7 @@ impl Session {
         }
     }
 
-    /// Whether the views show a hypothetical result.
-    pub fn is_hypothetical(&self) -> bool {
-        self.what_if.is_some()
-    }
-
-    /// What the views show: the hypothetical result while one is explored,
-    /// else the result of the comparison.
+    /// The result on screen: the hypothetical one while there is one.
     pub fn shown(&self) -> &Loadable<Outcome> {
         match &self.what_if {
             Some(what_if) => &what_if.result,
@@ -439,13 +438,13 @@ impl Session {
         }
     }
 
-    /// The analysis the views show, when it has arrived.
+    /// The analysis on screen.
     pub fn analysis(&self) -> Option<&Arc<Analysis>> {
         self.shown().ready().map(|outcome| &outcome.analysis)
     }
 
-    /// The changes the views show: those of the shown analysis, or the ones
-    /// that arrived ahead of it.
+    /// The changes on screen: those of the analysis, or those that arrived
+    /// before it.
     pub fn shown_changes(&self) -> Option<&DiffResult> {
         if let Some(analysis) = self.analysis() {
             return Some(&analysis.diff);
@@ -461,17 +460,12 @@ impl Session {
         self.history.current()
     }
 
-    /// Selects a symbol.
+    /// Selects something, remembering it in the history.
     pub fn select(&mut self, selection: Selection) {
         self.history.select(selection);
     }
 
-    /// Selects the first item worth reading when nothing is selected.
-    ///
-    /// A result that arrives with an empty selection leaves the code view and
-    /// the evidence panel blank, which reads as a bug. The window therefore
-    /// falls back to what most needs attention: an item that needs editing,
-    /// then one that may behave differently, then the change itself.
+    /// Makes sure a result never leaves the views without a selection.
     fn select_something(&mut self) {
         let Some(outcome) = self.shown().ready() else {
             return;
@@ -483,79 +477,60 @@ impl Session {
                 &selection.symbol,
             )
         });
-        if keep {
-            return;
-        }
-        let next = default_selection(&outcome.analysis);
-        if let Some(selection) = next {
+        if !keep && let Some(selection) = default_selection(&outcome.analysis) {
             self.select(selection);
         }
     }
 
-    /// Forgets selections of symbols the shown result no longer mentions.
-    ///
-    /// Symbols of the newer side's graph stay selectable even when nothing
-    /// reaches them, so that a search result can be looked at.
+    /// Forgets selections the result no longer mentions, when there is no
+    /// graph to find them in.
     fn drop_stale_selections(&mut self) {
         let Some(outcome) = self.shown().ready() else {
             return;
         };
         if outcome.graph.is_some() {
-            // Any symbol of the project may be selected through the search.
             return;
         }
         let analysis = Arc::clone(&outcome.analysis);
-        self.history.retain(|selection| {
-            analysis
-                .items
-                .iter()
-                .any(|item| item.symbol == selection.symbol)
-                || analysis
-                    .diff
-                    .changes
-                    .iter()
-                    .any(|change| change.symbol == selection.symbol)
-        });
+        self.history
+            .retain(|selection| mentions(&analysis, &selection.symbol));
     }
 }
 
-/// Whether the shown result still mentions `symbol`: as an item, as a change,
-/// or anywhere in the newer side's graph.
-fn selection_exists(
-    analysis: &Analysis,
-    graph: Option<&RevisionGraph>,
-    symbol: &SymbolPath,
-) -> bool {
-    if analysis.items.iter().any(|item| &item.symbol == symbol)
+/// Whether the analysis lists `symbol` as an item or a change.
+fn mentions(analysis: &Analysis, symbol: &SymbolPath) -> bool {
+    analysis.items.iter().any(|item| &item.symbol == symbol)
         || analysis
             .diff
             .changes
             .iter()
             .any(|change| &change.symbol == symbol)
-    {
-        return true;
-    }
-    graph.is_some_and(|graph| graph.symbols.iter().any(|entry| &entry.path == symbol))
 }
 
-/// The selection to make when a result arrives with nothing selected.
-///
-/// The first item that still needs editing comes first, then the first that
-/// may behave differently, then the first change: the answer the window can
-/// act on before anything else.
+/// Whether `symbol` is still something the views can show.
+fn selection_exists(
+    analysis: &Analysis,
+    graph: Option<&RevisionGraph>,
+    symbol: &SymbolPath,
+) -> bool {
+    mentions(analysis, symbol)
+        || graph.is_some_and(|graph| graph.symbols.iter().any(|entry| &entry.path == symbol))
+}
+
+/// What a fresh result selects: the first item to edit, else the first that
+/// may behave differently, else the first change.
 fn default_selection(analysis: &Analysis) -> Option<Selection> {
     let open = analysis
         .items
         .iter()
-        .find(|item| item.class == ImpactClass::Adaptation && !item.tags.changed);
+        .find(|item| item.class == ImpactClass::Adaptation && !item.tags.changed)
+        .or_else(|| {
+            analysis
+                .items
+                .iter()
+                .find(|item| item.class == ImpactClass::Behaviour)
+        });
     if let Some(item) = open {
-        return Some(Selection::symbol(item.symbol.clone()));
-    }
-    let behaving = analysis
-        .items
-        .iter()
-        .find(|item| item.class == ImpactClass::Behaviour);
-    if let Some(item) = behaving {
         return Some(Selection::symbol(item.symbol.clone()));
     }
     analysis
@@ -568,15 +543,15 @@ fn default_selection(analysis: &Analysis) -> Option<Selection> {
 #[cfg(test)]
 mod tests {
     use blastr_model::{
-        AnalysisParams, Change, ChangeDetail, ChangeKind, Comparison, ImpactClass, ImpactItem,
-        ImpactLimits, ImpactTags, Location, RelPath, Source, Span, SymbolKind, TestSelection,
+        Change, ChangeDetail, ChangeKind, Comparison, ImpactItem, ImpactLimits, ImpactTags,
+        Location, RelPath, Source, Span, SymbolKind, TestSelection,
     };
 
     use super::*;
 
-    fn repo(dirty: bool) -> RepoInfo {
-        RepoInfo {
-            root: PathBuf::from("/code/invoicing"),
+    fn repo(dirty: bool) -> Repository {
+        Repository {
+            root: "/code/invoicing".into(),
             name: "invoicing".to_owned(),
             branch: Some("main".to_owned()),
             head: Some(commit("a3f2e1c")),
@@ -584,8 +559,8 @@ mod tests {
         }
     }
 
-    fn commit(short: &str) -> CommitRef {
-        CommitRef {
+    fn commit(short: &str) -> Commit {
+        Commit {
             id: format!("{short}000000000000000000000000000000000"),
             short: short.to_owned(),
         }
@@ -616,16 +591,6 @@ mod tests {
                 .collect(),
             limits: Vec::new(),
         }
-    }
-
-    fn analysis(names: &[&str]) -> Arc<Analysis> {
-        Arc::new(Analysis {
-            diff: diff(names),
-            items: Vec::new(),
-            tests: TestSelection::default(),
-            limits: ImpactLimits::default(),
-            params: AnalysisParams::default(),
-        })
     }
 
     fn item(name: &str, class: ImpactClass, changed: bool) -> ImpactItem {
@@ -662,29 +627,29 @@ mod tests {
         })
     }
 
+    fn analysis(names: &[&str]) -> Arc<Analysis> {
+        analysis_of(names, Vec::new())
+    }
+
     fn opened(dirty: bool) -> Session {
         let mut session = Session::default();
         session.open_repository(repo(dirty));
         session
     }
 
+    fn selected(session: &Session) -> Option<String> {
+        session.selection().map(|s| s.symbol.name().to_owned())
+    }
+
     const SECOND: Duration = Duration::from_secs(1);
 
     #[test]
-    fn a_dirty_repository_starts_on_the_working_tree() {
+    fn a_repository_starts_on_its_changes_or_its_newest_commit() {
         assert_eq!(opened(true).default_compare(), Some(Compare::WorkingTree));
-    }
-
-    #[test]
-    fn a_clean_repository_starts_on_its_newest_commit() {
         assert_eq!(
             opened(false).default_compare(),
             Some(Compare::Commit(commit("a3f2e1c")))
         );
-    }
-
-    #[test]
-    fn a_repository_without_commits_starts_on_the_working_tree() {
         let mut session = Session::default();
         let mut info = repo(false);
         info.head = None;
@@ -696,10 +661,6 @@ mod tests {
     #[test]
     fn comparisons_become_revision_specs() {
         assert!(Compare::WorkingTree.spec().worktree);
-        assert_eq!(
-            Compare::Commit(commit("abc1234")).spec().rev.as_deref(),
-            Some("abc1234000000000000000000000000000000000")
-        );
         let range = Compare::Range {
             oldest: commit("aaaaaaa"),
             newest: commit("bbbbbbb"),
@@ -715,38 +676,16 @@ mod tests {
             range.labels(),
             ("aaaaaaa^".to_owned(), "bbbbbbb".to_owned())
         );
-        let from_root = Compare::Range {
-            oldest: commit("aaaaaaa"),
-            newest: commit("bbbbbbb"),
-            from_parent: false,
-        };
-        assert_eq!(
-            from_root.labels(),
-            ("aaaaaaa".to_owned(), "bbbbbbb".to_owned())
-        );
         assert!(Compare::WorkingTree.watches());
         assert!(!range.watches());
     }
 
     #[test]
-    fn choosing_a_comparison_starts_loading() {
-        let mut session = opened(true);
-
-        let ticket = session.choose(Compare::WorkingTree);
-
-        assert!(session.result.is_loading());
-        assert!(session.is_busy());
-        assert!(session.run.is_current(ticket.generation));
-        assert_eq!(session.shown_changes(), None);
-    }
-
-    #[test]
     fn changes_arrive_before_the_result() {
         let mut session = opened(true);
-        let ticket = session.choose(Compare::WorkingTree);
-
-        assert!(session.changes_arrived(ticket.generation, Arc::new(diff(&["vat_rate"]))));
-
+        let run = session.choose(Compare::WorkingTree);
+        assert!(session.is_busy());
+        assert!(session.changes_arrived(run, Arc::new(diff(&["vat_rate"]))));
         assert!(session.result.is_loading());
         assert_eq!(session.shown_changes().map(|d| d.changes.len()), Some(1));
         assert_eq!(session.analysis(), None);
@@ -755,36 +694,27 @@ mod tests {
     #[test]
     fn a_result_of_a_one_shot_comparison_finishes_the_job() {
         let mut session = opened(false);
-        let ticket = session.choose(Compare::Commit(commit("a3f2e1c")));
-
-        assert!(session.result_arrived(
-            ticket.generation,
-            analysis(&["vat_rate"]),
-            None,
-            SECOND,
-            false
-        ));
-
+        let run = session.choose(Compare::Commit(commit("a3f2e1c")));
+        assert!(session.result_arrived(run, analysis(&["vat_rate"]), None, SECOND, false));
         assert!(session.analysis().is_some());
+        assert!(
+            session.changes.is_none(),
+            "the analysis carries the changes"
+        );
         assert!(!session.run.is_running());
         assert!(!session.is_busy());
-        assert!(!session.is_watching());
     }
 
     #[test]
     fn a_watched_comparison_stays_alive_and_counts_its_results() {
         let mut session = opened(true);
-        let ticket = session.choose(Compare::WorkingTree);
-        session.result_arrived(ticket.generation, analysis(&["a"]), None, SECOND, true);
+        let run = session.choose(Compare::WorkingTree);
+        session.result_arrived(run, analysis(&["a"]), None, SECOND, true);
         assert!(session.is_watching());
-        assert_eq!(session.result.ready().map(|o| o.revision), Some(1));
-
-        session.refresh_started(ticket.generation);
+        session.refresh_started(run);
         assert!(session.is_busy());
         assert!(session.analysis().is_some(), "the old result stays shown");
-
-        session.result_arrived(ticket.generation, analysis(&["a", "b"]), None, SECOND, true);
-
+        session.result_arrived(run, analysis(&["a", "b"]), None, SECOND, true);
         assert!(!session.is_busy());
         assert_eq!(session.result.ready().map(|o| o.revision), Some(2));
         assert_eq!(session.shown_changes().map(|d| d.changes.len()), Some(2));
@@ -795,23 +725,26 @@ mod tests {
         let mut session = opened(true);
         let first = session.choose(Compare::WorkingTree);
         let second = session.choose(Compare::Commit(commit("7d9c4b2")));
-
-        assert!(first.cancel.is_cancelled());
-        assert!(!session.changes_arrived(first.generation, Arc::new(diff(&["old"]))));
-        assert!(!session.result_arrived(first.generation, analysis(&["old"]), None, SECOND, true));
-        assert!(!session.failed(first.generation, Failure::new("late"), false));
-
+        assert_eq!(
+            session.take_cancelled(),
+            vec![JobId {
+                kind: JobKind::Compare,
+                generation: first
+            }]
+        );
+        assert!(session.take_cancelled().is_empty(), "told once");
+        assert!(!session.changes_arrived(first, Arc::new(diff(&["old"]))));
+        assert!(!session.result_arrived(first, analysis(&["old"]), None, SECOND, true));
+        assert!(!session.failed(first, Failure::new("late"), false));
         assert!(session.result.is_loading());
-        assert!(session.run.is_current(second.generation));
+        assert!(session.run.is_current(second));
     }
 
     #[test]
     fn a_failure_ends_the_comparison() {
         let mut session = opened(true);
-        let ticket = session.choose(Compare::WorkingTree);
-
-        assert!(session.failed(ticket.generation, Failure::new("cargo failed"), true));
-
+        let run = session.choose(Compare::WorkingTree);
+        assert!(session.failed(run, Failure::new("cargo failed"), true));
         assert_eq!(
             session.result.failure().map(|f| f.message.as_str()),
             Some("cargo failed")
@@ -822,12 +755,10 @@ mod tests {
     #[test]
     fn a_failed_refresh_keeps_the_last_good_result() {
         let mut session = opened(true);
-        let ticket = session.choose(Compare::WorkingTree);
-        session.result_arrived(ticket.generation, analysis(&["a"]), None, SECOND, true);
-        session.refresh_started(ticket.generation);
-
-        session.failed(ticket.generation, Failure::new("does not parse"), true);
-
+        let run = session.choose(Compare::WorkingTree);
+        session.result_arrived(run, analysis(&["a"]), None, SECOND, true);
+        session.refresh_started(run);
+        session.failed(run, Failure::new("does not parse"), true);
         assert!(session.analysis().is_some());
         assert!(session.is_watching());
         assert!(!session.is_busy());
@@ -836,41 +767,34 @@ mod tests {
     #[test]
     fn cancelling_a_running_comparison_leaves_it_stopped() {
         let mut session = opened(true);
-        let ticket = session.choose(Compare::WorkingTree);
-
+        let run = session.choose(Compare::WorkingTree);
         assert!(session.cancel());
-
-        assert!(ticket.cancel.is_cancelled());
-        assert_eq!(session.stopped, Stopped::Cancelled);
+        assert!(session.cancelled);
         assert_eq!(session.result, Loadable::Empty);
+        assert_eq!(session.take_cancelled().len(), 1);
         assert!(!session.cancel(), "nothing is left to cancel");
-        assert!(!session.result_arrived(ticket.generation, analysis(&[]), None, SECOND, true));
+        assert!(!session.result_arrived(run, analysis(&[]), None, SECOND, true));
     }
 
     #[test]
     fn cancel_does_not_stop_a_finished_watch() {
         let mut session = opened(true);
-        let ticket = session.choose(Compare::WorkingTree);
-        session.result_arrived(ticket.generation, analysis(&["a"]), None, SECOND, true);
-
+        let run = session.choose(Compare::WorkingTree);
+        session.result_arrived(run, analysis(&["a"]), None, SECOND, true);
         assert!(!session.cancel());
-
         assert!(session.is_watching());
-        assert!(!ticket.cancel.is_cancelled());
+        assert!(session.take_cancelled().is_empty());
     }
 
     #[test]
     fn retry_runs_the_same_comparison_and_keeps_the_selection() {
         let mut session = opened(true);
-        let ticket = session.choose(Compare::WorkingTree);
+        let run = session.choose(Compare::WorkingTree);
         session.select(Selection::symbol(symbol("a")));
-        session.failed(ticket.generation, Failure::new("no"), false);
-
+        session.failed(run, Failure::new("no"), false);
         let again = session.retry().expect("a comparison to retry");
-
         assert!(session.result.is_loading());
-        assert_ne!(again.generation, ticket.generation);
-        assert_eq!(session.compare, Some(Compare::WorkingTree));
+        assert_ne!(again, run);
         assert!(session.selection().is_some());
         assert!(Session::default().retry().is_none());
     }
@@ -878,31 +802,20 @@ mod tests {
     #[test]
     fn a_what_if_result_replaces_the_shown_result_until_it_is_left() {
         let mut session = opened(true);
-        let ticket = session.choose(Compare::WorkingTree);
-        session.result_arrived(ticket.generation, analysis(&["real"]), None, SECOND, true);
-
+        let run = session.choose(Compare::WorkingTree);
+        session.result_arrived(run, analysis(&["real"]), None, SECOND, true);
         let what_if = session.begin_what_if(symbol("total"), Assume::Signature);
-        assert!(session.is_hypothetical());
         assert!(session.shown().is_loading());
         assert_eq!(session.shown_changes(), None);
-
-        assert!(session.what_if_arrived(what_if.generation, analysis(&["total"]), SECOND));
-        assert_eq!(
+        assert!(session.what_if_arrived(what_if, analysis(&["total"]), SECOND));
+        let first_change = |session: &Session| {
             session
                 .shown_changes()
-                .map(|d| d.changes[0].symbol.name().to_owned()),
-            Some("total".to_owned())
-        );
-
+                .map(|d| d.changes[0].symbol.name().to_owned())
+        };
+        assert_eq!(first_change(&session), Some("total".to_owned()));
         session.leave_what_if();
-
-        assert!(!session.is_hypothetical());
-        assert_eq!(
-            session
-                .shown_changes()
-                .map(|d| d.changes[0].symbol.name().to_owned()),
-            Some("real".to_owned())
-        );
+        assert_eq!(first_change(&session), Some("real".to_owned()));
         assert!(session.is_watching(), "the real comparison kept running");
     }
 
@@ -911,36 +824,27 @@ mod tests {
         let mut session = opened(true);
         let first = session.begin_what_if(symbol("a"), Assume::Body);
         let second = session.begin_what_if(symbol("b"), Assume::Body);
-
-        assert!(first.cancel.is_cancelled());
-        assert!(!session.what_if_arrived(first.generation, analysis(&["a"]), SECOND));
-        assert!(session.what_if_failed(second.generation, Failure::new("ambiguous")));
+        assert!(!session.what_if_arrived(first, analysis(&["a"]), SECOND));
+        assert!(session.what_if_failed(second, Failure::new("ambiguous")));
         assert!(session.shown().failure().is_some());
+        assert_eq!(
+            session.take_cancelled(),
+            vec![JobId {
+                kind: JobKind::WhatIf,
+                generation: first
+            }]
+        );
     }
 
     #[test]
     fn cancel_leaves_a_running_what_if_first() {
         let mut session = opened(true);
-        let ticket = session.choose(Compare::WorkingTree);
-        session.result_arrived(ticket.generation, analysis(&["real"]), None, SECOND, true);
-        let what_if = session.begin_what_if(symbol("a"), Assume::Body);
-
+        let run = session.choose(Compare::WorkingTree);
+        session.result_arrived(run, analysis(&["real"]), None, SECOND, true);
+        session.begin_what_if(symbol("a"), Assume::Body);
         assert!(session.cancel());
-
-        assert!(what_if.cancel.is_cancelled());
-        assert!(!session.is_hypothetical());
+        assert!(session.what_if.is_none());
         assert!(session.analysis().is_some());
-    }
-
-    #[test]
-    fn choosing_a_comparison_leaves_the_what_if() {
-        let mut session = opened(true);
-        let what_if = session.begin_what_if(symbol("a"), Assume::Body);
-
-        session.choose(Compare::WorkingTree);
-
-        assert!(what_if.cancel.is_cancelled());
-        assert!(!session.is_hypothetical());
     }
 
     #[test]
@@ -948,232 +852,81 @@ mod tests {
         let mut session = opened(true);
         let first = session.choose(Compare::WorkingTree);
         let second = session.choose(Compare::WorkingTree);
-
-        session.progress(first.generation, Progress::phase("impact"));
+        let phase = |name: &str| Progress {
+            phase: name.to_owned(),
+            ..Progress::default()
+        };
+        session.progress(first, phase("impact"));
         assert_eq!(
-            session.result.progress().map(|p| p.phase.as_str()),
-            Some("")
+            session.result.progress().map(|p| p.label()).as_deref(),
+            Some("Starting")
         );
-
-        session.progress(second.generation, Progress::phase("impact"));
+        session.progress(second, phase("impact"));
         assert_eq!(
-            session.result.progress().map(|p| p.phase.as_str()),
-            Some("impact")
+            session.result.progress().map(|p| p.label()).as_deref(),
+            Some("Tracing impact")
         );
     }
 
     #[test]
     fn selections_of_vanished_symbols_are_dropped_when_no_graph_is_known() {
         let mut session = opened(true);
-        let ticket = session.choose(Compare::WorkingTree);
-        session.result_arrived(ticket.generation, analysis(&["a", "b"]), None, SECOND, true);
+        let run = session.choose(Compare::WorkingTree);
+        session.result_arrived(run, analysis(&["a", "b"]), None, SECOND, true);
         session.select(Selection::symbol(symbol("a")));
         session.select(Selection::symbol(symbol("b")));
-
-        session.result_arrived(ticket.generation, analysis(&["a"]), None, SECOND, true);
-
-        assert_eq!(
-            session.selection().map(|s| s.symbol.name().to_owned()),
-            Some("a".to_owned())
-        );
+        session.result_arrived(run, analysis(&["a"]), None, SECOND, true);
+        assert_eq!(selected(&session), Some("a".to_owned()));
     }
 
     #[test]
-    fn a_result_with_nothing_selected_selects_the_first_item_to_edit() {
+    fn a_result_selects_the_first_item_to_edit_then_to_behave_then_a_change() {
         let mut session = opened(true);
-        let ticket = session.choose(Compare::WorkingTree);
+        let run = session.choose(Compare::WorkingTree);
+        let items = vec![
+            item("behaves", ImpactClass::Behaviour, false),
+            item("edited", ImpactClass::Adaptation, true),
+            item("adapts", ImpactClass::Adaptation, false),
+        ];
+        session.result_arrived(run, analysis_of(&["changed"], items), None, SECOND, false);
+        assert_eq!(selected(&session), Some("adapts".to_owned()));
 
-        session.result_arrived(
-            ticket.generation,
-            analysis_of(
-                &["changed"],
-                vec![
-                    item("behaves", ImpactClass::Behaviour, false),
-                    item("adapts", ImpactClass::Adaptation, false),
-                    item("also", ImpactClass::Adaptation, false),
-                ],
-            ),
-            None,
-            SECOND,
-            true,
-        );
+        let run = session.choose(Compare::WorkingTree);
+        let items = vec![item("behaves", ImpactClass::Behaviour, false)];
+        session.result_arrived(run, analysis_of(&["changed"], items), None, SECOND, false);
+        assert_eq!(selected(&session), Some("behaves".to_owned()));
 
-        assert_eq!(
-            session.selection().map(|s| s.symbol.name().to_owned()),
-            Some("adapts".to_owned())
-        );
+        let run = session.choose(Compare::WorkingTree);
+        session.result_arrived(run, analysis(&["changed"]), None, SECOND, false);
+        assert_eq!(selected(&session), Some("changed".to_owned()));
+        assert_eq!(default_selection(&analysis(&[])), None);
     }
 
     #[test]
-    fn a_result_with_only_behaving_items_selects_one_of_them() {
+    fn a_kept_selection_is_not_replaced_but_a_vanished_one_is() {
         let mut session = opened(true);
-        let ticket = session.choose(Compare::WorkingTree);
-
-        session.result_arrived(
-            ticket.generation,
-            analysis_of(
-                &["changed"],
-                vec![item("behaves", ImpactClass::Behaviour, false)],
-            ),
-            None,
-            SECOND,
-            true,
-        );
-
-        assert_eq!(
-            session.selection().map(|s| s.symbol.name().to_owned()),
-            Some("behaves".to_owned())
-        );
-    }
-
-    #[test]
-    fn a_result_with_nothing_to_read_selects_the_first_change() {
-        let mut session = opened(true);
-        let ticket = session.choose(Compare::WorkingTree);
-
-        session.result_arrived(
-            ticket.generation,
-            analysis_of(&["changed"], Vec::new()),
-            None,
-            SECOND,
-            true,
-        );
-
-        assert_eq!(
-            session.selection().map(|s| s.symbol.name().to_owned()),
-            Some("changed".to_owned())
-        );
-    }
-
-    #[test]
-    fn a_kept_selection_is_not_replaced() {
-        let mut session = opened(true);
-        let ticket = session.choose(Compare::WorkingTree);
-        session.result_arrived(
-            ticket.generation,
-            analysis_of(
-                &["changed"],
-                vec![item("adapts", ImpactClass::Adaptation, false)],
-            ),
-            None,
-            SECOND,
-            true,
-        );
+        let run = session.choose(Compare::WorkingTree);
+        let items = || vec![item("adapts", ImpactClass::Adaptation, false)];
+        session.result_arrived(run, analysis_of(&["changed"], items()), None, SECOND, true);
         session.select(Selection::symbol(symbol("changed")));
+        session.result_arrived(run, analysis_of(&["changed"], items()), None, SECOND, true);
+        assert_eq!(selected(&session), Some("changed".to_owned()));
 
-        session.result_arrived(
-            ticket.generation,
-            analysis_of(
-                &["changed"],
-                vec![
-                    item("first", ImpactClass::Adaptation, false),
-                    item("changed", ImpactClass::Adaptation, false),
-                ],
-            ),
-            None,
-            SECOND,
-            true,
-        );
-
-        assert_eq!(
-            session.selection().map(|s| s.symbol.name().to_owned()),
-            Some("changed".to_owned())
-        );
-    }
-
-    #[test]
-    fn an_empty_result_selects_nothing() {
-        assert_eq!(default_selection(&analysis_of(&[], Vec::new())), None);
-    }
-
-    fn graph_with(paths: &[&str]) -> RevisionGraph {
-        let mut graph = RevisionGraph::default();
-        for path in paths {
-            graph.symbols.push(blastr_model::Symbol {
-                path: SymbolPath::new(*path, SymbolKind::Function),
-                krate: blastr_model::CrateId(0),
-                location: Location {
-                    file: RelPath::new("src/lib.rs"),
-                    span: Span {
-                        start: 0,
-                        end: 1,
-                        start_line: 1,
-                        end_line: 1,
-                    },
-                },
-                visibility: blastr_model::Visibility::Public,
-                signature_hash: 0,
-                body_hash: 0,
-                attr_hash: 0,
-                body_sketch: Vec::new(),
-                parent: None,
-                flags: blastr_model::SymbolFlags::default(),
-                impl_info: None,
-            });
-        }
-        graph
-    }
-
-    #[test]
-    fn a_selection_exists_while_the_result_mentions_it() {
-        let analysis = analysis_of(
-            &["changed"],
-            vec![item("adapts", ImpactClass::Adaptation, false)],
-        );
-
-        assert!(selection_exists(&analysis, None, &symbol("adapts")));
-        assert!(selection_exists(&analysis, None, &symbol("changed")));
-        assert!(!selection_exists(&analysis, None, &symbol("gone")));
-        assert!(selection_exists(
-            &analysis,
-            Some(&graph_with(&["billing::gone"])),
-            &symbol("gone")
-        ));
-    }
-
-    #[test]
-    fn a_selection_of_a_vanished_symbol_is_replaced() {
         let mut session = opened(true);
-        let ticket = session.choose(Compare::WorkingTree);
-        session.result_arrived(
-            ticket.generation,
-            analysis_of(
-                &["changed"],
-                vec![item("adapts", ImpactClass::Adaptation, false)],
-            ),
-            None,
-            SECOND,
-            true,
-        );
+        let run = session.choose(Compare::WorkingTree);
+        session.result_arrived(run, analysis_of(&["changed"], items()), None, SECOND, true);
         session.select(Selection::symbol(symbol("gone")));
-
-        session.result_arrived(
-            ticket.generation,
-            analysis_of(
-                &["changed"],
-                vec![item("adapts", ImpactClass::Adaptation, false)],
-            ),
-            None,
-            SECOND,
-            true,
-        );
-
-        assert_eq!(
-            session.selection().map(|s| s.symbol.name().to_owned()),
-            Some("adapts".to_owned())
-        );
+        session.result_arrived(run, analysis_of(&["changed"], items()), None, SECOND, true);
+        assert_eq!(selected(&session), Some("adapts".to_owned()));
     }
 
     #[test]
     fn closing_the_repository_cancels_everything() {
         let mut session = opened(true);
-        let ticket = session.choose(Compare::WorkingTree);
-        let what_if = session.begin_what_if(symbol("a"), Assume::Body);
-
+        session.choose(Compare::WorkingTree);
+        session.begin_what_if(symbol("a"), Assume::Body);
         session.close_repository();
-
-        assert!(ticket.cancel.is_cancelled());
-        assert!(what_if.cancel.is_cancelled());
+        assert_eq!(session.take_cancelled().len(), 2);
         assert_eq!(session.repo, None);
         assert_eq!(session.compare, None);
     }

@@ -11,9 +11,10 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+async-channel.workspace = true
 blastr-git.workspace = true
 blastr-model.workspace = true
-gpui-kit.workspace = true
+gpui-kit = { workspace = true, features = ["tree-sitter-rust"] }
 serde.workspace = true
 serde_json.workspace = true
 similar.workspace = true

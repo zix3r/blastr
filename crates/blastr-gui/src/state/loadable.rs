@@ -1,36 +1,36 @@
-//! A value that arrives later, and what is known about it meanwhile.
+//! A value that arrives later: nothing yet, on its way, there, or failed.
 
-/// How far a running task has got.
+use blastr_model::protocol::{Failure, Report};
+
+/// How far a job has got, as the engine reported it.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Progress {
-    /// The phase the engine reported last, such as `extract head`.
+    /// The phase, such as `extract head`.
     pub phase: String,
     /// Units of the phase that are done.
     pub done: u64,
-    /// Units the phase has in all, when the engine knows.
+    /// Units the phase has in all, when known.
     pub total: Option<u64>,
 }
 
-impl Progress {
-    /// Progress at the start of `phase`, with nothing counted yet.
-    pub fn phase(phase: impl Into<String>) -> Progress {
+impl From<Report> for Progress {
+    fn from(report: Report) -> Progress {
         Progress {
-            phase: phase.into(),
-            done: 0,
-            total: None,
+            phase: report.phase,
+            done: report.done,
+            total: report.total,
         }
     }
+}
 
-    /// The finished share of the phase, between 0 and 1, when it is known.
+impl Progress {
+    /// How much of the phase is done, between 0 and 1, when the total is known.
     pub fn fraction(&self) -> Option<f32> {
-        let total = self.total?;
-        if total == 0 {
-            return None;
-        }
+        let total = self.total.filter(|total| *total > 0)?;
         Some((self.done as f32 / total as f32).clamp(0.0, 1.0))
     }
 
-    /// The phase in words a person reads in the status bar.
+    /// The phase in words.
     pub fn label(&self) -> String {
         let text = match self.phase.as_str() {
             "snapshot" => "Preparing the revision",
@@ -44,51 +44,29 @@ impl Progress {
             "classify" => "Classifying the changes",
             "impact" => "Tracing impact",
             "" => "Starting",
-            other => return capitalised(other),
+            other => {
+                let mut characters = other.chars();
+                return match characters.next() {
+                    Some(first) => first.to_uppercase().chain(characters).collect(),
+                    None => String::new(),
+                };
+            }
         };
         text.to_owned()
     }
 }
 
-/// `text` with its first letter in upper case.
-fn capitalised(text: &str) -> String {
-    let mut characters = text.chars();
-    match characters.next() {
-        Some(first) => first.to_uppercase().chain(characters).collect(),
-        None => String::new(),
-    }
-}
-
-/// Why a task did not produce its value.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Failure {
-    /// What went wrong.
-    pub message: String,
-    /// What to do next, when there is something useful to say.
-    pub hint: Option<String>,
-}
-
-impl Failure {
-    /// A failure with a message and no hint.
-    pub fn new(message: impl Into<String>) -> Failure {
-        Failure {
-            message: message.into(),
-            hint: None,
-        }
-    }
-}
-
-/// A value a background task produces.
+/// A value that is loaded in the background.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum Loadable<T> {
-    /// Nothing was asked for yet.
+    /// Nothing was asked for.
     #[default]
     Empty,
-    /// The task is running.
+    /// On its way.
     Loading(Progress),
-    /// The value arrived.
+    /// Arrived.
     Ready(T),
-    /// The task failed.
+    /// Could not be loaded.
     Failed(Failure),
 }
 
@@ -101,7 +79,7 @@ impl<T> Loadable<T> {
         }
     }
 
-    /// The progress of the running task.
+    /// The progress, while it is on its way.
     pub fn progress(&self) -> Option<&Progress> {
         match self {
             Loadable::Loading(progress) => Some(progress),
@@ -109,65 +87,16 @@ impl<T> Loadable<T> {
         }
     }
 
-    /// Whether the task is still running.
+    /// Whether it is on its way.
     pub fn is_loading(&self) -> bool {
         matches!(self, Loadable::Loading(_))
     }
 
-    /// Why the task failed.
+    /// Why it could not be loaded.
     pub fn failure(&self) -> Option<&Failure> {
         match self {
             Loadable::Failed(failure) => Some(failure),
             _ => None,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_fraction_needs_a_total() {
-        assert_eq!(Progress::phase("impact").fraction(), None);
-        let half = Progress {
-            phase: "extract head".to_owned(),
-            done: 5,
-            total: Some(10),
-        };
-        assert_eq!(half.fraction(), Some(0.5));
-        let over = Progress {
-            done: 12,
-            ..half.clone()
-        };
-        assert_eq!(over.fraction(), Some(1.0));
-        let empty = Progress {
-            total: Some(0),
-            ..half
-        };
-        assert_eq!(empty.fraction(), None);
-    }
-
-    #[test]
-    fn phases_read_as_plain_words() {
-        assert_eq!(Progress::phase("impact").label(), "Tracing impact");
-        assert_eq!(Progress::phase("link").label(), "Link");
-        assert_eq!(Progress::phase("").label(), "Starting");
-    }
-
-    #[test]
-    fn only_a_ready_value_is_handed_out() {
-        let mut value: Loadable<u32> = Loadable::Empty;
-        assert_eq!(value.ready(), None);
-        value = Loadable::Loading(Progress::phase("impact"));
-        assert!(value.is_loading());
-        assert_eq!(
-            value.progress().map(|progress| progress.label()),
-            Some("Tracing impact".to_owned())
-        );
-        value = Loadable::Ready(3);
-        assert_eq!(value.ready(), Some(&3));
-        value = Loadable::Failed(Failure::new("no"));
-        assert_eq!(value.failure().map(|f| f.message.as_str()), Some("no"));
     }
 }

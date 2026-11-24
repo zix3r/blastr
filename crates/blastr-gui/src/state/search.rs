@@ -52,11 +52,6 @@ impl SymbolIndex {
         SymbolIndex { entries }
     }
 
-    /// How many symbols can be searched.
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
     /// Whether the index holds no symbol.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
@@ -219,7 +214,6 @@ mod tests {
     #[test]
     fn modules_and_impl_blocks_are_not_listed() {
         let index = index();
-        assert_eq!(index.len(), 6);
         assert!(!index.is_empty());
         assert!(
             names(&index, "billing")

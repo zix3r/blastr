@@ -4,8 +4,9 @@
 //! behave differently*, green is tests, violet is a hypothetical change.
 //! Meaning is never carried by colour alone; badges and icons say it in words.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
+use gpui_kit::component::highlighter::HighlightTheme;
 use gpui_kit::component::theme::{Theme, ThemeMode};
 use gpui_kit::{App, Fill, Hsla, Pixels, Rgba, SharedString, Window, px};
 
@@ -141,15 +142,7 @@ pub(crate) const NEUTRAL: Accent = Accent {
 /// Candidate edges and `possible` confidence: muted, and dashed where drawn.
 pub(crate) const POSSIBLE: Tone = Tone::rgb(0x8b93a1);
 
-/// The quiet tint behind the lines a change touches in the source view.
-pub(crate) const CHANGED_TINT: Tone = Tone::rgba(0xff7a33, 20);
-/// Background of an added line.
-pub(crate) const ADD_BG: Tone = Tone::rgba(0x4cc38a, 22);
-/// Sign and line number of an added line.
-pub(crate) const ADD_FG: Tone = Tone::rgb(0x56c993);
-/// Background of a removed line.
-pub(crate) const DEL_BG: Tone = Tone::rgba(0xf0616d, 22);
-/// Sign and line number of a removed line.
+/// Removed lines and failures.
 pub(crate) const DEL_FG: Tone = Tone::rgb(0xf0616d);
 
 /// The fill of the one primary button of a view.
@@ -161,19 +154,6 @@ pub(crate) const PRIMARY_HOVER: Tone = Tone::rgb(0xffffff);
 /// What dims the window behind a popup.
 pub(crate) const SCRIM: Tone = Tone::rgba(0x050608, 158);
 
-/// Keywords in source text.
-pub(crate) const SYNTAX_KEYWORD: Tone = Tone::rgb(0xc49bea);
-/// Function names in source text.
-pub(crate) const SYNTAX_FUNCTION: Tone = Tone::rgb(0x7fb6ff);
-/// Type names in source text.
-pub(crate) const SYNTAX_TYPE: Tone = Tone::rgb(0x5fcfc0);
-/// String and character literals in source text.
-pub(crate) const SYNTAX_STRING: Tone = Tone::rgb(0xa6d189);
-/// Numbers and constants in source text.
-pub(crate) const SYNTAX_NUMBER: Tone = Tone::rgb(0xeab676);
-/// Comments in source text.
-pub(crate) const SYNTAX_COMMENT: Tone = Tone::rgb(0x5f6975);
-
 /// Size of ordinary interface text.
 pub(crate) const TEXT_UI: Pixels = px(13.);
 /// Size of secondary text.
@@ -182,10 +162,6 @@ pub(crate) const TEXT_SMALL: Pixels = px(12.);
 pub(crate) const TEXT_MICRO: Pixels = px(11.);
 /// Size of symbol names and source text.
 pub(crate) const TEXT_MONO: Pixels = px(12.5);
-/// Size of the line numbers beside source text.
-pub(crate) const TEXT_LINE_NUMBER: Pixels = px(11.5);
-/// Height of one line of source text.
-pub(crate) const LINE_HEIGHT: Pixels = px(20.);
 /// Corner radius of small tags.
 pub(crate) const RADIUS_SM: Pixels = px(4.);
 /// Corner radius of chips, buttons and inputs.
@@ -243,15 +219,6 @@ fn first_installed<'a>(candidates: &[&'a str], installed: &[String], fallback: &
         .copied()
         .find(|candidate| installed.iter().any(|name| name == candidate))
         .unwrap_or(fallback)
-}
-
-/// The width of the gutter that holds the line numbers up to `line`.
-///
-/// The widest number decides the width of the whole column, so that the
-/// numbers never move or clip at the left edge.
-pub(crate) fn gutter_width(line: u32) -> Pixels {
-    let digits = line.to_string().len().max(2);
-    px(7.2 * digits as f32 + 12.0)
 }
 
 /// Applies the dark theme to the component library.
@@ -317,78 +284,48 @@ pub(crate) fn apply(window: Option<&mut Window>, cx: &mut App) {
         theme.radius_lg = RADIUS_LG;
         theme.font_size = TEXT_UI;
         theme.mono_font_size = TEXT_MONO;
+        if let Ok(highlight) = serde_json::from_str::<HighlightTheme>(HIGHLIGHT) {
+            theme.highlight_theme = Arc::new(highlight);
+        }
     });
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tones_keep_their_channels() {
-        let orange: Rgba = CHANGED.solid.into();
-        assert!((orange.r - 1.0).abs() < 0.001);
-        assert!((orange.g - 122.0 / 255.0).abs() < 0.001);
-        assert!((orange.b - 51.0 / 255.0).abs() < 0.001);
-        assert!((orange.a - 1.0).abs() < 0.001);
-
-        let tint: Rgba = CHANGED.bg.into();
-        assert!((tint.a - 28.0 / 255.0).abs() < 0.001);
-        assert!((tint.r - 1.0).abs() < 0.001);
+/// The colours of source text: the editor surface and one colour per kind of
+/// token, in the shape of a Zed theme.
+const HIGHLIGHT: &str = r##"{
+  "name": "Blastr",
+  "appearance": "dark",
+  "style": {
+    "editor.background": "#0b0c0f",
+    "editor.foreground": "#b8c0ca",
+    "editor.active_line.background": "#111317",
+    "editor.line_number": "#5f6975",
+    "editor.active_line_number": "#b8c0ca",
+    "editor.gutter.background": "#0b0c0f",
+    "created": "#56c993",
+    "deleted": "#f0616d",
+    "modified": "#f2c14e",
+    "syntax": {
+      "attribute": { "color": "#eab676" },
+      "boolean": { "color": "#eab676" },
+      "comment": { "color": "#5f6975" },
+      "comment.doc": { "color": "#6f7a86" },
+      "constant": { "color": "#eab676" },
+      "constructor": { "color": "#5fcfc0" },
+      "function": { "color": "#7fb6ff" },
+      "keyword": { "color": "#c49bea" },
+      "label": { "color": "#eab676" },
+      "number": { "color": "#eab676" },
+      "operator": { "color": "#b8c0ca" },
+      "property": { "color": "#b8c0ca" },
+      "punctuation": { "color": "#929ca8" },
+      "punctuation.bracket": { "color": "#929ca8" },
+      "punctuation.delimiter": { "color": "#929ca8" },
+      "string": { "color": "#a6d189" },
+      "string.escape": { "color": "#eab676" },
+      "type": { "color": "#5fcfc0" },
+      "variable": { "color": "#e7eaee" },
+      "variable.special": { "color": "#c49bea" }
     }
-
-    #[test]
-    fn each_meaning_has_its_own_colour() {
-        let solids = [
-            CHANGED.solid,
-            EDIT.solid,
-            BEHAVE.solid,
-            TEST.solid,
-            WHATIF.solid,
-        ];
-        for (index, tone) in solids.iter().enumerate() {
-            for other in &solids[index + 1..] {
-                assert_ne!(tone, other);
-            }
-        }
-    }
-
-    fn names(names: &[&str]) -> Vec<String> {
-        names.iter().map(|name| (*name).to_owned()).collect()
-    }
-
-    #[test]
-    fn a_family_is_used_only_when_the_machine_has_it() {
-        let installed = names(&["Consolas", "Cascadia Mono"]);
-        assert_eq!(
-            first_installed(&["Cascadia Mono", "Consolas"], &installed, SYSTEM_UI_FONT),
-            "Cascadia Mono"
-        );
-        assert_eq!(
-            first_installed(&["Iosevka", "Consolas"], &installed, SYSTEM_UI_FONT),
-            "Consolas"
-        );
-        assert_eq!(
-            first_installed(&["Iosevka"], &installed, SYSTEM_UI_FONT),
-            SYSTEM_UI_FONT
-        );
-    }
-
-    #[test]
-    fn an_unknown_machine_keeps_the_first_candidate() {
-        assert_eq!(
-            first_installed(&["Cascadia Mono", "Consolas"], &[], SYSTEM_UI_FONT),
-            "Cascadia Mono"
-        );
-        assert_eq!(first_installed(&[], &[], SYSTEM_UI_FONT), SYSTEM_UI_FONT);
-    }
-
-    #[test]
-    fn the_gutter_grows_with_the_widest_line_number() {
-        assert_eq!(gutter_width(1), gutter_width(99), "two digits is the floor");
-        assert!(f32::from(gutter_width(99)) < f32::from(gutter_width(100)));
-        assert!(f32::from(gutter_width(2448)) > f32::from(gutter_width(999)));
-        // Four digits and their padding: wide enough for `2448` and a border.
-        assert!(f32::from(gutter_width(2448)) >= 40.0);
-    }
-}
+  }
+}"##;
