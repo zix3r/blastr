@@ -320,13 +320,20 @@ fn tree_changes(repo: &gix::Repository, base: &str, head: &str) -> Result<Vec<Ch
             }
             ChangeDetached::Modification {
                 location,
+                previous_entry_mode,
                 entry_mode,
                 ..
             } => {
-                let status = if is_file(entry_mode.kind()) {
-                    FileStatus::Modified
-                } else {
-                    FileStatus::Deleted
+                let status = match (
+                    is_file(previous_entry_mode.kind()),
+                    is_file(entry_mode.kind()),
+                ) {
+                    (true, true) => FileStatus::Modified,
+                    (true, false) => FileStatus::Deleted,
+                    (false, true) => FileStatus::Added,
+                    // A directory whose content changed: the diff reports the
+                    // files inside it on their own.
+                    (false, false) => continue,
                 };
                 out.push(changed(&rel_path(location), status));
             }
@@ -436,6 +443,7 @@ mod tests {
                 ("b.txt", "keep"),
                 ("old.txt", "moved content"),
                 ("gone.txt", "bye"),
+                ("sub/deep.txt", "deep"),
             ],
             "first",
         );
@@ -445,6 +453,7 @@ mod tests {
                 ("b.txt", "keep"),
                 ("new.txt", "fresh"),
                 ("renamed.txt", "moved content"),
+                ("sub/deep.txt", "deeper"),
             ],
             "second",
         );
@@ -462,6 +471,7 @@ mod tests {
                 deleted("gone.txt"),
                 added("new.txt"),
                 renamed("renamed.txt", "old.txt"),
+                modified("sub/deep.txt"),
             ]
         );
     }
