@@ -22,7 +22,7 @@ use ra_ap_project_model::{
 use ra_ap_vfs::{FileId, VfsPath};
 
 use crate::check_cancel;
-use crate::locate::rel_path;
+use crate::locate::Root;
 use crate::{Error, LoadOptions, Workspace};
 
 /// One loaded workspace-member crate: its metadata and its crate root.
@@ -65,6 +65,7 @@ impl Workspace {
         progress: &dyn Progress,
         cancel: &CancelToken,
     ) -> Result<Workspace, Error> {
+        let _span = tracing::info_span!("load").entered();
         let mut attempt = 1;
         loop {
             let workspace = Workspace::load_once(root, manifest_dir, options, progress, cancel)?;
@@ -475,10 +476,11 @@ fn crate_name(target_name: &str) -> String {
 /// Keeps the targets whose crate root is inside the root and known to the
 /// virtual file system.
 fn loaded_targets(root: &Path, vfs: &ra_ap_vfs::Vfs, targets: Vec<Target>) -> Vec<MemberCrate> {
+    let root = Root::new(root);
     let mut crates = Vec::with_capacity(targets.len());
     for target in targets {
         let root_path: &Path = target.root.as_ref();
-        let Some(root_file) = rel_path(root, root_path) else {
+        let Some(root_file) = root.relative(root_path) else {
             continue;
         };
         let path = VfsPath::from(target.root);

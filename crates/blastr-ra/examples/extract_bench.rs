@@ -53,10 +53,9 @@ fn main() {
 
     let extract_options = ExtractOptions {
         threads: args.threads,
-        measure: true,
     };
     let started = Instant::now();
-    let (graph, report) = match workspace.extract_with(&extract_options, &NoProgress, &cancel) {
+    let graph = match workspace.extract_with(&extract_options, &NoProgress, &cancel) {
         Ok(extracted) => extracted,
         Err(error) => {
             eprintln!("the extraction failed: {error}");
@@ -82,33 +81,6 @@ fn main() {
     println!("inactive:    {}", graph.inactive.len());
     println!("crates:      {}", graph.crates.len());
     println!("fingerprint: {fingerprint:016x}");
-    println!("pipeline:    {:.3} s", report.pipeline_pass);
-    println!("edge pass:   {:.3} s", report.edge_pass);
-    println!("merge:       {:.3} s", report.merge);
-    let mut phases = report.phases;
-    phases.sort_by(|left, right| right.seconds.total_cmp(&left.seconds));
-    println!("phases:");
-    for phase in &phases {
-        println!(
-            "  {:>8.3} s {:>8} calls  {}",
-            phase.seconds, phase.calls, phase.name
-        );
-    }
-    let mut files = report.files;
-    files.sort_by(|left, right| right.seconds.total_cmp(&left.seconds));
-    println!("files:");
-    for file in files.iter().take(20) {
-        println!(
-            "  {:>8.3} s {:>5} refs {:>4} defs  {}",
-            file.seconds,
-            file.references,
-            file.containers,
-            file.file
-                .as_ref()
-                .map(|path| path.as_str())
-                .unwrap_or("<macro expansion>")
-        );
-    }
 }
 
 fn parse_args(arguments: impl Iterator<Item = String>) -> Result<Args, String> {

@@ -31,23 +31,23 @@
 
 use std::collections::{HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::time::Duration;
 
 use blastr_model::{
-    Certainty, Edge, EdgeDetail, EdgeKind, Location, RevisionGraph, SymbolId, SymbolKind,
-    UnresolvedRef,
+    Certainty, Edge, EdgeDetail, EdgeKind, Location, RelPath, RevisionGraph, Span, SymbolId,
+    SymbolKind, UnresolvedRef,
 };
 use ra_ap_hir::{
     Adt, AsAssocItem, AssocItem, AssocItemContainer, Crate, Field, Function, HirFileId, Impl,
-    InFile, Macro, ModuleDef, PathResolution, Semantics, Trait, Variant, db::HirDatabase,
+    InFile, Macro, ModuleDef, Name, PathResolution, Semantics, Trait, db::HirDatabase,
 };
+use ra_ap_ide_db::RootDatabase;
 use ra_ap_ide_db::base_db::{Crate as BaseCrate, CrateOrigin};
-use ra_ap_syntax::ast::{HasArgList, HasAttrs, HasLoopBody};
+use ra_ap_ide_db::defs::{Definition, NameClass, NameRefClass};
+use ra_ap_syntax::ast::{HasArgList, HasAttrs};
 use ra_ap_syntax::{AstNode, AstToken, SyntaxNode, ast};
 
 use crate::hashing;
 use crate::locate::Locator;
-use crate::stats::{FileTiming, Kind, Profile};
 use crate::symbols::{DefKey, SymbolTable};
 
 /// The standard operator traits whose methods an operator expression invokes.
@@ -56,7 +56,8 @@ use crate::symbols::{DefKey, SymbolTable};
 /// an impl of one of these traits produces an edge. The list is also the
 /// pruning set: an operator whose traits have no implementation in the
 /// workspace cannot reach one, and asking rust-analyzer would force the type
-/// inference of the whole body for nothing.
+/// inference of the whole body for nothing. Only the standard library's traits count: a trait
+/// of the project that is merely named `Add` is not what `+` calls.
 const OPERATOR_TRAITS: &[&str] = &[
     "Add",
     "Sub",
@@ -128,7 +129,7 @@ pub(crate) struct Input<'a, 'db> {
     /// The database, attached to the current thread for the duration of the call.
     pub(crate) db: &'db dyn HirDatabase,
     /// The name resolution of the same database.
-    pub(crate) sema: &'a Semantics<'db, dyn HirDatabase>,
+    pub(crate) sema: &'a Semantics<'db, RootDatabase>,
     /// The definition-to-symbol lookup.
     pub(crate) symbols: &'a SymbolTable,
     /// The file and range to location conversion.
@@ -153,7 +154,7 @@ pub(crate) struct Output {
 }
 
 /// Collects every edge kind except `Contains`.
-pub(crate) fn collect(input: Input<'_, '_>, measure: bool) -> (Output, CollectorStats) {
+pub(crate) fn collect(input: Input<'_, '_>) -> Output {
     let mut collector = Collector {
         input,
         edges: Vec::new(),
@@ -163,73 +164,19 @@ pub(crate) fn collect(input: Input<'_, '_>, measure: bool) -> (Output, Collector
             .iter()
             .map(|container| container.node.clone())
             .collect(),
-        impls: Vec::new(),
-        formatting: Vec::new(),
-        conversions: Vec::new(),
-        iterators: Vec::new(),
-        collects: Vec::new(),
+        inactive: inactive_by_file(input.inactive),
+        impl_fns: HashMap::new(),
+        implicit: HashMap::new(),
         operators: HashSet::new(),
         invocations: HashMap::new(),
         quiet: false,
         expansion_site: None,
-        profile: Profile::new(measure),
-        file_times: HashMap::new(),
     };
     collector.run();
-    let files = file_timings(&collector.file_times, collector.input.locate);
-    (
-        Output {
-            edges: collector.edges,
-            unresolved: collector.unresolved,
-        },
-        CollectorStats {
-            profile: collector.profile,
-            files,
-        },
-    )
-}
-
-/// What one dependency pass measured.
-pub(crate) struct CollectorStats {
-    /// The times of each kind of work.
-    pub(crate) profile: Profile,
-    /// The time each file took.
-    pub(crate) files: Vec<FileTiming>,
-}
-
-/// The time one file took, accumulated over its regions.
-#[derive(Debug, Default, Clone, Copy)]
-struct FileCounters {
-    /// The time the regions of the file took.
-    duration: Duration,
-    /// The number of regions the file holds.
-    containers: u64,
-    /// The number of edges and unresolved references the file produced.
-    references: u64,
-}
-
-/// The per-file timings, in a deterministic order.
-fn file_timings(times: &HashMap<HirFileId, FileCounters>, locate: &Locator<'_>) -> Vec<FileTiming> {
-    let mut files: Vec<FileTiming> = times
-        .iter()
-        .map(|(&file, counters)| FileTiming {
-            file: locate.file_path(file),
-            containers: counters.containers,
-            references: counters.references,
-            seconds: counters.duration.as_secs_f64(),
-        })
-        .collect();
-    files.sort_by(|left, right| left.file.cmp(&right.file));
-    files
-}
-
-/// What one method call resolved to.
-#[derive(Debug, Clone, Copy)]
-enum MethodTarget {
-    /// A method or an associated function.
-    Function(Function),
-    /// A field holding a function, which the call goes through.
-    Field(Field),
+    Output {
+        edges: collector.edges,
+        unresolved: collector.unresolved,
+    }
 }
 
 /// Which impls the value of one expression can reach.
@@ -260,61 +207,57 @@ impl ValueType {
     }
 }
 
-/// One workspace implementation of a formatting trait.
-#[derive(Debug, Clone, Copy)]
-struct FormattingImpl {
-    /// Which trait the impl provides.
-    trait_: FormattingTrait,
-    /// The data type it is implemented for, when the impl names one.
-    ///
-    /// `None` for a self type this pass cannot name, such as a reference or a
-    /// type parameter: any formatted value may reach it.
-    self_ty: Option<Adt>,
-    /// The symbol of the impl's `fmt`.
-    symbol: SymbolId,
-}
-
-/// The standard formatting traits whose methods are invoked implicitly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FormattingTrait {
+/// A standard trait whose methods the code calls without naming them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Implicit {
     /// `Display`, which `{}` and `to_string` invoke.
     Display,
     /// `Debug`, which `{:?}` invokes.
     Debug,
+    /// `From`, which `?` invokes on the error of its operand.
+    From,
+    /// `Iterator`, which a `for` loop and every adaptor call.
+    Iterator,
+    /// `FromIterator`, which `collect` invokes.
+    FromIterator,
 }
 
-/// One workspace implementation of the standard `From`, which `?` invokes.
-#[derive(Debug, Clone, Copy)]
-struct ConversionImpl {
-    /// The error type it converts from, when that type is a data type.
-    ///
-    /// `None` for a source type this pass cannot name, such as a string or an
-    /// error of the standard library: any `?` may reach it.
-    source: Option<Adt>,
-    /// The symbol of the impl's `from`.
-    symbol: SymbolId,
+/// The standard traits the code calls without naming them: the trait, its
+/// name in the standard library, and the methods that run.
+///
+/// A trait of the same name that the project defines itself is a trait like
+/// any other: its methods are called by name.
+const IMPLICIT: [(Implicit, &str, &[&str]); 5] = [
+    (Implicit::Display, "Display", &["fmt"]),
+    (Implicit::Debug, "Debug", &["fmt"]),
+    (Implicit::From, "From", &["from"]),
+    (Implicit::Iterator, "Iterator", &["next", "size_hint"]),
+    (Implicit::FromIterator, "FromIterator", &["from_iter"]),
+];
+
+impl Implicit {
+    /// The methods of the trait that its implicit calls run.
+    fn methods(self) -> &'static [&'static str] {
+        IMPLICIT
+            .iter()
+            .find(|(family, _, _)| *family == self)
+            .map_or(&[], |(_, _, methods)| methods)
+    }
 }
 
-/// One workspace implementation of `FromIterator`, which `collect` invokes.
-#[derive(Debug, Clone, Copy)]
-struct CollectImpl {
-    /// The collection type, when the impl names one.
-    ///
-    /// `None` for a self type this pass cannot name, such as a reference or a
-    /// type parameter: any `collect` may reach it.
-    self_ty: Option<Adt>,
-    /// The symbol of the impl's `from_iter`.
-    symbol: SymbolId,
-}
-
-/// One workspace implementation of the standard `Iterator`.
+/// One function of a workspace impl of a trait.
 #[derive(Debug, Clone)]
-struct IteratorImpl {
-    /// The iterator type, when the impl names one.
-    self_ty: Option<Adt>,
-    /// The impl's `next`, and its `size_hint` when it provides one: a `for`
-    /// loop and an adaptor both call them without naming the impl.
-    symbols: Vec<SymbolId>,
+struct ImplFn {
+    /// The data type the impl applies to: the self type, and for `From` the
+    /// type converted from.
+    ///
+    /// `None` for a type this pass cannot name, such as a reference or a type
+    /// parameter: any value may reach it.
+    ty: Option<Adt>,
+    /// The name of the function.
+    name: Name,
+    /// The symbol of the function.
+    symbol: SymbolId,
 }
 
 /// The state of one dependency pass.
@@ -327,20 +270,14 @@ struct Collector<'a, 'db> {
     unresolved: Vec<UnresolvedRef>,
     /// The region nodes, so that a nested region is not walked twice.
     regions: HashSet<SyntaxNode>,
-    /// The impl blocks of the workspace, for trait dispatch and `Implements`.
-    impls: Vec<(SymbolId, Impl)>,
-    /// The `fmt` methods of the workspace's `Display` and `Debug` impls, which
-    /// a format string invokes without naming them.
-    formatting: Vec<FormattingImpl>,
-    /// The `from` methods of the workspace's `From` impls, which a `?` invokes
-    /// without naming one.
-    conversions: Vec<ConversionImpl>,
-    /// The workspace's `Iterator` impls, which a `for` loop and an adaptor call
-    /// through the trait.
-    iterators: Vec<IteratorImpl>,
-    /// The `from_iter` methods of the workspace's `FromIterator` impls, which
-    /// a `collect` invokes without naming one.
-    collects: Vec<CollectImpl>,
+    /// The code ranges that are inactive under the analysed configuration, by
+    /// file and sorted by their start.
+    inactive: HashMap<RelPath, Vec<Span>>,
+    /// The functions of the workspace's trait impls, by trait, which a call
+    /// through the trait may dispatch to.
+    impl_fns: HashMap<Trait, Vec<ImplFn>>,
+    /// The implicitly called standard traits the workspace implements.
+    implicit: HashMap<Implicit, Trait>,
     /// The operator traits the workspace implements.
     ///
     /// Resolving an operator to ask what it calls forces the type inference of
@@ -369,48 +306,19 @@ struct Collector<'a, 'db> {
     /// that call, because the tokens of the inner call are part of the outer call
     /// in the real file.
     expansion_site: Option<Location>,
-    /// Records the time spent in each kind of work.
-    profile: Profile,
-    /// The time each file took, by the file of its regions.
-    file_times: HashMap<HirFileId, FileCounters>,
 }
 
-impl Collector<'_, '_> {
+impl<'db> Collector<'_, 'db> {
     /// Walks every region and adds the edges that do not come from a region.
     fn run(&mut self) {
         for container in self.input.containers {
             if let Some(DefKey::Impl(block)) = container.def {
-                self.impls.push((container.id, block));
-            }
-        }
-        for index in 0..self.impls.len() {
-            let (id, block) = self.impls[index];
-            self.implements(id, block);
-        }
-        for index in 0..self.impls.len() {
-            let (_, block) = self.impls[index];
-            if let Some(found) = self.formatting_impl(block) {
-                self.formatting.push(found);
-            }
-            if let Some(found) = self.conversion_impl(block) {
-                self.conversions.push(found);
-            }
-            if let Some(found) = self.iterator_impl(block) {
-                self.iterators.push(found);
-            }
-            if let Some(found) = self.collect_impl(block) {
-                self.collects.push(found);
-            }
-            if let Some(name) = self.operator_trait(block) {
-                self.operators.insert(name);
+                self.index_impl(container.id, block);
             }
         }
         for container in self.input.containers {
-            let edges_before = self.edges.len();
-            let unresolved_before = self.unresolved.len();
-            let start = self.profile.start();
             // The semantics can only resolve nodes of trees it has parsed.
-            self.timed(Kind::Parse, || {
+            self.guard(|| {
                 self.input.sema.parse_or_expand(container.file);
                 Some(())
             });
@@ -419,35 +327,65 @@ impl Collector<'_, '_> {
             self.attrs(&container.node, container.file, container.id);
             self.visit(&container.node, container.id, 0, true);
             self.quiet = previous;
-            if let Some(start) = start {
-                let duration = start.elapsed();
-                self.profile.add(Kind::Visit, duration, 1);
-                let counters = self.file_times.entry(container.file).or_default();
-                counters.duration += duration;
-                counters.containers += 1;
-                counters.references += ((self.edges.len() - edges_before)
-                    + (self.unresolved.len() - unresolved_before))
-                    as u64;
-            }
         }
         self.generated_items();
         self.sort_unresolved();
     }
 
-    /// Times one rust-analyzer query.
-    fn timed<T>(&self, kind: Kind, query: impl FnOnce() -> Option<T>) -> Option<T> {
-        let start = self.profile.start();
-        let result = self.guard(query);
-        self.profile.finish(kind, start);
-        result
-    }
-
-    /// Adds the `Implements` edges of one trait impl block.
-    fn implements(&mut self, id: SymbolId, block: Impl) {
+    /// Adds the `Implements` edges of one impl block and records the functions
+    /// of a trait impl, which calls through the trait may dispatch to.
+    fn index_impl(&mut self, id: SymbolId, block: Impl) {
         let db = self.input.db;
-        let Some(trait_) = self.timed(Kind::Implements, || block.trait_(db)) else {
+        let Some(trait_) = self.guard(|| block.trait_(db)) else {
             return;
         };
+        let items = self.guard(|| Some(block.items(db))).unwrap_or_default();
+        self.implements(id, trait_, &items);
+        let Some(name) = self.guard(|| Some(trait_.name(db))) else {
+            return;
+        };
+        let standard = self.is_std(trait_);
+        if let Some(operator) = OPERATOR_TRAITS
+            .iter()
+            .find(|known| standard && **known == name.as_str())
+        {
+            self.operators.insert(operator);
+        }
+        let family = IMPLICIT
+            .iter()
+            .find(|(_, known, _)| standard && *known == name.as_str())
+            .map(|(family, _, _)| *family);
+        if let Some(family) = family {
+            self.implicit.insert(family, trait_);
+        }
+        let ty = self.guard(|| {
+            let ty = if family == Some(Implicit::From) {
+                // The first argument of `From<T>` is the `Self` type, so the
+                // second is the type the conversion takes.
+                block.trait_ref(db)?.get_type_argument(1)?
+            } else {
+                block.self_ty(db)
+            };
+            ty.strip_references().as_adt()
+        });
+        for item in items {
+            let AssocItem::Function(function) = item else {
+                continue;
+            };
+            let (Some(symbol), Some(name)) = (
+                self.input.symbols.assoc_item(item),
+                self.guard(|| Some(function.name(db))),
+            ) else {
+                continue;
+            };
+            let found = ImplFn { ty, name, symbol };
+            self.impl_fns.entry(trait_).or_default().push(found);
+        }
+    }
+
+    /// Adds the `Implements` edges of one trait impl block: from the block to
+    /// the trait, and from each item to the trait item it implements.
+    fn implements(&mut self, id: SymbolId, trait_: Trait, items: &[AssocItem]) {
         let site = self.symbol_location(id);
         if let Some(trait_id) = self.input.symbols.get(DefKey::Trait(trait_)) {
             self.push(
@@ -459,10 +397,7 @@ impl Collector<'_, '_> {
                 EdgeDetail::None,
             );
         }
-        let Some(items) = self.timed(Kind::Implements, || Some(block.items(db))) else {
-            return;
-        };
-        for item in items {
+        for &item in items {
             let Some(item_id) = self.input.symbols.assoc_item(item) else {
                 continue;
             };
@@ -484,105 +419,64 @@ impl Collector<'_, '_> {
         }
     }
 
-    /// The formatting impl a block provides, if it is one of the standard
-    /// traits.
-    ///
-    /// A `Display` the project defines itself is a trait like any other: its
-    /// methods are called by name, so only the standard library's traits are
-    /// recorded, and only their `fmt` is invoked implicitly.
-    fn formatting_impl(&mut self, block: Impl) -> Option<FormattingImpl> {
+    /// Whether a trait belongs to the standard library.
+    fn is_std(&self, trait_: Trait) -> bool {
         let db = self.input.db;
-        let trait_ = self.timed(Kind::Dispatch, || block.trait_(db))?;
-        let standard = self.timed(Kind::Dispatch, || {
+        self.guard(|| {
             Some(matches!(
                 trait_.module(db).krate(db).origin(db),
                 CrateOrigin::Lang(_)
             ))
-        })?;
-        if !standard {
-            return None;
-        }
-        let trait_ = self.timed(Kind::Dispatch, || Some(trait_.name(db)))?;
-        let trait_ = match trait_.as_str() {
-            "Display" => FormattingTrait::Display,
-            "Debug" => FormattingTrait::Debug,
-            _ => return None,
-        };
-        let fmt = self.timed(Kind::Dispatch, || {
-            block.items(db).into_iter().find_map(|item| match item {
-                AssocItem::Function(function) if function.name(db).as_str() == "fmt" => {
-                    Some(function)
-                }
-                _ => None,
-            })
-        })?;
-        let symbol = self.input.symbols.assoc_item(AssocItem::Function(fmt))?;
-        let self_ty = self.timed(Kind::InferType, || {
-            block.self_ty(db).strip_references().as_adt()
-        });
-        Some(FormattingImpl {
-            trait_,
-            self_ty,
-            symbol,
         })
+        .unwrap_or(false)
     }
 
-    /// The conversion impl a block provides, if it implements the standard
-    /// `From`.
+    /// The standard trait a function is a method of, and the function's own
+    /// name: `("ToString", "to_string")`.
     ///
-    /// A `From` the project defines itself is a trait like any other: its
-    /// methods are called by name, so only the standard library's is invoked by
-    /// `?` without one.
-    fn conversion_impl(&mut self, block: Impl) -> Option<ConversionImpl> {
+    /// A method of an impl counts as a method of the trait it implements, so
+    /// the blanket impls of the standard library are found too.
+    fn std_method(&self, function: Function) -> Option<(Name, Name)> {
         let db = self.input.db;
-        let reference = self.timed(Kind::Dispatch, || block.trait_ref(db))?;
-        let trait_ = self.timed(Kind::Dispatch, || Some(reference.trait_()))?;
-        let standard = self.timed(Kind::Dispatch, || {
-            Some(matches!(
-                trait_.module(db).krate(db).origin(db),
-                CrateOrigin::Lang(_)
-            ))
+        let trait_ = self.guard(|| match function.as_assoc_item(db)?.container(db) {
+            AssocItemContainer::Trait(trait_) => Some(trait_),
+            AssocItemContainer::Impl(block) => block.trait_(db),
         })?;
-        if !standard
-            || self
-                .timed(Kind::Dispatch, || Some(trait_.name(db)))?
-                .as_str()
-                != "From"
-        {
+        if !self.is_std(trait_) {
             return None;
         }
-        let from = self.timed(Kind::Dispatch, || {
-            block.items(db).into_iter().find_map(|item| match item {
-                AssocItem::Function(function) if function.name(db).as_str() == "from" => {
-                    Some(function)
-                }
-                _ => None,
-            })
-        })?;
-        let symbol = self.input.symbols.assoc_item(AssocItem::Function(from))?;
-        // The first argument of `From<T>` is the `Self` type, so the second is
-        // the error type the conversion takes.
-        let source = self.timed(Kind::InferType, || {
-            reference.get_type_argument(1)?.strip_references().as_adt()
-        });
-        Some(ConversionImpl { source, symbol })
+        self.guard(|| Some((trait_.name(db), function.name(db))))
     }
 
-    /// Adds the dispatch edges of one `?`, which converts its operand's error
-    /// through `From`.
+    /// Whether the workspace implements one of the implicitly called standard
+    /// traits, which is what makes a use of it worth looking at.
+    fn implements_std(&self, family: Implicit) -> bool {
+        self.implicit.contains_key(&family)
+    }
+
+    /// Adds the dispatch edges of one implicit call of a standard trait.
     ///
-    /// Which impl runs is decided by that error type, which is the second
-    /// argument of the operand's `Result`; a `?` whose type this pass cannot
-    /// read reaches every impl, as a coarse candidate.
-    fn conversion_use(&mut self, from: SymbolId, node: &SyntaxNode, error: ValueType) {
-        let Some(site) = self.site(node) else {
+    /// Nothing in the syntax names the impl that runs: the type of the value
+    /// decides it, and a value whose type this pass cannot name reaches every
+    /// impl of the trait, as a coarse candidate.
+    fn dispatch_use(
+        &mut self,
+        from: SymbolId,
+        site: &Location,
+        family: Implicit,
+        value: ValueType,
+    ) {
+        let Some(trait_) = self.implicit.get(&family) else {
             return;
         };
+        let methods = family.methods();
         let targets: Vec<SymbolId> = self
-            .conversions
-            .iter()
-            .filter(|impl_| error.can_reach(impl_.source))
-            .map(|impl_| impl_.symbol)
+            .impl_fns
+            .get(trait_)
+            .into_iter()
+            .flatten()
+            .filter(|found| methods.contains(&found.name.as_str()) && value.can_reach(found.ty))
+            .map(|found| found.symbol)
             .collect();
         for target in targets {
             self.push(
@@ -596,194 +490,24 @@ impl Collector<'_, '_> {
         }
     }
 
-    /// The iterator impl a block provides, if it implements the standard
-    /// `Iterator`.
-    fn iterator_impl(&mut self, block: Impl) -> Option<IteratorImpl> {
-        let db = self.input.db;
-        let reference = self.timed(Kind::Dispatch, || block.trait_ref(db))?;
-        let trait_ = self.timed(Kind::Dispatch, || Some(reference.trait_()))?;
-        let standard = self.timed(Kind::Dispatch, || {
-            Some(matches!(
-                trait_.module(db).krate(db).origin(db),
-                CrateOrigin::Lang(_)
-            ))
-        })?;
-        if !standard
-            || self
-                .timed(Kind::Dispatch, || Some(trait_.name(db)))?
-                .as_str()
-                != "Iterator"
+    /// The same, for an implicit call written at `node`.
+    fn dispatch_at(
+        &mut self,
+        from: SymbolId,
+        node: &SyntaxNode,
+        family: Implicit,
+        value: ValueType,
+    ) {
+        if self.implements_std(family)
+            && let Some(site) = self.site(node)
         {
-            return None;
-        }
-        let mut symbols = Vec::new();
-        for item in self.timed(Kind::Dispatch, || Some(block.items(db)))? {
-            let AssocItem::Function(function) = item else {
-                continue;
-            };
-            let name = self.timed(Kind::Dispatch, || Some(function.name(db)))?;
-            if name.as_str() != "next" && name.as_str() != "size_hint" {
-                continue;
-            }
-            if let Some(id) = self.input.symbols.assoc_item(item) {
-                symbols.push(id);
-            }
-        }
-        if symbols.is_empty() {
-            return None;
-        }
-        let self_ty = self.timed(Kind::InferType, || {
-            block.self_ty(db).strip_references().as_adt()
-        });
-        Some(IteratorImpl { self_ty, symbols })
-    }
-
-    /// Adds the dispatch edges of one use of the iterator protocol.
-    ///
-    /// A `for` loop and every adaptor call `next` (and `size_hint`) through the
-    /// trait, so no reference in the syntax names the impl of the iterator the
-    /// loop was given. The iterator's type decides which impl can run; one this
-    /// pass cannot name reaches every impl, as a coarse candidate.
-    fn iterator_use(&mut self, from: SymbolId, node: &SyntaxNode, iterator: ValueType) {
-        let Some(site) = self.site(node) else {
-            return;
-        };
-        let targets: Vec<SymbolId> = self
-            .iterators
-            .iter()
-            .filter(|impl_| iterator.can_reach(impl_.self_ty))
-            .flat_map(|impl_| impl_.symbols.iter().copied())
-            .collect();
-        for target in targets {
-            self.push(
-                from,
-                target,
-                EdgeKind::MayDispatchTo,
-                Certainty::Candidate,
-                site.clone(),
-                EdgeDetail::None,
-            );
-        }
-    }
-
-    /// Whether a function is one of the iterator protocol's methods.
-    fn is_iterator_method(&mut self, function: Function) -> bool {
-        let db = self.input.db;
-        self.timed(Kind::Dispatch, || {
-            let container = function.as_assoc_item(db)?.container(db);
-            let trait_ = match container {
-                AssocItemContainer::Trait(trait_) => trait_,
-                AssocItemContainer::Impl(block) => block.trait_(db)?,
-            };
-            Some(
-                trait_.name(db).as_str() == "Iterator"
-                    && matches!(trait_.module(db).krate(db).origin(db), CrateOrigin::Lang(_)),
-            )
-        }) == Some(true)
-    }
-
-    /// The collection impl a block provides, if it implements the standard
-    /// `FromIterator`.
-    ///
-    /// `collect` builds a collection by calling the `from_iter` of the type it
-    /// is asked for, so a `from_iter` of this workspace runs without any
-    /// reference naming it.
-    fn collect_impl(&mut self, block: Impl) -> Option<CollectImpl> {
-        let db = self.input.db;
-        let reference = self.timed(Kind::Dispatch, || block.trait_ref(db))?;
-        let trait_ = self.timed(Kind::Dispatch, || Some(reference.trait_()))?;
-        let standard = self.timed(Kind::Dispatch, || {
-            Some(matches!(
-                trait_.module(db).krate(db).origin(db),
-                CrateOrigin::Lang(_)
-            ))
-        })?;
-        if !standard
-            || self
-                .timed(Kind::Dispatch, || Some(trait_.name(db)))?
-                .as_str()
-                != "FromIterator"
-        {
-            return None;
-        }
-        let from_iter = self.timed(Kind::Dispatch, || {
-            block.items(db).into_iter().find_map(|item| match item {
-                AssocItem::Function(function) if function.name(db).as_str() == "from_iter" => {
-                    Some(function)
-                }
-                _ => None,
-            })
-        })?;
-        let symbol = self
-            .input
-            .symbols
-            .assoc_item(AssocItem::Function(from_iter))?;
-        let self_ty = self.timed(Kind::InferType, || {
-            block.self_ty(db).strip_references().as_adt()
-        });
-        Some(CollectImpl { self_ty, symbol })
-    }
-
-    /// Adds the dispatch edges of one `collect`, which builds the collection by
-    /// calling the `from_iter` of its type.
-    ///
-    /// The type of the call decides which impl can run; a collection type this
-    /// pass cannot name reaches every impl, as a coarse candidate.
-    fn collect_use(&mut self, from: SymbolId, node: &SyntaxNode, collection: ValueType) {
-        let Some(site) = self.site(node) else {
-            return;
-        };
-        let targets: Vec<SymbolId> = self
-            .collects
-            .iter()
-            .filter(|impl_| collection.can_reach(impl_.self_ty))
-            .map(|impl_| impl_.symbol)
-            .collect();
-        for target in targets {
-            self.push(
-                from,
-                target,
-                EdgeKind::MayDispatchTo,
-                Certainty::Candidate,
-                site.clone(),
-                EdgeDetail::None,
-            );
-        }
-    }
-
-    /// Whether a function is the standard `Iterator::collect`, which builds a
-    /// collection through `FromIterator`.
-    fn is_collect(&mut self, function: Function) -> bool {
-        let db = self.input.db;
-        self.timed(Kind::Dispatch, || {
-            let container = function.as_assoc_item(db)?.container(db);
-            let trait_ = match container {
-                AssocItemContainer::Trait(trait_) => trait_,
-                AssocItemContainer::Impl(block) => block.trait_(db)?,
-            };
-            Some(
-                function.name(db).as_str() == "collect"
-                    && trait_.name(db).as_str() == "Iterator"
-                    && matches!(trait_.module(db).krate(db).origin(db), CrateOrigin::Lang(_)),
-            )
-        }) == Some(true)
-    }
-
-    /// Visits a `for` loop, whose iteration calls the iterator's own `next`.
-    fn for_expr(&mut self, expr: &ast::ForExpr, from: SymbolId, depth: u32) {
-        if let Some(iterable) = expr.iterable() {
-            let iterator = self.typed_value(&iterable);
-            self.iterator_use(from, iterable.syntax(), iterator);
-            self.visit(iterable.syntax(), from, depth, false);
-        }
-        if let Some(body) = expr.loop_body() {
-            self.visit(body.syntax(), from, depth, false);
+            self.dispatch_use(from, &site, family, value);
         }
     }
 
     /// The error type of the operand of a `?`.
     fn error_type(&mut self, expr: &ast::Expr) -> ValueType {
-        let Some(info) = self.timed(Kind::InferType, || self.input.sema.type_of_expr(expr)) else {
+        let Some(info) = self.guard(|| self.input.sema.type_of_expr(expr)) else {
             return ValueType::Unknown;
         };
         let ty = info.original.strip_references();
@@ -804,82 +528,30 @@ impl Collector<'_, '_> {
         }
     }
 
-    /// Adds the dispatch edges of one formatting invocation.
-    ///
-    /// A format string calls the `fmt` of the value it prints without naming
-    /// it, so no reference in the syntax resolves to the implementation. The
-    /// value's type decides which impl can run; a value whose type this pass
-    /// cannot name reaches every impl of the trait, as a coarse candidate.
-    fn formatting_use(
-        &mut self,
-        from: SymbolId,
-        site: Location,
-        traits: &[FormattingTrait],
-        value: ValueType,
-    ) {
-        let targets: Vec<SymbolId> = self
-            .formatting
-            .iter()
-            .filter(|impl_| traits.contains(&impl_.trait_) && value.can_reach(impl_.self_ty))
-            .map(|impl_| impl_.symbol)
-            .collect();
-        for target in targets {
-            self.push(
-                from,
-                target,
-                EdgeKind::MayDispatchTo,
-                Certainty::Candidate,
-                site.clone(),
-                EdgeDetail::None,
-            );
-        }
-    }
-
-    /// The same, for a formatting use written at a node.
-    fn formatting_site(
-        &mut self,
-        from: SymbolId,
-        node: &SyntaxNode,
-        traits: &[FormattingTrait],
-        value: ValueType,
-    ) {
-        let Some(site) = self.site(node) else {
-            return;
-        };
-        self.formatting_use(from, site, traits, value);
-    }
-
     /// Which formatting impls one name of a format string can reach.
     ///
     /// A name in a template is not an expression, so it has no syntax node to
     /// infer: a local's type is read from its binding, a constant's from its
     /// declaration, and a unit struct or variant is its own type.
-    fn typed_resolution(&mut self, resolution: PathResolution<'_>) -> Option<ValueType> {
+    fn typed_definition(&mut self, def: Definition<'_>) -> Option<ValueType> {
         let db = self.input.db;
-        let ty = match resolution {
-            PathResolution::Local(local) => {
-                Some(self.timed(Kind::InferType, || Some(local.ty(db)))?)
+        let ty = match def {
+            Definition::Local(local) => self.guard(|| Some(local.ty(db)))?,
+            Definition::Const(item) => self.guard(|| Some(item.ty(db)))?,
+            Definition::Static(item) => self.guard(|| Some(item.ty(db)))?,
+            Definition::Adt(adt) => return Some(ValueType::Data(adt)),
+            Definition::EnumVariant(variant) => {
+                let parent = self.guard(|| Some(variant.parent_enum(db)))?;
+                return Some(ValueType::Data(Adt::Enum(parent)));
             }
-            PathResolution::Def(ModuleDef::Const(item)) => {
-                Some(self.timed(Kind::InferType, || Some(item.ty(db)))?)
-            }
-            PathResolution::Def(ModuleDef::Static(item)) => {
-                Some(self.timed(Kind::InferType, || Some(item.ty(db)))?)
-            }
-            PathResolution::Def(ModuleDef::Adt(adt)) => return Some(ValueType::Data(adt)),
-            PathResolution::Def(ModuleDef::EnumVariant(variant)) => {
-                return Some(ValueType::Data(Adt::Enum(
-                    self.timed(Kind::ResolveDef, || Some(variant.parent_enum(db)))?,
-                )));
-            }
-            _ => None,
+            _ => return None,
         };
-        ty.map(|ty| self.value_of_type(ty))
+        Some(self.value_of_type(ty))
     }
 
     /// Which formatting impls the value of one expression can reach.
     fn typed_value(&mut self, expr: &ast::Expr) -> ValueType {
-        let Some(info) = self.timed(Kind::InferType, || self.input.sema.type_of_expr(expr)) else {
+        let Some(info) = self.guard(|| self.input.sema.type_of_expr(expr)) else {
             return ValueType::Unknown;
         };
         self.value_of_type(info.original)
@@ -898,7 +570,7 @@ impl Collector<'_, '_> {
         }
         let db = self.input.db;
         if self
-            .timed(Kind::InferType, || Some(ty.as_type_param(db).is_some()))
+            .guard(|| Some(ty.as_type_param(db).is_some()))
             .unwrap_or(false)
         {
             return ValueType::Unknown;
@@ -911,11 +583,10 @@ impl Collector<'_, '_> {
     /// The item of `trait_` that `item` of an impl block implements.
     fn trait_item(&self, trait_: Trait, item: AssocItem) -> Option<AssocItem> {
         let db = self.input.db;
-        let name = self.timed(Kind::Implements, || item.name(db))?;
-        let items = self.timed(Kind::Implements, || Some(trait_.items(db)))?;
+        let name = self.guard(|| item.name(db))?;
+        let items = self.guard(|| Some(trait_.items(db)))?;
         items.into_iter().find(|candidate| {
-            same_kind(*candidate, item)
-                && self.timed(Kind::Implements, || candidate.name(db)) == Some(name.clone())
+            same_kind(*candidate, item) && self.guard(|| candidate.name(db)) == Some(name.clone())
         })
     }
 
@@ -923,6 +594,12 @@ impl Collector<'_, '_> {
     ///
     /// `root` is true for the node the region was made from, which is in
     /// [`Collector::regions`] like every nested region and must still be walked.
+    ///
+    /// A reference is a [`ast::NameRef`] or a [`ast::Path`], which rust-analyzer
+    /// classifies the way find-references does; the syntax around it decides
+    /// what kind of edge it is. The calls nothing in the syntax names (an
+    /// operator, a `?`, a `for` loop, a format string) are added by
+    /// [`Collector::implicit`].
     fn visit(&mut self, node: &SyntaxNode, from: SymbolId, depth: u32, root: bool) {
         if !root && self.regions.contains(node) {
             return;
@@ -937,70 +614,590 @@ impl Collector<'_, '_> {
             self.macro_call(&call, from, depth);
             return;
         }
-        if let Some(call) = ast::CallExpr::cast(node.clone()) {
-            self.call_expr(&call, from, depth);
+        if let Some(path) = ast::Path::cast(node.clone()) {
+            self.path(&path, from, depth);
             return;
         }
-        if let Some(call) = ast::MethodCallExpr::cast(node.clone()) {
-            self.method_call(&call, from, depth);
+        if let Some(name_ref) = ast::NameRef::cast(node.clone()) {
+            self.name_ref(&name_ref, from);
             return;
         }
-        if let Some(field) = ast::FieldExpr::cast(node.clone()) {
-            self.field_expr(&field, from, depth);
+        if let Some(name) = ast::Name::cast(node.clone()) {
+            self.name(&name, from);
             return;
         }
-        if let Some(expr) = ast::RecordExpr::cast(node.clone()) {
-            self.record_expr(&expr, from, depth);
-            return;
+        self.implicit(node, from);
+        for child in node.children() {
+            self.visit(&child, from, depth, false);
         }
+    }
+
+    /// Adds the edges of the calls that one node makes without naming them.
+    fn implicit(&mut self, node: &SyntaxNode, from: SymbolId) {
         if let Some(expr) = ast::MatchExpr::cast(node.clone()) {
-            self.match_expr(&expr, from, depth);
-            return;
-        }
-        if let Some(pat) = ast::RecordPat::cast(node.clone()) {
-            self.record_pat(&pat, from, depth);
-            return;
-        }
-        if let Some(pat) = ast::TupleStructPat::cast(node.clone()) {
-            self.pattern_path(pat.path(), pat.syntax(), from, tuple_struct_has_rest(&pat));
-            self.tuple_pattern_fields(&pat, from);
-            for field in pat.fields() {
-                self.visit(field.syntax(), from, depth, false);
+            self.match_expr(&expr, from);
+        } else if let Some(expr) = ast::ForExpr::cast(node.clone()) {
+            // A `for` loop calls the iterator's own `next`.
+            if let Some(iterable) = expr.iterable()
+                && self.implements_std(Implicit::Iterator)
+            {
+                let iterator = self.typed_value(&iterable);
+                self.dispatch_at(from, iterable.syntax(), Implicit::Iterator, iterator);
             }
-            return;
-        }
-        if let Some(pat) = ast::PathPat::cast(node.clone()) {
-            self.pattern_path(pat.path(), pat.syntax(), from, false);
-            return;
-        }
-        if let Some(expr) = ast::FormatArgsExpr::cast(node.clone()) {
-            self.format_args(&expr, from, depth);
-            return;
-        }
-        if let Some(expr) = ast::TryExpr::cast(node.clone()) {
-            self.try_expr(&expr, from, depth);
-            return;
-        }
-        if let Some(expr) = ast::ForExpr::cast(node.clone()) {
-            self.for_expr(&expr, from, depth);
-            return;
-        }
-        if let Some(expr) = ast::PathExpr::cast(node.clone()) {
-            self.path_expr(&expr, from, depth);
-            return;
-        }
-        if ast::BinExpr::can_cast(node.kind())
+        } else if let Some(expr) = ast::TryExpr::cast(node.clone()) {
+            // A `?` runs `From::from` on the error type of its operand.
+            if let Some(operand) = expr.expr()
+                && self.implements_std(Implicit::From)
+            {
+                let error = self.error_type(&operand);
+                self.dispatch_at(from, expr.syntax(), Implicit::From, error);
+            }
+        } else if let Some(expr) = ast::FormatArgsExpr::cast(node.clone()) {
+            self.format_args(&expr, from);
+        } else if ast::BinExpr::can_cast(node.kind())
             || ast::PrefixExpr::can_cast(node.kind())
             || ast::IndexExpr::can_cast(node.kind())
         {
             self.operator_expr(node, from);
         }
-        if let Some(ty) = ast::PathType::cast(node.clone()) {
-            self.path_type(&ty, from, depth);
+    }
+
+    /// The definition a name reference refers to.
+    fn classify(&self, name_ref: &ast::NameRef) -> Option<Definition<'db>> {
+        self.guard(
+            || match NameRefClass::classify(self.input.sema, name_ref)? {
+                NameRefClass::Definition(def, _) => Some(def),
+                NameRefClass::FieldShorthand { field_ref, .. } => {
+                    Some(Definition::Field(field_ref))
+                }
+                NameRefClass::ExternCrateShorthand { .. } => None,
+            },
+        )
+    }
+
+    /// The definition a path refers to, which is what its last segment names.
+    fn resolve(&self, path: &ast::Path) -> Option<Definition<'db>> {
+        match path.segment().and_then(|segment| segment.name_ref()) {
+            Some(name_ref) => self.classify(&name_ref),
+            None => self
+                .guard(|| self.input.sema.resolve_path(path))
+                .map(Definition::from),
+        }
+    }
+
+    /// The symbol of a definition, if it produced one.
+    fn symbol(&self, def: Definition<'_>) -> Option<SymbolId> {
+        let key = match def {
+            Definition::Module(it) => DefKey::Module(it),
+            Definition::Function(it) => DefKey::Function(it),
+            Definition::Adt(it) => DefKey::Adt(it),
+            Definition::EnumVariant(it) => DefKey::Variant(it),
+            Definition::Field(it) => DefKey::Field(it),
+            Definition::Const(it) => DefKey::Const(it),
+            Definition::Static(it) => DefKey::Static(it),
+            Definition::Trait(it) => DefKey::Trait(it),
+            Definition::TypeAlias(it) => DefKey::TypeAlias(it),
+            Definition::Macro(it) => DefKey::Macro(it),
+            Definition::SelfType(it) => DefKey::Impl(it),
+            _ => return None,
+        };
+        self.input.symbols.get(key)
+    }
+
+    /// Adds the edges of a path, by where it is written.
+    ///
+    /// Only the whole path is a reference: its qualifier names the scope it
+    /// is found in. The generic arguments of a path in an expression or a type
+    /// are type positions of their own.
+    fn path(&mut self, path: &ast::Path, from: SymbolId, depth: u32) {
+        let Some(parent) = path.syntax().parent() else {
+            return;
+        };
+        if let Some(expr) = ast::PathExpr::cast(parent.clone()) {
+            self.path_expr(path, &expr, from);
+        } else if ast::PathType::can_cast(parent.kind()) {
+            match self.resolve(path) {
+                Some(
+                    def @ (Definition::Adt(_) | Definition::Trait(_) | Definition::TypeAlias(_)),
+                ) => {
+                    self.edge_to(
+                        def,
+                        from,
+                        EdgeKind::UsesType,
+                        path.syntax(),
+                        EdgeDetail::None,
+                    );
+                }
+                Some(_) => {}
+                None => self.record_unresolved_path(path),
+            }
+        } else if ast::PathPat::can_cast(parent.kind()) {
+            self.pattern_path(path, &parent, from, false);
+            return;
+        } else if let Some(pat) = ast::TupleStructPat::cast(parent.clone()) {
+            let rest = pat
+                .fields()
+                .any(|field| matches!(field, ast::Pat::RestPat(_)));
+            if let Some(def) = self.pattern_path(path, &parent, from, rest) {
+                self.tuple_pattern_fields(&pat, def, from);
+            }
+            return;
+        } else if let Some(pat) = ast::RecordPat::cast(parent.clone()) {
+            let rest = pat
+                .record_pat_field_list()
+                .is_some_and(|list| list.rest_pat().is_some());
+            self.pattern_path(path, &parent, from, rest);
+            return;
+        } else if let Some(expr) = ast::RecordExpr::cast(parent.clone()) {
+            self.record_expr(path, &expr, from);
+        } else {
             return;
         }
-        for child in node.children() {
-            self.visit(&child, from, depth, false);
+        self.type_arguments(path, from, depth);
+    }
+
+    /// Adds the edges of a path in value position: a call, a constructor, a
+    /// value, or the value of a shorthand field of a literal.
+    fn path_expr(&mut self, path: &ast::Path, expr: &ast::PathExpr, from: SymbolId) {
+        let parent = expr.syntax().parent();
+        if let Some(call) = parent.clone().and_then(ast::CallExpr::cast)
+            && call
+                .expr()
+                .is_some_and(|callee| callee.syntax() == expr.syntax())
+        {
+            let def = self.resolve(path);
+            match def {
+                Some(Definition::Function(function)) => self.call_to(function, from, path.syntax()),
+                // `Wrapper(1)` and `State::Busy(1)` are constructor calls.
+                Some(def @ (Definition::Adt(_) | Definition::EnumVariant(_))) => {
+                    self.constructs(def, from, path.syntax(), false);
+                }
+                Some(_) => {}
+                None => self.record_unresolved_path(path),
+            }
+            if let Some(def) = def {
+                self.tuple_literal_fields(def, call.arg_list(), from);
+            }
+            return;
+        }
+        let mut def = self.resolve(path);
+        // `Point { x }` names the field `x` and takes the value `x`.
+        if let Some(field) = parent.and_then(ast::RecordExprField::cast)
+            && field.name_ref().is_none()
+            && let Some(Definition::Field(target)) = def
+        {
+            self.literal_field(target, field.syntax(), from);
+            def = self
+                .guard(|| self.input.sema.resolve_path(path))
+                .map(Definition::from);
+        }
+        let Some(def) = def else {
+            self.record_unresolved_path(path);
+            return;
+        };
+        if let Some(kind) = value_kind(def) {
+            self.edge_to(def, from, kind, path.syntax(), EdgeDetail::None);
+        }
+        // `map(ToString::to_string)` hands the formatting trait to a caller
+        // instead of calling it, so the value it formats is not named where it
+        // is formatted.
+        if let Definition::Function(function) = def
+            && is_to_string(self.std_method(function))
+        {
+            let value = ValueType::Unknown;
+            self.dispatch_at(from, path.syntax(), Implicit::Display, value);
+        }
+    }
+
+    /// Adds the edges of a name reference that is not a path: a method, a
+    /// field, or the field of a literal or a pattern.
+    fn name_ref(&mut self, name_ref: &ast::NameRef, from: SymbolId) {
+        let Some(parent) = name_ref.syntax().parent() else {
+            return;
+        };
+        if let Some(call) = ast::MethodCallExpr::cast(parent.clone()) {
+            match self.classify(name_ref) {
+                Some(Definition::Function(function)) => {
+                    self.method_call(function, &call, name_ref, from);
+                }
+                Some(def @ Definition::Field(_)) => {
+                    let kind = EdgeKind::ReadsField;
+                    self.edge_to(def, from, kind, name_ref.syntax(), EdgeDetail::None);
+                }
+                Some(_) => {}
+                None => self.record_unresolved_name(name_ref),
+            }
+        } else if ast::FieldExpr::can_cast(parent.kind()) {
+            match self.classify(name_ref) {
+                Some(def @ Definition::Field(_)) => {
+                    let kind = if is_write_target(&parent) {
+                        EdgeKind::WritesField
+                    } else {
+                        EdgeKind::ReadsField
+                    };
+                    self.edge_to(def, from, kind, name_ref.syntax(), EdgeDetail::None);
+                }
+                // A field of a plain tuple has no symbol.
+                Some(Definition::TupleField(_)) => {}
+                _ => {
+                    if name_ref.as_tuple_field().is_none() {
+                        self.record_unresolved_name(name_ref);
+                    }
+                }
+            }
+        } else if ast::RecordExprField::can_cast(parent.kind()) {
+            if let Some(Definition::Field(field)) = self.classify(name_ref) {
+                self.literal_field(field, name_ref.syntax(), from);
+            }
+        } else if ast::RecordPatField::can_cast(parent.kind())
+            && let Some(Definition::Field(field)) = self.classify(name_ref)
+        {
+            self.pattern_field(field, &parent, from);
+        }
+    }
+
+    /// Adds the edge of a name a pattern binds: the field of a shorthand
+    /// (`Point { x }`), or the constant or unit variant a bare name matches
+    /// (`MAX`, or `Idle` after `use State::*`).
+    fn name(&mut self, name: &ast::Name, from: SymbolId) {
+        let Some(pat) = name.syntax().parent().and_then(ast::IdentPat::cast) else {
+            return;
+        };
+        match self.guard(|| NameClass::classify(self.input.sema, name)) {
+            Some(NameClass::PatFieldShorthand { field_ref, .. }) => {
+                if let Some(field) = pat.syntax().parent() {
+                    self.pattern_field(field_ref, &field, from);
+                }
+            }
+            Some(NameClass::ConstReference(
+                def @ (Definition::Adt(_) | Definition::EnumVariant(_) | Definition::Const(_)),
+            )) => {
+                let detail = self.match_detail(pat.syntax());
+                self.edge_to(def, from, EdgeKind::Matches, pat.syntax(), detail);
+            }
+            _ => {}
+        }
+    }
+
+    /// Adds the edges of a method call to `function`.
+    fn method_call(
+        &mut self,
+        function: Function,
+        call: &ast::MethodCallExpr,
+        name_ref: &ast::NameRef,
+        from: SymbolId,
+    ) {
+        self.call_to(function, from, name_ref.syntax());
+        let called = self.std_method(function);
+        let receiver = call.receiver();
+        // `ToString::to_string` calls the `Display::fmt` of the receiver.
+        if let Some(receiver) = &receiver
+            && is_to_string(called.clone())
+            && self.implements_std(Implicit::Display)
+        {
+            let value = self.typed_value(receiver);
+            self.dispatch_at(from, receiver.syntax(), Implicit::Display, value);
+        }
+        let Some((trait_, method)) = called else {
+            return;
+        };
+        if trait_.as_str() != "Iterator" {
+            return;
+        }
+        // An adaptor call on an iterator runs the iterator's own `next` from
+        // inside the standard library.
+        if let Some(receiver) = &receiver
+            && self.implements_std(Implicit::Iterator)
+        {
+            let iterator = self.typed_value(receiver);
+            self.dispatch_at(from, name_ref.syntax(), Implicit::Iterator, iterator);
+        }
+        // `collect` builds the collection the type asks for through
+        // `FromIterator`, which nothing names.
+        if method.as_str() == "collect" && self.implements_std(Implicit::FromIterator) {
+            let collection = self.typed_value(&ast::Expr::MethodCallExpr(call.clone()));
+            self.dispatch_at(from, name_ref.syntax(), Implicit::FromIterator, collection);
+        }
+    }
+
+    /// Adds the `Constructs` edge of a struct or variant literal.
+    ///
+    /// `Self { .. }` and a type alias name the struct they stand for. A spread
+    /// leaves the other fields to the value it copies them from.
+    fn record_expr(&mut self, path: &ast::Path, expr: &ast::RecordExpr, from: SymbolId) {
+        let spread = expr
+            .record_expr_field_list()
+            .is_some_and(|list| list.spread().is_some());
+        let db = self.input.db;
+        let aliased = |adt: Adt| (!matches!(adt, Adt::Enum(_))).then_some(Definition::Adt(adt));
+        let target = match self.resolve(path) {
+            Some(Definition::SelfType(block)) => {
+                self.guard(|| block.self_ty(db).as_adt()).and_then(aliased)
+            }
+            Some(Definition::TypeAlias(alias)) => {
+                self.guard(|| alias.ty(db).as_adt()).and_then(aliased)
+            }
+            other => other,
+        };
+        match target {
+            // An enum is not a literal: only its path is located.
+            Some(def @ Definition::Adt(Adt::Enum(_))) => {
+                self.constructs(def, from, path.syntax(), spread);
+            }
+            Some(def @ (Definition::Adt(_) | Definition::EnumVariant(_))) => {
+                self.constructs(def, from, expr.syntax(), spread);
+            }
+            _ => {}
+        }
+    }
+
+    /// Adds the `WritesField` edge of a field named in a literal.
+    ///
+    /// A field named in a literal is not read: the literal itself is what
+    /// constructs the value. It does name the field, so a removed or retyped
+    /// field has to reach this site, and a field the literal leaves to a
+    /// `..base` does not.
+    fn literal_field(&mut self, field: Field, node: &SyntaxNode, from: SymbolId) {
+        let def = Definition::Field(field);
+        self.edge_to(def, from, EdgeKind::WritesField, node, EdgeDetail::None);
+    }
+
+    /// Adds the `Matches` edge of a field named in a record pattern.
+    fn pattern_field(&mut self, field: Field, node: &SyntaxNode, from: SymbolId) {
+        let detail = self.match_detail(node);
+        let def = Definition::Field(field);
+        self.edge_to(def, from, EdgeKind::Matches, node, detail);
+    }
+
+    /// Adds the `Matches` edge of an enum `match` on its scrutinee.
+    fn match_expr(&mut self, expr: &ast::MatchExpr, from: SymbolId) {
+        let Some(scrutinee) = expr.expr() else {
+            return;
+        };
+        let scrutinee_ty = self
+            .guard(|| self.input.sema.type_of_expr(&scrutinee))
+            .map(|info| info.original.strip_references());
+        if let Some(adt @ Adt::Enum(_)) = scrutinee_ty.and_then(|ty| ty.as_adt()) {
+            let detail = self.match_detail_of(expr);
+            let def = Definition::Adt(adt);
+            self.edge_to(def, from, EdgeKind::Matches, scrutinee.syntax(), detail);
+        }
+    }
+
+    /// Adds the `Matches` edge of a pattern that names a struct, variant or
+    /// constant, and returns what the pattern names.
+    ///
+    /// `rest` says that the pattern ends with `..`, which is recorded on the edge
+    /// to a struct or a variant: the pattern then matches whatever fields the
+    /// struct or variant grows, and leaves the fields it already has to be
+    /// checked individually.
+    fn pattern_path(
+        &mut self,
+        path: &ast::Path,
+        node: &SyntaxNode,
+        from: SymbolId,
+        rest: bool,
+    ) -> Option<Definition<'db>> {
+        let Some(def) = self.resolve(path) else {
+            self.record_unresolved_path(path);
+            return None;
+        };
+        let detail = match def {
+            Definition::Adt(Adt::Struct(_)) | Definition::EnumVariant(_) if rest => {
+                EdgeDetail::WithRest
+            }
+            Definition::Adt(_) | Definition::EnumVariant(_) | Definition::Const(_) => {
+                self.match_detail(node)
+            }
+            _ => return Some(def),
+        };
+        self.edge_to(def, from, EdgeKind::Matches, node, detail);
+        Some(def)
+    }
+
+    /// Visits the template of a format string.
+    ///
+    /// A captured argument (`format!("{NAME}")`) is only a name inside the
+    /// literal, so it has no syntax node of its own; the format machinery
+    /// resolves the names of the literal, and each of them is a value reference
+    /// like a path would be.
+    fn format_args(&mut self, expr: &ast::FormatArgsExpr, from: SymbolId) {
+        let template = expr
+            .syntax()
+            .descendants_with_tokens()
+            .filter_map(|child| child.into_token())
+            .find_map(ast::String::cast);
+        let traits = format_traits(&template);
+        if let Some(string) = template
+            && let Some(file) = string
+                .syntax()
+                .parent()
+                .and_then(|node| self.guard(|| Some(self.input.sema.hir_file_for(&node))))
+            && let Some(parts) = self.guard(|| self.input.sema.as_format_args_parts(&string))
+        {
+            for (range, resolution) in parts {
+                let Some(def) = resolution
+                    .and_then(|part| part.left())
+                    .map(Definition::from)
+                else {
+                    continue;
+                };
+                let Some(site) = self.guard(|| self.input.locate.location(file, range)) else {
+                    continue;
+                };
+                // A part that names an item is a value reference.
+                if let Some(kind) = value_kind(def)
+                    && let Some(id) = self.symbol(def)
+                {
+                    self.push(
+                        from,
+                        id,
+                        kind,
+                        Certainty::Resolved,
+                        site.clone(),
+                        EdgeDetail::None,
+                    );
+                }
+                // The part may also print a value, which runs the `fmt` of
+                // the value's formatting trait without naming it.
+                if traits.iter().any(|family| self.implements_std(*family))
+                    && let Some(value) = self.typed_definition(def)
+                {
+                    for &family in &traits {
+                        self.dispatch_use(from, &site, family, value);
+                    }
+                }
+            }
+        }
+        // The values the template prints are handed to `fmt` of the formatting
+        // traits it names, which is a dispatch no reference in the syntax
+        // resolves.
+        if traits.iter().any(|family| self.implements_std(*family)) {
+            for argument in expr
+                .syntax()
+                .children()
+                .filter_map(ast::FormatArgsArg::cast)
+            {
+                let Some(argument) = argument.expr() else {
+                    continue;
+                };
+                let value = self.typed_value(&argument);
+                for &family in &traits {
+                    self.dispatch_at(from, argument.syntax(), family, value);
+                }
+            }
+        }
+    }
+
+    /// Visits the generic arguments of a path, which are type positions of their
+    /// own (`Wrapper<Item>` uses `Item` as well).
+    fn type_arguments(&mut self, path: &ast::Path, from: SymbolId, depth: u32) {
+        let root = path.syntax();
+        let lists: Vec<SyntaxNode> = root
+            .descendants()
+            .filter_map(ast::GenericArgList::cast)
+            .map(|list| list.syntax().clone())
+            .filter(|list| {
+                !list
+                    .ancestors()
+                    .skip(1)
+                    .take_while(|parent| parent != root)
+                    .any(|parent| ast::GenericArgList::can_cast(parent.kind()))
+            })
+            .collect();
+        for list in &lists {
+            self.visit(list, from, depth, false);
+        }
+    }
+
+    /// The fields of a struct, union or variant, in declaration order.
+    fn fields_of(&self, def: Definition<'_>) -> Option<Vec<Field>> {
+        let db = self.input.db;
+        self.guard(|| match def {
+            Definition::Adt(Adt::Struct(it)) => Some(it.fields(db)),
+            Definition::Adt(Adt::Union(it)) => Some(it.fields(db)),
+            Definition::EnumVariant(it) => Some(it.fields(db)),
+            _ => None,
+        })
+    }
+
+    /// Adds a `WritesField` edge to every positional field a tuple constructor
+    /// literal supplies.
+    ///
+    /// `Wrapper(1)` names its field by position rather than by name; the field
+    /// it supplies is the one at that position.
+    fn tuple_literal_fields(
+        &mut self,
+        def: Definition<'_>,
+        args: Option<ast::ArgList>,
+        from: SymbolId,
+    ) {
+        let (Some(args), Some(fields)) = (args, self.fields_of(def)) else {
+            return;
+        };
+        for (arg, field) in args.args().zip(fields) {
+            self.literal_field(field, arg.syntax(), from);
+        }
+    }
+
+    /// Adds a `Matches` edge to every positional field a tuple pattern names.
+    ///
+    /// A pattern with a `..` does not line its fields up with the declaration
+    /// positions, so only a pattern that names every field gets one.
+    fn tuple_pattern_fields(
+        &mut self,
+        pat: &ast::TupleStructPat,
+        def: Definition<'_>,
+        from: SymbolId,
+    ) {
+        let Some(fields) = self.fields_of(def) else {
+            return;
+        };
+        let inner: Vec<ast::Pat> = pat.fields().collect();
+        if inner.len() != fields.len() {
+            return;
+        }
+        for (sub, field) in inner.iter().zip(fields) {
+            self.pattern_field(field, sub.syntax(), from);
+        }
+    }
+
+    /// Adds a `Constructs` edge to a struct, union or variant.
+    ///
+    /// `spread` says that the literal ends with `..base`, which is recorded on
+    /// the edge to a struct or a variant: only those can be given from another
+    /// value of their type.
+    fn constructs(&mut self, def: Definition<'_>, from: SymbolId, node: &SyntaxNode, spread: bool) {
+        let Some(id) = self.symbol(def) else {
+            return;
+        };
+        let kind = self.input.graph.symbols[id.0 as usize].path.kind;
+        let detail = if spread && matches!(kind, SymbolKind::Struct | SymbolKind::Variant) {
+            EdgeDetail::WithRest
+        } else {
+            EdgeDetail::None
+        };
+        self.located_edge(
+            from,
+            id,
+            EdgeKind::Constructs,
+            Certainty::Resolved,
+            node,
+            detail,
+        );
+    }
+
+    /// Adds a resolved edge to the symbol of `def`, if it has one.
+    fn edge_to(
+        &mut self,
+        def: Definition<'_>,
+        from: SymbolId,
+        kind: EdgeKind,
+        node: &SyntaxNode,
+        detail: EdgeDetail,
+    ) {
+        if let Some(id) = self.symbol(def) {
+            self.located_edge(from, id, kind, Certainty::Resolved, node, detail);
         }
     }
 
@@ -1014,9 +1211,7 @@ impl Collector<'_, '_> {
         if depth >= MAX_EXPANSION_DEPTH {
             return;
         }
-        let Some(expanded) = self.timed(Kind::ExpandMacro, || {
-            self.input.sema.expand_macro_call(call)
-        }) else {
+        let Some(expanded) = self.guard(|| self.input.sema.expand_macro_call(call)) else {
             return;
         };
         if self.regions.contains(&expanded.value) {
@@ -1041,9 +1236,7 @@ impl Collector<'_, '_> {
     /// invocation of a macro of the standard library or of a dependency
     /// resolves to no symbol and produces nothing.
     fn expands(&mut self, call: &ast::MacroCall, from: SymbolId) {
-        let Some(macro_) = self.timed(Kind::ResolveMacro, || {
-            self.input.sema.resolve_macro_call(call)
-        }) else {
+        let Some(macro_) = self.guard(|| self.input.sema.resolve_macro_call(call)) else {
             return;
         };
         let Some(id) = self.input.symbols.get(DefKey::Macro(macro_)) else {
@@ -1093,7 +1286,7 @@ impl Collector<'_, '_> {
         // The definition map already knows whether an attribute macro applies
         // to the item, which is much cheaper than resolving the attributes of
         // every item of the workspace.
-        let attribute_macro = self.timed(Kind::ResolveMacro, || {
+        let attribute_macro = self.guard(|| {
             let file = self.input.sema.hir_file_for(item.syntax());
             Some(self.input.sema.is_attr_macro_call(InFile::new(file, &item)))
         });
@@ -1141,9 +1334,7 @@ impl Collector<'_, '_> {
         let Some(site) = self.site(meta.syntax()) else {
             return true;
         };
-        let derives = self.timed(Kind::ResolveMacro, || {
-            self.input.sema.resolve_derive_macro(&meta)
-        });
+        let derives = self.guard(|| self.input.sema.resolve_derive_macro(&meta));
         for derive in derives.into_iter().flatten().flatten() {
             self.invocation(derive, from, &site);
         }
@@ -1158,9 +1349,7 @@ impl Collector<'_, '_> {
         let Some(path) = meta.path() else {
             return;
         };
-        let resolved = self.timed(Kind::ResolveMacro, || {
-            self.input.sema.resolve_path_per_ns(&path)
-        });
+        let resolved = self.guard(|| self.input.sema.resolve_path_per_ns(&path));
         let Some(PathResolution::Def(ModuleDef::Macro(macro_))) =
             resolved.and_then(|resolution| resolution.macro_ns)
         else {
@@ -1247,47 +1436,13 @@ impl Collector<'_, '_> {
         let Some(site) = self.site(call.syntax()) else {
             return false;
         };
-        self.input.inactive.iter().any(|range| {
-            range.file == site.file
-                && site.span.start <= range.span.start
-                && range.span.end <= site.span.end
-        })
-    }
-
-    /// Visits a call expression.
-    fn call_expr(&mut self, call: &ast::CallExpr, from: SymbolId, depth: u32) {
-        if let Some(callee) = call.expr() {
-            match &callee {
-                ast::Expr::PathExpr(path_expr) => {
-                    if let Some(path) = path_expr.path()
-                        && path.parent_path().is_none()
-                    {
-                        self.path_call(&path, from);
-                        self.tuple_literal_fields(&path, call.arg_list(), from);
-                        self.type_arguments(&path, from, depth);
-                    }
-                }
-                other => self.visit(other.syntax(), from, depth, false),
-            }
-        }
-        if let Some(args) = call.arg_list() {
-            for arg in args.args() {
-                self.visit(arg.syntax(), from, depth, false);
-            }
-        }
-    }
-
-    /// The operator trait a block implements, when it is one of the standard
-    /// operator traits.
-    fn operator_trait(&mut self, block: Impl) -> Option<&'static str> {
-        let reference = self.timed(Kind::Dispatch, || block.trait_ref(self.input.db))?;
-        let name = self.timed(Kind::Dispatch, || {
-            Some(reference.trait_().name(self.input.db))
-        })?;
-        OPERATOR_TRAITS
+        let ranges = self.inactive_in(&site);
+        // The ranges that start inside the call, of which one must end inside it.
+        let first = ranges.partition_point(|range| range.start < site.span.start);
+        ranges[first..]
             .iter()
-            .copied()
-            .find(|known| *known == name.as_str())
+            .take_while(|range| range.start <= site.span.end)
+            .any(|range| range.end <= site.span.end)
     }
 
     /// Adds the edge of an operator expression, which calls the operator's
@@ -1306,11 +1461,11 @@ impl Collector<'_, '_> {
         }
         let sema = self.input.sema;
         let resolved = if let Some(expr) = ast::BinExpr::cast(node.clone()) {
-            self.timed(Kind::ResolveMethod, || sema.resolve_bin_expr(&expr))
+            self.guard(|| sema.resolve_bin_expr(&expr))
         } else if let Some(expr) = ast::PrefixExpr::cast(node.clone()) {
-            self.timed(Kind::ResolveMethod, || sema.resolve_prefix_expr(&expr))
+            self.guard(|| sema.resolve_prefix_expr(&expr))
         } else if let Some(expr) = ast::IndexExpr::cast(node.clone()) {
-            self.timed(Kind::ResolveMethod, || sema.resolve_index_expr(&expr))
+            self.guard(|| sema.resolve_index_expr(&expr))
         } else {
             None
         };
@@ -1319,162 +1474,22 @@ impl Collector<'_, '_> {
         }
     }
 
-    /// Adds the edge of a path in callee position.
-    fn path_call(&mut self, path: &ast::Path, from: SymbolId) {
-        match self.timed(Kind::ResolvePath, || self.input.sema.resolve_path(path)) {
-            Some(PathResolution::Def(ModuleDef::Function(function))) => {
-                self.call_to(function, from, path.syntax());
-            }
-            // `Wrapper(1)` and `State::Busy(1)` are constructor calls.
-            Some(PathResolution::Def(ModuleDef::Adt(adt))) => {
-                self.constructs_adt(adt, from, path.syntax(), false);
-            }
-            Some(PathResolution::Def(ModuleDef::EnumVariant(variant))) => {
-                self.constructs_variant_key(DefKey::Variant(variant), from, path.syntax(), false);
-            }
-            Some(_) => {}
-            None => self.record_unresolved_path(path),
-        }
-    }
-
-    /// Visits a method call.
-    fn method_call(&mut self, call: &ast::MethodCallExpr, from: SymbolId, depth: u32) {
-        if let Some(receiver) = call.receiver() {
-            self.visit(receiver.syntax(), from, depth, false);
-        }
-        if let Some(name_ref) = call.name_ref() {
-            let resolved = self.timed(Kind::ResolveMethod, || {
-                self.input.sema.resolve_method_call_fallback(call)
-            });
-            match resolved {
-                Some((target, _)) => {
-                    let target = target.either(MethodTarget::Function, MethodTarget::Field);
-                    match target {
-                        MethodTarget::Function(function) => {
-                            self.call_to(function, from, name_ref.syntax());
-                            self.dispatch_to_display(function, from, call);
-                            // An adaptor call on an iterator runs the iterator's
-                            // own `next` from inside the standard library.
-                            if self.is_iterator_method(function)
-                                && let Some(receiver) = call.receiver()
-                            {
-                                let iterator = self.typed_value(&receiver);
-                                self.iterator_use(from, name_ref.syntax(), iterator);
-                            }
-                            // `collect` builds the collection the type asks for
-                            // through `FromIterator`, which nothing names.
-                            if self.is_collect(function) {
-                                let collection =
-                                    self.typed_value(&ast::Expr::MethodCallExpr(call.clone()));
-                                self.collect_use(from, name_ref.syntax(), collection);
-                            }
-                        }
-                        MethodTarget::Field(field) => {
-                            if let Some(id) = self.input.symbols.get(DefKey::Field(field)) {
-                                self.located_edge(
-                                    from,
-                                    id,
-                                    EdgeKind::ReadsField,
-                                    Certainty::Resolved,
-                                    name_ref.syntax(),
-                                    EdgeDetail::None,
-                                );
-                            }
-                        }
-                    }
-                }
-                None => self.record_unresolved_name(&name_ref),
-            }
-        }
-        if let Some(args) = call.arg_list() {
-            for arg in args.args() {
-                self.visit(arg.syntax(), from, depth, false);
-            }
-        }
-        for list in call
-            .syntax()
-            .children()
-            .filter_map(ast::GenericArgList::cast)
-        {
-            self.visit(list.syntax(), from, depth, false);
-        }
-    }
-
-    /// Adds the dispatch edges of a `to_string` call.
-    ///
-    /// `ToString::to_string` is implemented in the standard library and calls
-    /// `Display::fmt` of the receiver, so the workspace impl that can run is
-    /// reached through the receiver's type and not through a reference.
-    fn dispatch_to_display(
-        &mut self,
-        function: Function,
-        from: SymbolId,
-        call: &ast::MethodCallExpr,
-    ) {
-        if !self.is_to_string(function) {
-            return;
-        }
-        let Some(receiver) = call.receiver() else {
-            return;
-        };
-        let value = self.typed_value(&receiver);
-        self.formatting_site(from, receiver.syntax(), &[FormattingTrait::Display], value);
-    }
-
-    /// Whether a function is `ToString::to_string`, which calls the `Display`
-    /// implementation of whatever it is given.
-    fn is_to_string(&mut self, function: Function) -> bool {
-        let db = self.input.db;
-        self.timed(Kind::Dispatch, || {
-            let container = function.as_assoc_item(db)?.container(db);
-            // `to_string` comes from the trait's declaration or from the
-            // blanket implementation the standard library provides for it.
-            let trait_ = match container {
-                AssocItemContainer::Trait(trait_) => trait_,
-                AssocItemContainer::Impl(block) => block.trait_(db)?,
-            };
-            Some(
-                function.name(db).as_str() == "to_string"
-                    && trait_.name(db).as_str() == "ToString"
-                    && matches!(trait_.module(db).krate(db).origin(db), CrateOrigin::Lang(_)),
-            )
-        }) == Some(true)
-    }
-
     /// Adds the edge of a call to `function`.
     ///
     /// A call that resolves to a trait method declaration dispatches through the
     /// receiver, so every implementation of the trait in the workspace may be
     /// reached as well.
     fn call_to(&mut self, function: Function, from: SymbolId, node: &SyntaxNode) {
-        let container = self.timed(Kind::ResolveDef, || {
-            function
-                .as_assoc_item(self.input.db)
-                .map(|item| item.container(self.input.db))
-        });
-        if let Some(AssocItemContainer::Trait(trait_)) = container
-            && let Some(id) = self.input.symbols.get(DefKey::Function(function))
-        {
-            self.located_edge(
-                from,
-                id,
-                EdgeKind::Calls,
-                Certainty::Resolved,
-                node,
-                EdgeDetail::None,
-            );
-            self.dispatch_candidates(trait_, function, from, node);
+        let Some(id) = self.input.symbols.get(DefKey::Function(function)) else {
             return;
-        }
-        if let Some(id) = self.input.symbols.get(DefKey::Function(function)) {
-            self.located_edge(
-                from,
-                id,
-                EdgeKind::Calls,
-                Certainty::Resolved,
-                node,
-                EdgeDetail::None,
-            );
+        };
+        let kind = EdgeKind::Calls;
+        self.located_edge(from, id, kind, Certainty::Resolved, node, EdgeDetail::None);
+        let db = self.input.db;
+        if let Some(AssocItemContainer::Trait(trait_)) =
+            self.guard(|| Some(function.as_assoc_item(db)?.container(db)))
+        {
+            self.dispatch_candidates(trait_, function, from, node);
         }
     }
 
@@ -1487,581 +1502,21 @@ impl Collector<'_, '_> {
         from: SymbolId,
         node: &SyntaxNode,
     ) {
-        let db = self.input.db;
-        let Some(name) = self.timed(Kind::Dispatch, || Some(method.name(db))) else {
+        let Some(name) = self.guard(|| Some(method.name(self.input.db))) else {
             return;
         };
-        for index in 0..self.impls.len() {
-            let block = self.impls[index].1;
-            if self.timed(Kind::Dispatch, || block.trait_(db)) != Some(trait_) {
-                continue;
-            }
-            let Some(items) = self.timed(Kind::Dispatch, || Some(block.items(db))) else {
-                continue;
-            };
-            for item in items {
-                let AssocItem::Function(candidate) = item else {
-                    continue;
-                };
-                if self.timed(Kind::Dispatch, || Some(candidate.name(db))) != Some(name.clone()) {
-                    continue;
-                }
-                if let Some(id) = self.input.symbols.assoc_item(item) {
-                    self.located_edge(
-                        from,
-                        id,
-                        EdgeKind::MayDispatchTo,
-                        Certainty::Candidate,
-                        node,
-                        EdgeDetail::None,
-                    );
-                }
-            }
-        }
-    }
-
-    /// Visits a field access, which reads or writes the field.
-    fn field_expr(&mut self, field: &ast::FieldExpr, from: SymbolId, depth: u32) {
-        if let Some(base) = field.expr() {
-            self.visit(base.syntax(), from, depth, false);
-        }
-        let Some(name_ref) = field.name_ref() else {
-            return;
-        };
-        let kind = if is_write_target(field.syntax()) {
-            EdgeKind::WritesField
-        } else {
-            EdgeKind::ReadsField
-        };
-        match self.timed(Kind::ResolveField, || self.input.sema.resolve_field(field)) {
-            Some(target) => {
-                // The second case is a field of a plain tuple, which has no symbol.
-                let key = target.either(|item| Some(DefKey::Field(item)), |_tuple_field| None);
-                if let Some(key) = key
-                    && let Some(id) = self.input.symbols.get(key)
-                {
-                    self.located_edge(
-                        from,
-                        id,
-                        kind,
-                        Certainty::Resolved,
-                        name_ref.syntax(),
-                        EdgeDetail::None,
-                    );
-                }
-            }
-            None => {
-                if name_ref.as_tuple_field().is_none() {
-                    self.record_unresolved_name(&name_ref);
-                }
-            }
-        }
-    }
-
-    /// Visits a struct or variant literal.
-    fn record_expr(&mut self, expr: &ast::RecordExpr, from: SymbolId, depth: u32) {
-        let path = expr.path();
-        // A spread leaves the other fields to the value it copies them from.
-        let spread = expr
-            .record_expr_field_list()
-            .is_some_and(|list| list.spread().is_some());
-        match self.timed(Kind::ResolveRecord, || {
-            self.input.sema.resolve_variant(expr.clone())
-        }) {
-            Some(variant) => self.constructs_variant(&variant, from, expr.syntax(), spread),
-            None => {
-                if let Some(path) = &path
-                    && let Some(PathResolution::Def(ModuleDef::Adt(adt))) =
-                        self.timed(Kind::ResolvePath, || self.input.sema.resolve_path(path))
-                {
-                    self.constructs_adt(adt, from, path.syntax(), spread);
-                }
-            }
-        }
-        if let Some(path) = &path {
-            self.type_arguments(path, from, depth);
-        }
-        let Some(list) = expr.record_expr_field_list() else {
-            return;
-        };
-        // A field named in a literal is not read: the literal itself is what
-        // constructs the value. It does name the field, so a change to that
-        // field has to reach this site, and a field the literal does not name
-        // leaves it alone.
-        for field in list.fields() {
-            self.literal_field(&field, from);
-            if let Some(value) = field.expr() {
-                self.visit(value.syntax(), from, depth, false);
-            }
-        }
-        if let Some(spread) = list.spread() {
-            self.visit(spread.syntax(), from, depth, false);
-        }
-    }
-
-    /// Visits a `match` expression.
-    fn match_expr(&mut self, expr: &ast::MatchExpr, from: SymbolId, depth: u32) {
-        let detail = self.match_detail_of(expr);
-        if let Some(scrutinee) = expr.expr() {
-            let scrutinee_ty = self
-                .timed(Kind::InferType, || self.input.sema.type_of_expr(&scrutinee))
-                .map(|info| info.original.strip_references());
-            if let Some(Adt::Enum(item)) = scrutinee_ty.and_then(|ty| ty.as_adt())
-                && let Some(id) = self.input.symbols.get(DefKey::Adt(Adt::Enum(item)))
-            {
-                self.located_edge(
-                    from,
-                    id,
-                    EdgeKind::Matches,
-                    Certainty::Resolved,
-                    scrutinee.syntax(),
-                    detail,
-                );
-            }
-            self.visit(scrutinee.syntax(), from, depth, false);
-        }
-        if let Some(arms) = expr.match_arm_list() {
-            for arm in arms.arms() {
-                self.visit(arm.syntax(), from, depth, false);
-            }
-        }
-    }
-
-    /// Visits a record pattern: it matches the struct or variant and its fields.
-    fn record_pat(&mut self, pat: &ast::RecordPat, from: SymbolId, depth: u32) {
-        self.pattern_path(pat.path(), pat.syntax(), from, record_pat_has_rest(pat));
-        let Some(list) = pat.record_pat_field_list() else {
-            return;
-        };
-        for field in list.fields() {
-            if let Some((field_def, _)) = self.timed(Kind::ResolveRecord, || {
-                self.input.sema.resolve_record_pat_field(&field)
-            }) && let Some(id) = self.input.symbols.get(DefKey::Field(field_def))
-            {
-                let detail = self.match_detail(field.syntax());
-                self.located_edge(
-                    from,
-                    id,
-                    EdgeKind::Matches,
-                    Certainty::Resolved,
-                    field.syntax(),
-                    detail,
-                );
-            }
-            if let Some(inner) = field.pat() {
-                self.visit(inner.syntax(), from, depth, false);
-            }
-        }
-    }
-
-    /// Adds the `Matches` edge of a pattern that names a struct, variant or
-    /// constant.
-    ///
-    /// `rest` says that the pattern ends with `..`, which is recorded on the edge
-    /// to a struct or a variant: the pattern then matches whatever fields the
-    /// struct or variant grows, and leaves the fields it already has to be
-    /// checked individually.
-    fn pattern_path(
-        &mut self,
-        path: Option<ast::Path>,
-        node: &SyntaxNode,
-        from: SymbolId,
-        rest: bool,
-    ) {
-        let Some(path) = path else {
-            return;
-        };
-        match self.timed(Kind::ResolvePath, || self.input.sema.resolve_path(&path)) {
-            Some(PathResolution::Def(def)) => {
-                let leaves_fields_out = rest
-                    && matches!(
-                        def,
-                        ModuleDef::Adt(Adt::Struct(_)) | ModuleDef::EnumVariant(_)
-                    );
-                let key = match def {
-                    ModuleDef::Adt(adt) => Some(DefKey::Adt(adt)),
-                    ModuleDef::EnumVariant(variant) => Some(DefKey::Variant(variant)),
-                    ModuleDef::Const(item) => Some(DefKey::Const(item)),
-                    _ => None,
-                };
-                if let Some(key) = key
-                    && let Some(id) = self.input.symbols.get(key)
-                {
-                    let detail = if leaves_fields_out {
-                        EdgeDetail::WithRest
-                    } else {
-                        self.match_detail(node)
-                    };
-                    self.located_edge(
-                        from,
-                        id,
-                        EdgeKind::Matches,
-                        Certainty::Resolved,
-                        node,
-                        detail,
-                    );
-                }
-            }
-            Some(_) => {}
-            None => self.record_unresolved_path(&path),
-        }
-    }
-
-    /// Visits a path in value position.
-    fn path_expr(&mut self, expr: &ast::PathExpr, from: SymbolId, depth: u32) {
-        let Some(path) = expr.path() else {
-            return;
-        };
-        if path.parent_path().is_some() {
-            return;
-        }
-        match self.timed(Kind::ResolvePath, || self.input.sema.resolve_path(&path)) {
-            Some(PathResolution::Def(def)) => {
-                if let Some((key, kind)) = value_target(def)
-                    && let Some(id) = self.input.symbols.get(key)
-                {
-                    self.located_edge(
-                        from,
-                        id,
-                        kind,
-                        Certainty::Resolved,
-                        path.syntax(),
-                        EdgeDetail::None,
-                    );
-                }
-                // `map(ToString::to_string)` hands the formatting trait to a
-                // caller instead of calling it, so the value it formats is not
-                // named where it is formatted.
-                if let ModuleDef::Function(function) = def
-                    && self.is_to_string(function)
-                {
-                    self.formatting_site(
-                        from,
-                        path.syntax(),
-                        &[FormattingTrait::Display],
-                        ValueType::Unknown,
-                    );
-                }
-            }
-            Some(_) => {}
-            None => self.record_unresolved_path(&path),
-        }
-        self.type_arguments(&path, from, depth);
-    }
-
-    /// Visits the template of a format string.
-    ///
-    /// A captured argument (`format!("{NAME}")`) is only a name inside the
-    /// literal, so it has no syntax node of its own; the format machinery
-    /// resolves the names of the literal, and each of them is a value reference
-    /// like a path would be.
-    fn format_args(&mut self, expr: &ast::FormatArgsExpr, from: SymbolId, depth: u32) {
-        let template = expr
-            .syntax()
-            .descendants_with_tokens()
-            .filter_map(|child| child.into_token())
-            .find_map(ast::String::cast);
-        let traits = format_traits(&template);
-        if let Some(string) = template.clone() {
-            let file = string.syntax().parent().and_then(|node| {
-                self.timed(Kind::Site, || Some(self.input.sema.hir_file_for(&node)))
-            });
-            if let Some(file) = file
-                && let Some(parts) = self.timed(Kind::FormatArgs, || {
-                    self.input.sema.as_format_args_parts(&string)
-                })
-            {
-                for (range, resolution) in parts {
-                    let Some(resolution) =
-                        resolution.and_then(|part| part.either(Some, |_asm_operand| None))
-                    else {
-                        continue;
-                    };
-                    let Some(site) =
-                        self.timed(Kind::Site, || self.input.locate.location(file, range))
-                    else {
-                        continue;
-                    };
-                    // A part that names an item is a value reference.
-                    if let PathResolution::Def(def) = resolution
-                        && let Some((key, kind)) = value_target(def)
-                        && let Some(id) = self.input.symbols.get(key)
-                    {
-                        self.push(
-                            from,
-                            id,
-                            kind,
-                            Certainty::Resolved,
-                            site.clone(),
-                            EdgeDetail::None,
-                        );
-                    }
-                    // The part may also print a value, which runs the `fmt` of
-                    // the value's formatting trait without naming it.
-                    if !traits.is_empty()
-                        && let Some(value) = self.typed_resolution(resolution)
-                    {
-                        self.formatting_use(from, site, &traits, value);
-                    }
-                }
-            }
-        }
-        // The values the template prints are handed to `fmt` of the formatting
-        // traits it names, which is a dispatch no reference in the syntax
-        // resolves.
-        if !traits.is_empty() {
-            for argument in expr
-                .syntax()
-                .children()
-                .filter_map(ast::FormatArgsArg::cast)
-            {
-                let Some(argument) = argument.expr() else {
-                    continue;
-                };
-                let value = self.typed_value(&argument);
-                self.formatting_site(from, argument.syntax(), &traits, value);
-            }
-        }
-        // The explicit arguments are expressions of the expansion.
-        for child in expr.syntax().children() {
-            self.visit(&child, from, depth, false);
-        }
-    }
-
-    /// Visits a `?`, which converts its operand's error to the error of the
-    /// function it is written in.
-    fn try_expr(&mut self, expr: &ast::TryExpr, from: SymbolId, depth: u32) {
-        let operand = expr.expr();
-        if let Some(operand) = &operand {
-            // A `?` runs `From::from` on the error type of its operand: a
-            // conversion no reference in the syntax names.
-            let error = self.error_type(operand);
-            self.conversion_use(from, expr.syntax(), error);
-            self.visit(operand.syntax(), from, depth, false);
-        }
-    }
-
-    /// Visits a path in type position.
-    fn path_type(&mut self, ty: &ast::PathType, from: SymbolId, depth: u32) {
-        let Some(path) = ty.path() else {
-            return;
-        };
-        if path.parent_path().is_some() {
-            return;
-        }
-        match self.timed(Kind::ResolvePath, || self.input.sema.resolve_path(&path)) {
-            Some(PathResolution::Def(def)) => {
-                let key = match def {
-                    ModuleDef::Adt(adt) => Some(DefKey::Adt(adt)),
-                    ModuleDef::Trait(item) => Some(DefKey::Trait(item)),
-                    ModuleDef::TypeAlias(item) => Some(DefKey::TypeAlias(item)),
-                    _ => None,
-                };
-                if let Some(key) = key
-                    && let Some(id) = self.input.symbols.get(key)
-                {
-                    self.located_edge(
-                        from,
-                        id,
-                        EdgeKind::UsesType,
-                        Certainty::Resolved,
-                        path.syntax(),
-                        EdgeDetail::None,
-                    );
-                }
-            }
-            Some(_) => {}
-            None => self.record_unresolved_path(&path),
-        }
-        self.type_arguments(&path, from, depth);
-    }
-
-    /// Visits the generic arguments of a path, which are type positions of their
-    /// own (`Wrapper<Item>` uses `Item` as well).
-    fn type_arguments(&mut self, path: &ast::Path, from: SymbolId, depth: u32) {
-        let root = path.syntax();
-        let lists: Vec<SyntaxNode> = root
-            .descendants()
-            .filter_map(ast::GenericArgList::cast)
-            .map(|list| list.syntax().clone())
-            .filter(|list| {
-                !list
-                    .ancestors()
-                    .skip(1)
-                    .take_while(|parent| parent != root)
-                    .any(|parent| ast::GenericArgList::can_cast(parent.kind()))
-            })
+        let targets: Vec<SymbolId> = self
+            .impl_fns
+            .get(&trait_)
+            .into_iter()
+            .flatten()
+            .filter(|found| found.name == name)
+            .map(|found| found.symbol)
             .collect();
-        for list in &lists {
-            self.visit(list, from, depth, false);
-        }
-    }
-
-    /// Adds the `WritesField` edge of a field named in a literal.
-    ///
-    /// The literal supplies the field: it spells its name out and gives it a
-    /// value, so a removed or retyped field has to reach this site, and a field
-    /// the literal leaves to a `..base` does not.
-    fn literal_field(&mut self, field: &ast::RecordExprField, from: SymbolId) {
-        let resolved = self.timed(Kind::ResolveRecord, || {
-            self.input.sema.resolve_record_field(field)
-        });
-        let Some((def, _, _)) = resolved else {
-            return;
-        };
-        let Some(id) = self.input.symbols.get(DefKey::Field(def)) else {
-            return;
-        };
-        let node = field
-            .name_ref()
-            .map_or_else(|| field.syntax().clone(), |name| name.syntax().clone());
-        self.located_edge(
-            from,
-            id,
-            EdgeKind::WritesField,
-            Certainty::Resolved,
-            &node,
-            EdgeDetail::None,
-        );
-    }
-
-    /// Adds a `WritesField` edge to every positional field a tuple constructor
-    /// literal supplies.
-    ///
-    /// `Wrapper(1)` names its field by position rather than by name; the field
-    /// it supplies is the one at that position.
-    fn tuple_literal_fields(
-        &mut self,
-        path: &ast::Path,
-        args: Option<ast::ArgList>,
-        from: SymbolId,
-    ) {
-        let Some(args) = args else {
-            return;
-        };
-        let Some(fields) = self.container_fields(path) else {
-            return;
-        };
-        for (index, arg) in args.args().enumerate() {
-            let Some(field) = fields.get(index) else {
-                return;
-            };
-            if let Some(id) = self.input.symbols.get(DefKey::Field(*field)) {
-                self.located_edge(
-                    from,
-                    id,
-                    EdgeKind::WritesField,
-                    Certainty::Resolved,
-                    arg.syntax(),
-                    EdgeDetail::None,
-                );
-            }
-        }
-    }
-
-    /// Adds a `Matches` edge to every positional field a tuple pattern names.
-    ///
-    /// A pattern with a `..` does not line its fields up with the declaration
-    /// positions, so only a pattern that names every field gets one.
-    fn tuple_pattern_fields(&mut self, pat: &ast::TupleStructPat, from: SymbolId) {
-        let Some(path) = pat.path() else {
-            return;
-        };
-        let Some(fields) = self.container_fields(&path) else {
-            return;
-        };
-        let inner: Vec<ast::Pat> = pat.fields().collect();
-        if inner.len() != fields.len() {
-            return;
-        }
-        for (sub, field) in inner.iter().zip(fields.iter()) {
-            let Some(id) = self.input.symbols.get(DefKey::Field(*field)) else {
-                continue;
-            };
-            let detail = self.match_detail(sub.syntax());
-            self.located_edge(
-                from,
-                id,
-                EdgeKind::Matches,
-                Certainty::Resolved,
-                sub.syntax(),
-                detail,
-            );
-        }
-    }
-
-    /// The fields of the struct or variant a path names, in declaration order.
-    fn container_fields(&mut self, path: &ast::Path) -> Option<Vec<Field>> {
-        let db = self.input.db;
-        self.timed(Kind::ResolvePath, || {
-            match self.input.sema.resolve_path(path)? {
-                PathResolution::Def(ModuleDef::Adt(Adt::Struct(it))) => Some(it.fields(db)),
-                PathResolution::Def(ModuleDef::Adt(Adt::Union(it))) => Some(it.fields(db)),
-                PathResolution::Def(ModuleDef::EnumVariant(variant)) => Some(variant.fields(db)),
-                _ => None,
-            }
-        })
-    }
-
-    /// Adds the `Constructs` edge of a struct, union or enum variant literal.
-    ///
-    /// `spread` says that the literal ends with `..base`, which is recorded on the
-    /// edge to a struct or a variant.
-    fn constructs_variant(
-        &mut self,
-        variant: &Variant,
-        from: SymbolId,
-        node: &SyntaxNode,
-        spread: bool,
-    ) {
-        let key = match variant {
-            Variant::Struct(item) => DefKey::Adt(Adt::Struct(*item)),
-            Variant::Union(item) => DefKey::Adt(Adt::Union(*item)),
-            Variant::EnumVariant(item) => DefKey::Variant(*item),
-        };
-        self.constructs_variant_key(key, from, node, spread);
-    }
-
-    /// Adds a `Constructs` edge to the symbol of `key`, when it has one.
-    fn constructs_variant_key(
-        &mut self,
-        key: DefKey,
-        from: SymbolId,
-        node: &SyntaxNode,
-        spread: bool,
-    ) {
-        if let Some(id) = self.input.symbols.get(key) {
-            let detail = self.constructs_detail(id, spread);
-            self.located_edge(
-                from,
-                id,
-                EdgeKind::Constructs,
-                Certainty::Resolved,
-                node,
-                detail,
-            );
-        }
-    }
-
-    /// Adds a `Constructs` edge to a struct or union.
-    fn constructs_adt(&mut self, adt: Adt, from: SymbolId, node: &SyntaxNode, spread: bool) {
-        self.constructs_variant_key(DefKey::Adt(adt), from, node, spread);
-    }
-
-    /// The detail of a `Constructs` edge to `id`.
-    ///
-    /// Only a struct or a variant field can be given from another value of its
-    /// type, and only the literal that does it leaves fields out; any other
-    /// literal names every field.
-    fn constructs_detail(&self, id: SymbolId, spread: bool) -> EdgeDetail {
-        if !spread {
-            return EdgeDetail::None;
-        }
-        let symbol = &self.input.graph.symbols[id.0 as usize];
-        if matches!(symbol.path.kind, SymbolKind::Struct | SymbolKind::Variant) {
-            EdgeDetail::WithRest
-        } else {
-            EdgeDetail::None
+        for id in targets {
+            let certainty = Certainty::Candidate;
+            let kind = EdgeKind::MayDispatchTo;
+            self.located_edge(from, id, kind, certainty, node, EdgeDetail::None);
         }
     }
 
@@ -2150,9 +1605,7 @@ impl Collector<'_, '_> {
                 // A bare ident that names a constant or a unit variant is not a
                 // binding at all.
                 None => self
-                    .timed(Kind::ResolveBinding, || {
-                        self.input.sema.resolve_bind_pat_to_const(ident)
-                    })
+                    .guard(|| self.input.sema.resolve_bind_pat_to_const(ident))
                     .is_none(),
             },
             _ => false,
@@ -2192,16 +1645,22 @@ impl Collector<'_, '_> {
 
     /// Whether `location` lies in code that is inactive under the configuration.
     fn is_inactive(&self, location: &Location) -> bool {
-        self.input.inactive.iter().any(|range| {
-            range.file == location.file
-                && range.span.start <= location.span.start
-                && location.span.end <= range.span.end
-        })
+        let ranges = self.inactive_in(location);
+        // The ranges that start before the location, of which one must cover it.
+        let end = ranges.partition_point(|range| range.start <= location.span.start);
+        ranges[..end]
+            .iter()
+            .any(|range| location.span.end <= range.end)
+    }
+
+    /// The inactive ranges of the file of `location`, sorted by their start.
+    fn inactive_in(&self, location: &Location) -> &[Span] {
+        self.inactive.get(&location.file).map_or(&[], Vec::as_slice)
     }
 
     /// The location of `node`, mapped back to the real file.
     fn site(&self, node: &SyntaxNode) -> Option<Location> {
-        self.timed(Kind::Site, || {
+        self.guard(|| {
             let file = self.input.sema.hir_file_for(node);
             self.input.locate.location(file, node.text_range())
         })
@@ -2280,18 +1739,31 @@ impl Collector<'_, '_> {
     }
 }
 
+/// The inactive ranges by file, each list sorted by start.
+fn inactive_by_file(ranges: &[Location]) -> HashMap<RelPath, Vec<Span>> {
+    let mut by_file: HashMap<RelPath, Vec<Span>> = HashMap::new();
+    for range in ranges {
+        by_file
+            .entry(range.file.clone())
+            .or_default()
+            .push(range.span);
+    }
+    for spans in by_file.values_mut() {
+        spans.sort_by_key(|span| (span.start, span.end));
+    }
+    by_file
+}
+
 /// The edge a path in value position produces for the definition it resolves
 /// to, if it is a value at all.
-fn value_target(def: ModuleDef) -> Option<(DefKey, EdgeKind)> {
-    Some(match def {
-        ModuleDef::Function(item) => (DefKey::Function(item), EdgeKind::TakesAsValue),
-        ModuleDef::Const(item) => (DefKey::Const(item), EdgeKind::UsesValue),
-        ModuleDef::Static(item) => (DefKey::Static(item), EdgeKind::UsesValue),
-        ModuleDef::EnumVariant(item) => (DefKey::Variant(item), EdgeKind::Constructs),
-        // A unit struct built by naming it.
-        ModuleDef::Adt(item) => (DefKey::Adt(item), EdgeKind::Constructs),
-        _ => return None,
-    })
+fn value_kind(def: Definition<'_>) -> Option<EdgeKind> {
+    match def {
+        Definition::Function(_) => Some(EdgeKind::TakesAsValue),
+        Definition::Const(_) | Definition::Static(_) => Some(EdgeKind::UsesValue),
+        // A unit struct or variant built by naming it.
+        Definition::EnumVariant(_) | Definition::Adt(_) => Some(EdgeKind::Constructs),
+        _ => None,
+    }
 }
 
 /// The traits one arithmetic operator invokes, plain and assigning.
@@ -2348,18 +1820,26 @@ fn operator_traits(node: &SyntaxNode) -> &'static [&'static str] {
     &[]
 }
 
+/// Whether a function is `ToString::to_string`, which calls the `Display`
+/// implementation of whatever it is given, given its [`Collector::std_method`].
+fn is_to_string(called: Option<(Name, Name)>) -> bool {
+    called.is_some_and(|(trait_, method)| {
+        trait_.as_str() == "ToString" && method.as_str() == "to_string"
+    })
+}
+
 /// Which formatting traits a format string invokes.
 ///
 /// `{}` prints its value with `Display` and `{:?}` (and `{:#?}`) with `Debug`,
 /// so the placeholders of the template decide what a site may call. A template
 /// that prints both is reported as both; one without a placeholder prints
 /// nothing and reaches nothing.
-fn format_traits(template: &Option<ast::String>) -> Vec<FormattingTrait> {
+fn format_traits(template: &Option<ast::String>) -> Vec<Implicit> {
     let Some(string) = template else {
         return Vec::new();
     };
     let text = string.syntax().text().to_string();
-    let mut traits: Vec<FormattingTrait> = Vec::new();
+    let mut traits: Vec<Implicit> = Vec::new();
     let mut placeholder = false;
     let mut spec = false;
     let mut debug = false;
@@ -2380,9 +1860,9 @@ fn format_traits(template: &Option<ast::String>) -> Vec<FormattingTrait> {
             '}' if placeholder => {
                 placeholder = false;
                 let found = if debug {
-                    FormattingTrait::Debug
+                    Implicit::Debug
                 } else {
-                    FormattingTrait::Display
+                    Implicit::Display
                 };
                 if !traits.contains(&found) {
                     traits.push(found);
@@ -2402,18 +1882,6 @@ fn same_kind(left: AssocItem, right: AssocItem) -> bool {
             | (AssocItem::Const(_), AssocItem::Const(_))
             | (AssocItem::TypeAlias(_), AssocItem::TypeAlias(_))
     )
-}
-
-/// Whether a tuple-struct pattern ends with a rest pattern (`Pair(a, ..)`).
-fn tuple_struct_has_rest(pat: &ast::TupleStructPat) -> bool {
-    pat.fields()
-        .any(|field| matches!(field, ast::Pat::RestPat(_)))
-}
-
-/// Whether a record pattern ends with `..` (`Point { x, .. }`).
-fn record_pat_has_rest(pat: &ast::RecordPat) -> bool {
-    pat.record_pat_field_list()
-        .is_some_and(|list| list.rest_pat().is_some())
 }
 
 /// Whether `node` is the target of an assignment or of a mutable borrow.

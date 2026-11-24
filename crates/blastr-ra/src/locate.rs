@@ -6,39 +6,68 @@
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf, Prefix};
-use std::sync::{Arc, Mutex};
 
 use blastr_model::{Location, RelPath, Span};
 use ra_ap_hir::{HirFileId, InFile};
 use ra_ap_ide_db::base_db::SourceDatabase;
-use ra_ap_syntax::TextRange;
+use ra_ap_ide_db::line_index::LineIndex;
+use ra_ap_syntax::{TextRange, TextSize};
 use ra_ap_vfs::{FileId, Vfs};
 
-/// The line structure of one file's text, so that offsets can be turned into
-/// 1-based line numbers without scanning the text again.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LineMap {
-    /// Byte offset of the first character of every line, ascending.
-    starts: Vec<u32>,
+/// The directory the reported paths are relative to.
+///
+/// The caller and the file system may spell the same directory differently
+/// (symlinks, the case of a Windows path, a verbatim prefix), so the root is
+/// kept in both spellings, the canonical one read once.
+#[derive(Debug, Clone)]
+pub(crate) struct Root {
+    /// The root as the caller spelled it, normalized.
+    plain: PathBuf,
+    /// The canonical spelling, normalized, when it is a different one.
+    canonical: Option<PathBuf>,
 }
 
-impl LineMap {
-    /// Indexes the line starts of `text`.
-    pub(crate) fn new(text: &str) -> LineMap {
-        let mut starts = vec![0];
-        for (offset, byte) in text.bytes().enumerate() {
-            if byte == b'\n' {
-                starts.push(offset as u32 + 1);
-            }
-        }
-        LineMap { starts }
+impl Root {
+    /// The root `path`, which is canonicalized once.
+    pub(crate) fn new(path: &Path) -> Root {
+        let plain = normalize(path);
+        let canonical = std::fs::canonicalize(&plain)
+            .ok()
+            .map(|canonical| normalize(&canonical))
+            .filter(|canonical| canonical != &plain);
+        Root { plain, canonical }
     }
 
-    /// The 1-based line containing the byte `offset`.
-    pub(crate) fn line(&self, offset: u32) -> u32 {
-        // Every line start at or before the offset adds one line.
-        self.starts.partition_point(|&start| start <= offset) as u32
+    /// The path of `file` relative to the root, with `/` separators, or `None`
+    /// when `file` is the root itself, lies outside it or is not UTF-8.
+    ///
+    /// The comparison is lexical, against either spelling of the root, so the
+    /// thousands of files of the standard library and the registry need no
+    /// file system access.
+    pub(crate) fn relative(&self, file: &Path) -> Option<RelPath> {
+        let file = normalize(file);
+        let below = |root: &Path| {
+            let rest = file.strip_prefix(root).ok()?;
+            let segments: Option<Vec<&str>> = rest
+                .components()
+                .map(|component| component.as_os_str().to_str())
+                .collect();
+            let text = segments?.join("/");
+            (!text.is_empty()).then(|| RelPath::new(text))
+        };
+        below(&self.plain).or_else(|| below(self.canonical.as_ref()?))
     }
+}
+
+/// The repository-relative path of every file of the virtual file system that
+/// lies below the root.
+pub(crate) type Paths = HashMap<FileId, RelPath>;
+
+/// The relative path of every file of `vfs` below `root`.
+pub(crate) fn paths(vfs: &Vfs, root: &Root) -> Paths {
+    vfs.iter()
+        .filter_map(|(file, path)| Some((file, root.relative(path.as_path()?.as_ref())?)))
+        .collect()
 }
 
 /// Turns rust-analyzer file ids and text ranges into [`Location`]s.
@@ -46,65 +75,18 @@ impl LineMap {
 /// Files outside the repository root (the standard library, dependencies in the
 /// Cargo registry) have no relative path and therefore no location: nothing in
 /// the graph ever points at them.
-///
-/// One locator serves every worker of an extraction, so the line maps it builds
-/// are shared behind a lock: a worker looks up the map of a file once and keeps
-/// its own reference to it.
+#[derive(Clone, Copy)]
 pub(crate) struct Locator<'a> {
-    /// Where the file texts come from.
+    /// Where the file texts and their line indexes come from.
     db: &'a dyn SourceDatabase,
-    /// The repository-relative path of every file in the virtual file system,
-    /// shared with the locators of the workers.
-    paths: Arc<Paths>,
-    /// The line maps of the files that were asked about, built on first use.
-    lines: Mutex<HashMap<FileId, Arc<LineMap>>>,
+    /// The relative path of every file below the root.
+    paths: &'a Paths,
 }
 
-/// The repository-relative path of every file of the virtual file system.
-pub(crate) type Paths = HashMap<FileId, Option<RelPath>>;
-
 impl<'a> Locator<'a> {
-    /// Records the relative path of every file of `vfs`.
-    pub(crate) fn new(db: &'a dyn SourceDatabase, vfs: &Vfs, root: &Path) -> Locator<'a> {
-        let root = normalize(root);
-        // When the root is written differently from how the file system spells
-        // it, the files have to be canonicalized too. When it is not, a lexical
-        // comparison decides, which is exact and needs no file system access for
-        // the thousands of files of the standard library and the registry.
-        let canonical_root = std::fs::canonicalize(&root)
-            .ok()
-            .filter(|canonical| canonical != &root);
-        let mut paths = HashMap::new();
-        for (file, path) in vfs.iter() {
-            let relative = path.as_path().and_then(|absolute| {
-                let absolute = normalize(absolute.as_ref());
-                relative_to(&root, &absolute).or_else(|| {
-                    let canonical_root = canonical_root.as_ref()?;
-                    let canonical = std::fs::canonicalize(&absolute).ok()?;
-                    relative_to(canonical_root, &canonical)
-                })
-            });
-            paths.insert(file, relative);
-        }
-        Locator {
-            db,
-            paths: Arc::new(paths),
-            lines: Mutex::new(HashMap::new()),
-        }
-    }
-
-    /// The paths of every file, for building the locator of a worker thread.
-    pub(crate) fn paths(&self) -> Arc<Paths> {
-        Arc::clone(&self.paths)
-    }
-
-    /// A locator for `db` over `paths`, which it shares with other locators.
-    pub(crate) fn with_paths(db: &'a dyn SourceDatabase, paths: Arc<Paths>) -> Locator<'a> {
-        Locator {
-            db,
-            paths,
-            lines: Mutex::new(HashMap::new()),
-        }
+    /// A locator for `db` over `paths`.
+    pub(crate) fn new(db: &'a dyn SourceDatabase, paths: &'a Paths) -> Locator<'a> {
+        Locator { db, paths }
     }
 
     /// The location of `range` in `file`, which may be a macro expansion: it is
@@ -117,94 +99,43 @@ impl<'a> Locator<'a> {
         self.location_in_file(rooted.file_id, rooted.range)
     }
 
-    /// The relative path of `file`, or `None` when it lies outside the root or
-    /// is a macro expansion.
-    pub(crate) fn file_path(&self, file: HirFileId) -> Option<RelPath> {
-        let file = file.file_id()?.file_id(self.db);
-        self.paths.get(&file)?.clone()
-    }
-
     /// The location of `range`, which is already known to be in the real file
     /// `file`.
     pub(crate) fn location_in_file(&self, file: FileId, range: TextRange) -> Option<Location> {
-        let path = self.paths.get(&file)?.clone()?;
-        let span = self.span(file, range)?;
-        Some(Location { file: path, span })
-    }
-
-    fn span(&self, file: FileId, range: TextRange) -> Option<Span> {
-        let lines = self.line_map(file);
-        let start = u32::from(range.start());
-        let end = u32::from(range.end());
-        let start_line = lines.line(start);
+        let path = self.paths.get(&file)?.clone();
+        let index = ra_ap_ide_db::line_index(self.db, file);
+        let (start, end) = (range.start(), range.end());
         // `end` is one past the last byte, so the last line is the one holding
         // the last byte of the range.
-        let end_line = lines.line(end.saturating_sub(1).max(start));
-        Some(Span {
-            start,
-            end,
-            start_line,
-            end_line,
-        })
-    }
-
-    fn line_map(&self, file: FileId) -> Arc<LineMap> {
-        let mut lines = self.lines.lock().unwrap_or_else(|error| error.into_inner());
-        if let Some(lines) = lines.get(&file) {
-            return Arc::clone(lines);
-        }
-        let text = self.db.file_text(file);
-        let map = Arc::new(LineMap::new(text.text(self.db)));
-        lines.insert(file, Arc::clone(&map));
-        map
+        let last = end.checked_sub(TextSize::from(1)).unwrap_or(end).max(start);
+        let span = Span {
+            start: start.into(),
+            end: end.into(),
+            start_line: line(index, start),
+            end_line: line(index, last),
+        };
+        Some(Location { file: path, span })
     }
 }
 
-/// The path of `file` relative to `root`, with `/` separators, or `None` when
-/// `file` is outside `root` or not UTF-8.
-pub(crate) fn rel_path(root: &Path, file: &Path) -> Option<RelPath> {
-    let root = normalize(root);
-    let file = normalize(file);
-    if let Some(relative) = relative_to(&root, &file) {
-        return Some(relative);
-    }
-    // The two paths can spell the same directory differently: symlinks, `..`,
-    // or shortened Windows names. Cargo metadata and a repository root found by
-    // walking upwards are usually fine, but be forgiving when they are not.
-    let canonical_root = std::fs::canonicalize(&root).ok()?;
-    let canonical_file = std::fs::canonicalize(&file).ok()?;
-    relative_to(&canonical_root, &canonical_file)
-}
-
-/// The path of `file` relative to `root` decided by a plain comparison of the
-/// two, without touching the file system.
-pub(crate) fn lexical_rel_path(root: &Path, file: &Path) -> Option<RelPath> {
-    relative_to(&normalize(root), &normalize(file))
-}
-
-/// The components of `file` below `root`, with `/` separators.
-fn relative_to(root: &Path, file: &Path) -> Option<RelPath> {
-    let rest = file.strip_prefix(root).ok()?;
-    let mut text = String::new();
-    for component in rest.components() {
-        let segment = component.as_os_str().to_str()?;
-        if !text.is_empty() {
-            text.push('/');
-        }
-        text.push_str(segment);
-    }
-    if text.is_empty() {
-        return None;
-    }
-    Some(RelPath::new(text))
+/// The 1-based line holding the byte at `offset`; an offset past the end is on
+/// the last line.
+///
+/// A byte inside a multi-byte character has no column of its own, so the start
+/// of the character, which is on the same line, is asked instead.
+fn line(index: &LineIndex, offset: TextSize) -> u32 {
+    let offset = offset.min(index.len());
+    (0..4u32)
+        .find_map(|back| index.try_line_col(offset.checked_sub(TextSize::from(back))?))
+        .map_or(1, |position| position.line + 1)
 }
 
 /// Removes `.`, applies `..`, drops a trailing separator and drops the
 /// Windows verbatim prefix, without touching the filesystem.
 ///
 /// `\\?\C:\dir` and `C:\dir` name the same directory, and a load hands out
-/// both spellings: [`Locator::new`] is given a canonical root, which has the
-/// prefix, while rust-analyzer adds some of the files below it without one.
+/// both spellings: a canonical root has the prefix, while rust-analyzer adds
+/// some of the files below it without one.
 /// Comparing the two as text would put those files outside the root, so the
 /// prefix is removed from both sides and they compare equal.
 fn normalize(path: &Path) -> PathBuf {
@@ -238,7 +169,7 @@ fn normalize(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{LineMap, rel_path};
+    use super::{LineIndex, Root, TextSize, line};
     use std::path::{Path, PathBuf};
 
     fn joined(parts: &[&str]) -> PathBuf {
@@ -251,31 +182,38 @@ mod tests {
 
     #[test]
     fn empty_text_has_one_line() {
-        let map = LineMap::new("");
-        assert_eq!(map.line(0), 1);
+        let map = LineIndex::new("");
+        assert_eq!(line(&map, TextSize::from(0)), 1);
     }
 
     #[test]
     fn lines_are_one_based() {
-        let map = LineMap::new("abc\ndef\nghi");
-        assert_eq!(map.line(0), 1);
-        assert_eq!(map.line(2), 1);
-        assert_eq!(map.line(3), 1);
-        assert_eq!(map.line(4), 2);
-        assert_eq!(map.line(10), 3);
+        let map = LineIndex::new("abc\ndef\nghi");
+        assert_eq!(line(&map, TextSize::from(0)), 1);
+        assert_eq!(line(&map, TextSize::from(2)), 1);
+        assert_eq!(line(&map, TextSize::from(3)), 1);
+        assert_eq!(line(&map, TextSize::from(4)), 2);
+        assert_eq!(line(&map, TextSize::from(10)), 3);
     }
 
     #[test]
     fn offsets_past_the_end_stay_on_the_last_line() {
-        let map = LineMap::new("abc");
-        assert_eq!(map.line(99), 1);
+        let map = LineIndex::new("abc");
+        assert_eq!(line(&map, TextSize::from(99)), 1);
+    }
+
+    #[test]
+    fn a_byte_inside_a_character_is_on_its_line() {
+        let map = LineIndex::new("\u{e9}\nx");
+        assert_eq!(line(&map, TextSize::from(1)), 1);
+        assert_eq!(line(&map, TextSize::from(3)), 2);
     }
 
     #[test]
     fn trailing_newline_starts_an_empty_line() {
-        let map = LineMap::new("abc\n");
-        assert_eq!(map.line(3), 1);
-        assert_eq!(map.line(4), 2);
+        let map = LineIndex::new("abc\n");
+        assert_eq!(line(&map, TextSize::from(3)), 1);
+        assert_eq!(line(&map, TextSize::from(4)), 2);
     }
 
     #[test]
@@ -283,7 +221,9 @@ mod tests {
         let root = joined(&["repo"]);
         let file = joined(&["repo", "src", "lib.rs"]);
         assert_eq!(
-            rel_path(&root, &file).map(|it| it.as_str().to_owned()),
+            Root::new(&root)
+                .relative(&file)
+                .map(|it| it.as_str().to_owned()),
             Some("src/lib.rs".to_owned())
         );
     }
@@ -293,7 +233,9 @@ mod tests {
         let root = joined(&["repo"]);
         let file = joined(&["repo", ".", "src", "..", "src", "main.rs"]);
         assert_eq!(
-            rel_path(&root, &file).map(|it| it.as_str().to_owned()),
+            Root::new(&root)
+                .relative(&file)
+                .map(|it| it.as_str().to_owned()),
             Some("src/main.rs".to_owned())
         );
     }
@@ -302,13 +244,13 @@ mod tests {
     fn files_outside_the_root_have_no_path() {
         let root = joined(&["repo"]);
         let outside = joined(&["elsewhere", "lib.rs"]);
-        assert_eq!(rel_path(&root, &outside), None);
+        assert_eq!(Root::new(&root).relative(&outside), None);
     }
 
     #[test]
     fn the_root_itself_has_no_path() {
         let root = joined(&["repo"]);
-        assert_eq!(rel_path(&root, &root), None);
+        assert_eq!(Root::new(&root).relative(&root), None);
     }
 
     #[test]
@@ -318,7 +260,9 @@ mod tests {
         // Only the lexical comparison is exercised here; `Path` never touches
         // the filesystem, so this holds on every platform.
         assert_eq!(
-            rel_path(root, file).map(|it| it.as_str().to_owned()),
+            Root::new(root)
+                .relative(file)
+                .map(|it| it.as_str().to_owned()),
             Some("c.rs".to_owned())
         );
     }
@@ -328,8 +272,6 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_verbatim_root_and_a_plain_file_are_the_same_directory() {
-        use super::lexical_rel_path;
-
         // Windows canonical paths carry a `\\?\` prefix that the paths Cargo
         // reports for the files below them do not. A load hands out both
         // spellings, and a file of a crate has to be found below the root
@@ -337,13 +279,17 @@ mod tests {
         let root = Path::new(r"\\?\C:\work\project");
         let file = Path::new(r"C:\work\project\crate\src\lib.rs");
         assert_eq!(
-            lexical_rel_path(root, file).map(|it| it.as_str().to_owned()),
+            Root::new(root)
+                .relative(file)
+                .map(|it| it.as_str().to_owned()),
             Some("crate/src/lib.rs".to_owned())
         );
         let plain_root = Path::new(r"C:\work\project");
         let verbatim_file = Path::new(r"\\?\C:\work\project\crate\src\lib.rs");
         assert_eq!(
-            lexical_rel_path(plain_root, verbatim_file).map(|it| it.as_str().to_owned()),
+            Root::new(plain_root)
+                .relative(verbatim_file)
+                .map(|it| it.as_str().to_owned()),
             Some("crate/src/lib.rs".to_owned())
         );
     }
