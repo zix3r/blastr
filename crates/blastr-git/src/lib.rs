@@ -21,7 +21,7 @@ pub use changes::changed_files_between_dirs;
 pub use repo::Repo;
 
 /// The marker file that shows that a snapshot directory was written completely.
-pub(crate) const SNAPSHOT_MARKER: &str = ".blastr-complete";
+pub const SNAPSHOT_MARKER: &str = ".blastr-complete";
 
 /// The root directory of a Git working tree.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use blastr_git::Repo;
 use blastr_model::{
@@ -24,6 +25,15 @@ use crate::error::{Error, Result};
 use crate::pipeline::{
     Loaded, MANIFEST_FILE, Run, Sides, collect_limits, pipeline, trace, union_of,
 };
+
+/// Most bytes the graphs, results and snapshots of the cache take together
+/// once it is pruned.
+const CACHE_LIMIT: u64 = 2 << 30;
+
+/// How long an entry is safe from pruning after it was last used. Everything
+/// the current analysis reads or writes is used within it, so pruning never
+/// takes what the analysis holds.
+const IN_USE: Duration = Duration::from_secs(60 * 60);
 
 /// The toolchain recorded in an analysis key when `rustc --version` cannot be run.
 const UNKNOWN_TOOLCHAIN: &str = "unknown";
@@ -69,7 +79,65 @@ impl Engine {
     /// Opens the engine on the per-user cache directory ([`blastr_model::paths`]).
     pub fn open() -> Result<Engine> {
         let paths = blastr_model::paths().ok_or(Error::NoUserDirs)?;
-        Ok(Engine::with_paths(paths))
+        let engine = Engine::with_paths(paths);
+        engine.prune_quietly();
+        Ok(engine)
+    }
+
+    /// Removes the graphs, results and snapshots unused the longest until
+    /// together they take at most `limit` bytes. Nothing used after
+    /// `keep_since` is removed, even when that leaves more than `limit`.
+    pub(crate) fn prune(&self, limit: u64, keep_since: SystemTime) -> Result<()> {
+        let mut entries = self.cache.entries(Kind::Graph)?;
+        entries.extend(self.cache.entries(Kind::Result)?);
+        let snapshots_dir = self.paths.snapshots_dir();
+        if let Ok(directories) = std::fs::read_dir(&snapshots_dir) {
+            for entry in directories {
+                let entry = entry?;
+                if !entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let path = entry.path();
+                // The marker is touched when the snapshot is used; a directory
+                // without one is a snapshot that was never finished.
+                let used = std::fs::metadata(path.join(blastr_git::SNAPSHOT_MARKER))
+                    .or_else(|_| entry.metadata())?
+                    .modified()
+                    .unwrap_or(SystemTime::UNIX_EPOCH);
+                let size = directory_size(&path)?;
+                entries.push((path, size, used));
+            }
+        }
+        let mut total: u64 = entries.iter().map(|(_, size, _)| size).sum();
+        entries.sort_by_key(|(_, _, used)| *used);
+        for (path, size, used) in entries {
+            if total <= limit || used >= keep_since {
+                break;
+            }
+            if path.is_dir() {
+                remove_dir_if_present(&path)?;
+            } else {
+                match std::fs::remove_file(&path) {
+                    Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                        return Err(Error::Io(error));
+                    }
+                    _ => {}
+                }
+            }
+            total = total.saturating_sub(size);
+        }
+        Ok(())
+    }
+
+    /// Prunes the cache to [`CACHE_LIMIT`]; a failure is logged, because a
+    /// cache that stays too large is no reason to stop an analysis.
+    fn prune_quietly(&self) {
+        let keep_since = SystemTime::now()
+            .checked_sub(IN_USE)
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        if let Err(error) = self.prune(CACHE_LIMIT, keep_since) {
+            tracing::warn!("could not prune the cache: {error}");
+        }
     }
 
     /// Creates an engine whose cache lives in the given directories.
@@ -142,6 +210,7 @@ impl Engine {
         {
             self.cache
                 .put(Kind::Result, key, &codec::encode(&analysis)?)?;
+            self.prune_quietly();
         }
         Ok(analysis)
     }
@@ -405,6 +474,7 @@ impl Engine {
         if let Some(key) = key {
             self.cache
                 .put(Kind::Graph, &key.hash(), &codec::encode(graph)?)?;
+            self.prune_quietly();
         }
         Ok(())
     }
@@ -726,6 +796,43 @@ mod tests {
         engine.cache_clear().unwrap();
 
         assert!(!paths.snapshots_dir().exists());
+    }
+
+    #[test]
+    fn pruning_removes_the_entries_unused_longest_and_keeps_recent_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_under(dir.path());
+        let cache = Cache::new(&paths.cache_dir);
+        let now = SystemTime::now();
+        let ago = |hours: u64| now - Duration::from_secs(hours * 3600);
+        let age = |path: &Path, when: SystemTime| {
+            let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+            file.set_modified(when).unwrap();
+        };
+        // Each entry is ten bytes; the snapshot's age is that of its marker.
+        cache.put(Kind::Graph, "old", &[0; 10]).unwrap();
+        age(&cache.file(Kind::Graph, "old"), ago(5));
+        cache.put(Kind::Result, "newer", &[0; 10]).unwrap();
+        age(&cache.file(Kind::Result, "newer"), ago(3));
+        cache.put(Kind::Graph, "current", &[0; 10]).unwrap();
+        let snapshot = paths.snapshots_dir().join("4f2a91c");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(snapshot.join("lib.rs"), [0; 10]).unwrap();
+        std::fs::write(snapshot.join(blastr_git::SNAPSHOT_MARKER), b"").unwrap();
+        age(&snapshot.join(blastr_git::SNAPSHOT_MARKER), ago(4));
+
+        let engine = Engine::with_paths(paths.clone());
+        engine.prune(20, ago(1)).unwrap();
+        assert!(!cache.file(Kind::Graph, "old").exists());
+        assert!(!snapshot.exists());
+        assert!(cache.file(Kind::Result, "newer").exists());
+
+        // Reading an entry marks it as used, and an entry used recently stays
+        // even when the cache is still over its limit.
+        cache.get(Kind::Result, "newer").unwrap();
+        engine.prune(0, ago(1)).unwrap();
+        assert!(cache.file(Kind::Result, "newer").exists());
+        assert!(cache.file(Kind::Graph, "current").exists());
     }
 
     #[test]

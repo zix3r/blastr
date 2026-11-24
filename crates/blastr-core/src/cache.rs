@@ -7,6 +7,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::SystemTime;
 
 /// What a cache entry holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,16 +46,22 @@ impl Cache {
     }
 
     /// The file of one entry.
-    fn file(&self, kind: Kind, key: &str) -> PathBuf {
+    pub(crate) fn file(&self, kind: Kind, key: &str) -> PathBuf {
         self.root
             .join(kind.dir())
             .join(format!("{key}.{EXTENSION}"))
     }
 
     /// The bytes stored under `key`, or `None` when there are none.
+    ///
+    /// Reading an entry marks it as used, so that pruning keeps it longest.
     pub(crate) fn get(&self, kind: Kind, key: &str) -> io::Result<Option<Vec<u8>>> {
-        match std::fs::read(self.file(kind, key)) {
-            Ok(bytes) => Ok(Some(bytes)),
+        let file = self.file(kind, key);
+        match std::fs::read(&file) {
+            Ok(bytes) => {
+                touch(&file);
+                Ok(Some(bytes))
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),
         }
@@ -83,12 +90,19 @@ impl Cache {
 
     /// The number of entries of `kind` and their total size in bytes.
     pub(crate) fn stats(&self, kind: Kind) -> io::Result<(u64, u64)> {
+        let entries = self.entries(kind)?;
+        let bytes = entries.iter().map(|(_, size, _)| size).sum();
+        Ok((entries.len() as u64, bytes))
+    }
+
+    /// The file, size and time of last use of every entry of `kind`.
+    pub(crate) fn entries(&self, kind: Kind) -> io::Result<Vec<(PathBuf, u64, SystemTime)>> {
         let entries = match std::fs::read_dir(self.root.join(kind.dir())) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok((0, 0)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(error),
         };
-        let (mut count, mut bytes) = (0, 0);
+        let mut out = Vec::new();
         for entry in entries {
             let entry = entry?;
             let path = entry.path();
@@ -96,11 +110,12 @@ impl Cache {
                 .extension()
                 .is_some_and(|extension| extension == EXTENSION)
             {
-                count += 1;
-                bytes += entry.metadata()?.len();
+                let metadata = entry.metadata()?;
+                let used = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                out.push((path, metadata.len(), used));
             }
         }
-        Ok((count, bytes))
+        Ok(out)
     }
 
     /// Removes every entry.
@@ -112,6 +127,14 @@ impl Cache {
             }
         }
         Ok(())
+    }
+}
+
+/// Marks `path` as used now by moving its modification time; a file that
+/// cannot be touched keeps its old time, which only makes it go sooner.
+pub(crate) fn touch(path: &Path) {
+    if let Ok(file) = std::fs::OpenOptions::new().write(true).open(path) {
+        let _ = file.set_modified(SystemTime::now());
     }
 }
 

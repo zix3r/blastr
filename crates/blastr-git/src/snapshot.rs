@@ -27,7 +27,7 @@ impl Repo {
     /// Writes the files of a tree into `snapshots_dir`, once.
     fn materialize_tree(&self, id: &str, snapshots_dir: &Path) -> Result<PathBuf, Error> {
         let destination = snapshots_dir.join(id);
-        if is_complete(&destination) {
+        if reuse(&destination) {
             return Ok(destination);
         }
         let repo = self.repo()?;
@@ -49,7 +49,7 @@ impl Repo {
     fn materialize_index(&self, snapshots_dir: &Path) -> Result<PathBuf, Error> {
         let content_id = self.uncommitted_content_id(&Source::Index)?;
         let destination = snapshots_dir.join(format!("index-{content_id}"));
-        if is_complete(&destination) {
+        if reuse(&destination) {
             return Ok(destination);
         }
         let repo = self.repo()?;
@@ -70,6 +70,22 @@ impl Repo {
         })?;
         Ok(destination)
     }
+}
+
+/// True when `dir` holds a complete snapshot, which is then marked as used now:
+/// the time of its marker is when it was last used, and the cache removes
+/// the snapshots unused the longest first.
+fn reuse(dir: &Path) -> bool {
+    if !is_complete(dir) {
+        return false;
+    }
+    if let Ok(marker) = std::fs::OpenOptions::new()
+        .write(true)
+        .open(dir.join(SNAPSHOT_MARKER))
+    {
+        let _ = marker.set_modified(std::time::SystemTime::now());
+    }
+    true
 }
 
 /// True when `dir` holds a snapshot that was written completely.
