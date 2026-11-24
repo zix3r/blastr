@@ -11,6 +11,7 @@
 //! Symbol ids are assigned after the whole walk, in a deterministic order, so
 //! the same project always produces the same ids.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
@@ -70,7 +71,7 @@ impl Workspace {
         };
         attach_db(db, || {
             let members = self.members(db);
-            let (walks, inactive) = pipeline.run(members.len(), |index| {
+            let (walks, inactive, failed) = pipeline.run(members.len(), |index| {
                 let extractor = Extractor::new(db, &locator, cancel, self, &members[index]);
                 let extractor = extractor.run()?;
                 let modules = extractor.modules.clone();
@@ -80,7 +81,8 @@ impl Workspace {
                 .iter()
                 .map(|member| member.resolved.krate.base())
                 .collect();
-            let assembler = Assembler::merge(walks, database, &locator, self, workspace_crates);
+            let mut assembler = Assembler::merge(walks, database, &locator, self, workspace_crates);
+            assembler.failed += failed;
             Ok(assembler.finish(inactive))
         })
     }
@@ -216,6 +218,8 @@ struct Extractor<'a> {
     /// The procedural macros of the crate, waiting for the symbol of the
     /// function that implements them.
     aliases: Vec<MacroAlias>,
+    /// The queries that panicked, whose answers are missing.
+    failed: Cell<u32>,
 }
 
 /// A procedural macro, which has no item of its own.
@@ -257,6 +261,7 @@ impl<'a> Extractor<'a> {
             modules: Vec::new(),
             containers: Vec::new(),
             aliases: Vec::new(),
+            failed: Cell::new(0),
         }
     }
 
@@ -865,9 +870,13 @@ impl<'a> Extractor<'a> {
     /// rust-analyzer uses unwinding to cancel queries and can panic on syntax it
     /// cannot map, for example inside a broken macro expansion. One such item
     /// must not take the whole extraction down, and every caller can do without
-    /// the answer, so a panic becomes `None`.
+    /// the answer, so a panic becomes `None`. It is counted, so that the graph
+    /// can say that something is missing.
     fn guarded<T>(&self, query: impl FnOnce() -> Option<T>) -> Option<T> {
-        catch_unwind(AssertUnwindSafe(query)).ok().flatten()
+        catch_unwind(AssertUnwindSafe(query)).unwrap_or_else(|_| {
+            self.failed.set(self.failed.get() + 1);
+            None
+        })
     }
 
     /// The definitions a listing query returns, or none when it panics.
@@ -976,6 +985,8 @@ struct Assembler<'a> {
     defs: HashMap<DefKey, usize>,
     /// The regions the dependency pass walks.
     containers: Vec<PendingContainer>,
+    /// The queries of the walks that panicked.
+    failed: u32,
 }
 
 impl<'a> Assembler<'a> {
@@ -995,8 +1006,10 @@ impl<'a> Assembler<'a> {
             raws: Vec::new(),
             defs: HashMap::new(),
             containers: Vec::new(),
+            failed: 0,
         };
         for walk in walks {
+            assembler.failed += walk.failed.get();
             let offset = assembler.raws.len();
             for mut raw in walk.raws {
                 if let Some(parent) = raw.parent {
@@ -1096,6 +1109,7 @@ impl<'a> Assembler<'a> {
             unresolved: Vec::new(),
             inactive,
             restricted: self.workspace.restricted,
+            failed_queries: 0,
         };
 
         let sema = Semantics::new(self.db);
@@ -1114,6 +1128,7 @@ impl<'a> Assembler<'a> {
         graph.edges.extend(output.edges);
         edges::sort_edges(&mut graph.edges);
         graph.unresolved = output.unresolved;
+        graph.failed_queries = self.failed + output.failed;
         graph
     }
 }

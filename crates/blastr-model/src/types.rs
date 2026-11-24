@@ -236,6 +236,9 @@ pub struct RevisionGraph {
     pub inactive: Vec<Location>,
     /// True when build scripts and procedural macros were not run.
     pub restricted: bool,
+    /// rust-analyzer queries that panicked during the extraction; the symbols,
+    /// edges or inactive ranges they would have found are missing.
+    pub failed_queries: u32,
 }
 
 /// What the user asked to be analysed, independent of the revision.
@@ -450,6 +453,12 @@ pub enum Limit {
     MacrosNotExpanded {
         /// The crates whose macros failed, sorted and without duplicates.
         crates: Vec<String>,
+    },
+    /// rust-analyzer failed on some queries while the graphs were extracted,
+    /// so what they would have found is missing.
+    FailedQueries {
+        /// How many, on both sides together.
+        count: u32,
     },
 }
 

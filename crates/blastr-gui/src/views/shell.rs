@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use blastr_model::protocol::Failure;
-use blastr_model::{Assume, ExecMode, wording};
+use blastr_model::{Assume, ExecMode, Limit, wording};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::command::{Command, CommandItem, CommandState};
 use gpui_kit::component::notification::Notification;
@@ -521,6 +521,22 @@ impl Shell {
                         .child(separator())
                         .child(icon(IconName::TriangleAlert, theme::EDIT.fg))
                         .child(format!("{unresolved} unresolved {noun}"));
+                }
+                let failed = outcome
+                    .analysis
+                    .diff
+                    .limits
+                    .iter()
+                    .find_map(|limit| match limit {
+                        Limit::FailedQueries { count } => Some(*count),
+                        _ => None,
+                    });
+                if let Some(failed) = failed {
+                    let noun = wording::count_noun(failed, "query", "queries");
+                    left = left
+                        .child(separator())
+                        .child(icon(IconName::TriangleAlert, theme::EDIT.fg))
+                        .child(format!("{failed} failed rust-analyzer {noun}"));
                 }
                 let elapsed = outcome.elapsed.as_secs_f64();
                 right = right.child(if elapsed < 0.3 {

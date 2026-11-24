@@ -248,6 +248,10 @@ fn limit_text(limit: &Limit) -> String {
                  from the analysis"
             )
         }
+        Limit::FailedQueries { count } => {
+            let noun = count_noun(*count, "query", "queries");
+            format!("rust-analyzer failed on {count} {noun}, so parts of the graph are missing")
+        }
     }
 }
 
@@ -912,6 +916,31 @@ mod tests {
             sentence
                 .text
                 .contains("is 3 steps from Invoice::total, whose body changed")
+        );
+    }
+
+    #[test]
+    fn failed_queries_are_listed_among_the_limits() {
+        let analysis = Analysis {
+            diff: crate::DiffResult {
+                comparison: crate::Comparison {
+                    base: crate::Source::Worktree,
+                    head: crate::Source::Worktree,
+                },
+                base_key: None,
+                head_key: None,
+                changed_files: Vec::new(),
+                changes: Vec::new(),
+                limits: vec![Limit::FailedQueries { count: 2 }],
+            },
+            items: Vec::new(),
+            tests: crate::TestSelection::default(),
+            limits: crate::ImpactLimits::default(),
+            params: crate::AnalysisParams::default(),
+        };
+        assert_eq!(
+            limit_parts(&analysis),
+            ["rust-analyzer failed on 2 queries, so parts of the graph are missing"]
         );
     }
 

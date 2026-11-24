@@ -251,6 +251,7 @@ impl Engine {
         let limits = collect_limits(
             &run,
             &fetched.graph,
+            fetched.graph.failed_queries,
             &BTreeMap::new(),
             &fetched.missing_macros,
         )?;

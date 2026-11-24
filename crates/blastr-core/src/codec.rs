@@ -109,6 +109,7 @@ mod tests {
             }],
             inactive: vec![loc("src/lib.rs", 50, 60)],
             restricted: true,
+            failed_queries: 2,
         }
     }
 

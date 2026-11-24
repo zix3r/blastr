@@ -207,6 +207,7 @@ mod tests {
             unresolved: Vec::new(),
             inactive: Vec::new(),
             restricted: false,
+            failed_queries: 0,
         }
     }
 

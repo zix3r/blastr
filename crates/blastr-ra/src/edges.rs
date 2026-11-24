@@ -29,6 +29,7 @@
 //! macro-defined item is found by expanding the macro call and walking the
 //! expansion; its location is always mapped back to the real file.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
@@ -151,6 +152,8 @@ pub(crate) struct Output {
     pub(crate) edges: Vec<Edge>,
     /// The references that did not resolve.
     pub(crate) unresolved: Vec<UnresolvedRef>,
+    /// The queries that panicked, whose edges are missing.
+    pub(crate) failed: u32,
 }
 
 /// Collects every edge kind except `Contains`.
@@ -171,11 +174,13 @@ pub(crate) fn collect(input: Input<'_, '_>) -> Output {
         invocations: HashMap::new(),
         quiet: false,
         expansion_site: None,
+        failed: Cell::new(0),
     };
     collector.run();
     Output {
         edges: collector.edges,
         unresolved: collector.unresolved,
+        failed: collector.failed.get(),
     }
 }
 
@@ -306,6 +311,8 @@ struct Collector<'a, 'db> {
     /// that call, because the tokens of the inner call are part of the outer call
     /// in the real file.
     expansion_site: Option<Location>,
+    /// The queries that panicked, whose edges are missing.
+    failed: Cell<u32>,
 }
 
 impl<'db> Collector<'_, 'db> {
@@ -1733,9 +1740,13 @@ impl<'db> Collector<'_, 'db> {
     ///
     /// rust-analyzer can panic on syntax it cannot map, for example inside a
     /// broken macro expansion. One such reference must not take the whole
-    /// extraction down, and every caller can do without the answer.
+    /// extraction down, and every caller can do without the answer. It is
+    /// counted, so that the graph can say that something is missing.
     fn guard<T>(&self, query: impl FnOnce() -> Option<T>) -> Option<T> {
-        catch_unwind(AssertUnwindSafe(query)).ok().flatten()
+        catch_unwind(AssertUnwindSafe(query)).unwrap_or_else(|_| {
+            self.failed.set(self.failed.get() + 1);
+            None
+        })
     }
 }
 

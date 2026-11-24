@@ -123,7 +123,13 @@ pub(crate) fn pipeline(
     );
     changes.extend(manifest_changes(run.repo, comparison, &changed_files)?);
     let lines = changed_lines_of(run.repo, comparison, &changed_files)?;
-    let limits = collect_limits(run, &sides.head, &lines, &sides.missing_macros)?;
+    let limits = collect_limits(
+        run,
+        &sides.head,
+        sides.base.failed_queries + sides.head.failed_queries,
+        &lines,
+        &sides.missing_macros,
+    )?;
     let diff = DiffResult {
         comparison: comparison.clone(),
         base_key: sides.base_key.clone(),
@@ -259,10 +265,12 @@ fn changed_lines_of(
     Ok(lines)
 }
 
-/// What limits the completeness of a comparison.
+/// What limits the completeness of a comparison; `failed_queries` counts the
+/// rust-analyzer queries that failed while the graphs were extracted.
 pub(crate) fn collect_limits(
     run: &Run<'_>,
     head: &RevisionGraph,
+    failed_queries: u32,
     changed_lines: &BTreeMap<RelPath, Vec<RangeInclusive<u32>>>,
     missing_macros: &[String],
 ) -> Result<Vec<Limit>> {
@@ -273,6 +281,11 @@ pub(crate) fn collect_limits(
     if !missing_macros.is_empty() {
         limits.push(Limit::MacrosNotExpanded {
             crates: missing_macros.to_vec(),
+        });
+    }
+    if failed_queries > 0 {
+        limits.push(Limit::FailedQueries {
+            count: failed_queries,
         });
     }
     if run.repo.has_submodules()? {

@@ -18,7 +18,7 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use blastr_model::{CancelToken, Location, Progress};
 use ra_ap_hir::{AnyDiagnostic, Crate, Module, attach_db, db::HirDatabase};
@@ -44,7 +44,8 @@ pub(crate) struct Pipeline<'a> {
 
 impl Pipeline<'_> {
     /// Computes the definition maps, walks the `members` member crates with
-    /// `walk` and reads the inactive ranges of the modules the walks return.
+    /// `walk` and reads the inactive ranges of the modules the walks return,
+    /// with the number of modules whose ranges could not be read.
     ///
     /// `walk` runs on the calling thread, which must have the database
     /// attached.
@@ -52,7 +53,7 @@ impl Pipeline<'_> {
         &self,
         members: usize,
         mut walk: impl FnMut(usize) -> Result<(T, Vec<Module>), Error>,
-    ) -> Result<(Vec<T>, Vec<Location>), Error> {
+    ) -> Result<(Vec<T>, Vec<Location>, u32), Error> {
         {
             let _span = tracing::info_span!("prime caches").entered();
             let crates: Vec<_> = Crate::all(self.database)
@@ -94,17 +95,20 @@ impl Pipeline<'_> {
         let _span = tracing::info_span!("inactive ranges", modules = modules.len()).entered();
         let inactive = Mutex::new(Vec::new());
         let done = AtomicU64::new(0);
+        let failed = AtomicU32::new(0);
         let total = modules.len() as u64;
         let (paths, progress) = (self.paths, self.progress);
         self.parallel(&modules, |db, module| {
-            let ranges = inactive_ranges(db, *module, &Locator::new(db, paths));
-            lock(&inactive).extend(ranges);
+            match inactive_ranges(db, *module, &Locator::new(db, paths)) {
+                Some(ranges) => lock(&inactive).extend(ranges),
+                None => _ = failed.fetch_add(1, Ordering::Relaxed),
+            }
             let done = done.fetch_add(1, Ordering::Relaxed) + 1;
             progress.report("extract", done, Some(total));
             Some(())
         });
         check_cancel(self.cancel)?;
-        Ok((walks, lock(&inactive).split_off(0)))
+        Ok((walks, lock(&inactive).split_off(0), failed.into_inner()))
     }
 
     /// The number of workers: as many as asked for, or one per core.
@@ -162,16 +166,20 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 ///
 /// rust-analyzer reports them among the diagnostics of the module, which also
 /// validate every body of the module; that is the price of the answer, and the
-/// caller runs it for several modules at once.
-fn inactive_ranges(db: &dyn HirDatabase, module: Module, locator: &Locator<'_>) -> Vec<Location> {
+/// caller runs it for several modules at once. `None` when the query panicked.
+fn inactive_ranges(
+    db: &dyn HirDatabase,
+    module: Module,
+    locator: &Locator<'_>,
+) -> Option<Vec<Location>> {
     let mut diagnostics = Vec::new();
     let done = catch_unwind(AssertUnwindSafe(|| {
         module.diagnostics(db, &mut diagnostics, false);
     }));
     if done.is_err() {
-        return Vec::new();
+        return None;
     }
-    diagnostics
+    let ranges = diagnostics
         .into_iter()
         .filter_map(|diagnostic| match diagnostic {
             AnyDiagnostic::InactiveCode(code) => {
@@ -186,5 +194,6 @@ fn inactive_ranges(db: &dyn HirDatabase, module: Module, locator: &Locator<'_>) 
             .ok()
             .flatten()
         })
-        .collect()
+        .collect();
+    Some(ranges)
 }
