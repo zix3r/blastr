@@ -76,6 +76,8 @@ pub(crate) struct Workspace {
     pub commits: Commits,
     /// Whether a setting the analysis depends on changed since it ran.
     pub rerun_needed: bool,
+    /// The change whose propagation the graph shows.
+    focus: Option<usize>,
     save: Task<()>,
     _receive: Task<()>,
 }
@@ -134,6 +136,7 @@ impl Workspace {
             tests_expanded: Vec::new(),
             commits: Commits::default(),
             rerun_needed: false,
+            focus: None,
             save: Task::ready(()),
             _receive: receive,
         }
@@ -321,6 +324,7 @@ impl Workspace {
             }
             Response::Cache { .. } => self.probing = false,
         }
+        self.refocus();
         cx.notify();
     }
 
@@ -521,6 +525,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.session.select(Selection { symbol, site });
+        self.refocus();
         cx.notify();
     }
 
@@ -532,6 +537,7 @@ impl Workspace {
             self.session.history.back().is_some()
         };
         if moved {
+            self.refocus();
             cx.notify();
         }
     }
@@ -557,13 +563,24 @@ impl Workspace {
     /// The change whose propagation the graph shows: the selected change, or
     /// the one the selected item's best path starts from.
     pub(crate) fn focus_change(&self) -> Option<usize> {
-        if let Some((index, _)) = self.selected_change() {
-            return Some(index);
-        }
-        self.selected_item()?
-            .paths
-            .first()
-            .map(|path| path.change as usize)
+        self.focus
+    }
+
+    /// Follows the selection with the focused change, keeping the one shown
+    /// while it still reaches a selected item.
+    fn refocus(&mut self) {
+        self.focus = match (self.selected_change(), self.selected_item()) {
+            (Some((index, _)), _) => Some(index),
+            (None, Some(item)) => {
+                let reaches =
+                    |index: usize| item.paths.iter().any(|path| path.change as usize == index);
+                match self.focus {
+                    Some(index) if reaches(index) => Some(index),
+                    _ => item.paths.first().map(|path| path.change as usize),
+                }
+            }
+            (None, None) => None,
+        };
     }
 
     /// Where the selection is: the revision and the location to read.
@@ -592,6 +609,7 @@ impl Workspace {
 
     /// Rebuilds the rows of the lists from the session and the filter.
     fn rebuild_rows(&mut self) {
+        self.refocus();
         let analysis = self.session.analysis().cloned();
         let loading = self.session.shown().is_loading();
         self.outline = Outline::build(
