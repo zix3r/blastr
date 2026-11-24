@@ -1214,6 +1214,10 @@ fn fixture_repository(fixtures: &Path, dir: &Path) {
         }
     }
     copy_workspace(&fixtures.join("after"), dir);
+    // A copy keeps the size and the modification time of its source, so the
+    // index would take an edit of the same length for an unchanged file:
+    // every file is hashed again instead.
+    git(dir, &["rm", "-r", "-q", "--cached", "."]);
     git(dir, &["add", "-A"]);
     git(dir, &["commit", "-qm", "after"]);
 }
