@@ -124,7 +124,8 @@ Blastr loads both revisions with [rust-analyzer](https://rust-analyzer.github.io
 library, and turns each into a graph of symbols and the references between them. It matches the
 symbols across the two sides (renames and moves included), classifies every difference, and then
 follows the references backwards from each change using rules specific to its kind. Graphs and
-results are cached per revision and configuration, so the second look at a commit is instant.
+results are cached per revision and configuration, so the second look at a commit is instant; the cache
+keeps itself under 2 GB by dropping what was used least recently.
 
 The analysis runs in a separate engine process, the way editors run rust-analyzer: a slow or failed
 load never freezes or crashes the window.
