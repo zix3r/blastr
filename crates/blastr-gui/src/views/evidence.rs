@@ -86,6 +86,11 @@ impl EvidencePanel {
     fn body(&self, cx: &mut Context<Self>) -> AnyElement {
         let workspace = self.workspace.read(cx);
         let session = &workspace.session;
+        // While a comparison or a hypothetical change is on its way, the
+        // panel shows where its evidence will be. A refresh keeps the last.
+        if session.shown().is_loading() {
+            return ui::evidence_skeleton();
+        }
         let Some(selection) = session.selection() else {
             return ui::empty_state(
                 IconName::Network,

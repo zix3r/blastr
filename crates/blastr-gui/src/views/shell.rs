@@ -657,7 +657,7 @@ impl Shell {
                         .h(px(code_height))
                         .border_t_1()
                         .border_color(theme::LINE)
-                        .bg(theme::BG_CANVAS),
+                        .child(ui::code_skeleton()),
                 )
                 .into_any_element()
         } else if self.code.read(cx).maximized {

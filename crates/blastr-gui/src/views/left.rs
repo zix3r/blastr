@@ -447,26 +447,27 @@ impl LeftPane {
                 .text_color(theme::FG_4)
                 .child(text.clone())
                 .into_any_element(),
-            Row::Skeleton => h_flex()
-                .h(px(height::SKELETON))
-                .px_3()
-                .gap_2()
-                .items_center()
-                .child(
-                    div()
-                        .w(px(90.))
-                        .h(px(8.))
-                        .rounded(px(4.))
-                        .bg(theme::BG_RAISED_2),
+            // A row as the result will draw it: a marker, a name, its module
+            // and a badge, of lengths that differ from row to row.
+            Row::Skeleton => {
+                let name = [110., 84., 132., 96.][index % 4];
+                let module = [64., 88., 52., 76.][index % 4];
+                ui::shimmer(
+                    ("skeleton-row", index),
+                    h_flex()
+                        .h(px(height::SKELETON))
+                        .w_full()
+                        .pl(ui::LEAD_PLAIN)
+                        .pr(px(10.))
+                        .gap(ui::GUTTER_GAP)
+                        .items_center()
+                        .child(ui::gutter(ui::bone(px(8.), px(8.)).rounded(px(4.))))
+                        .child(ui::bone(px(name), px(10.)))
+                        .child(ui::bone(px(module), px(8.)))
+                        .child(div().flex_1())
+                        .child(ui::bone(px(46.), ui::PILL)),
                 )
-                .child(
-                    div()
-                        .w(px(40.))
-                        .h(px(8.))
-                        .rounded(px(4.))
-                        .bg(theme::BG_RAISED_2),
-                )
-                .into_any_element(),
+            }
             Row::Gap => div().into_any_element(),
         }
     }

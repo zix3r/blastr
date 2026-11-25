@@ -574,3 +574,152 @@ pub(crate) fn determinate_bar(fraction: f32, height: Pixels) -> AnyElement {
         )
         .into_any_element()
 }
+
+/// A placeholder block of a skeleton: where text or a badge will be.
+pub(crate) fn bone(width: impl Into<gpui_kit::Length> + Clone, height: Pixels) -> Div {
+    div()
+        .flex_none()
+        .w(width)
+        .h(height)
+        .rounded(RADIUS_SM)
+        .bg(theme::BG_RAISED_2)
+}
+
+/// `content` with a faint highlight sweeping across it, left to right.
+///
+/// Every sweep takes the same time and starts on the frame its placeholder
+/// first shows, so the rows of a list sweep together, as one band. Only a
+/// view that is loading draws one: the animation redraws the window on every
+/// frame while it runs.
+pub(crate) fn shimmer(id: impl Into<ElementId>, content: impl IntoElement) -> AnyElement {
+    let glow = theme::FG.hsla().alpha(0.06);
+    let clear = theme::FG.hsla().alpha(0.);
+    let half = |from, to| {
+        div().h_full().flex_1().bg(gpui_kit::linear_gradient(
+            90.,
+            gpui_kit::linear_color_stop(from, 0.),
+            gpui_kit::linear_color_stop(to, 1.),
+        ))
+    };
+    let band = h_flex()
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .w(gpui_kit::relative(0.4))
+        .child(half(clear, glow))
+        .child(half(glow, clear))
+        .with_animation(
+            id,
+            gpui_kit::Animation::new(std::time::Duration::from_millis(1600))
+                .repeat()
+                .with_easing(gpui_kit::ease_in_out),
+            |band, delta| band.left(gpui_kit::relative(-0.4 + 1.4 * delta)),
+        );
+    div()
+        .relative()
+        .size_full()
+        .overflow_hidden()
+        .child(content)
+        .child(band)
+        .into_any_element()
+}
+
+/// The evidence panel while the result is on its way: a name, its place, two
+/// badges, a sentence and the steps of a path.
+pub(crate) fn evidence_skeleton() -> AnyElement {
+    let step = |index: usize, width: f32| {
+        h_flex()
+            .id(("evidence-skeleton-step", index))
+            .gap(GUTTER_GAP)
+            .items_center()
+            .child(gutter(bone(px(8.), px(8.)).rounded(px(4.))))
+            .child(bone(px(width), px(10.)))
+            .child(div().flex_1())
+            .child(bone(px(54.), px(8.)))
+    };
+    shimmer(
+        "evidence-skeleton",
+        v_flex()
+            .p_3()
+            .gap_3()
+            .child(bone(px(180.), px(14.)))
+            .child(bone(gpui_kit::relative(0.8), px(8.)))
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(bone(px(96.), PILL))
+                    .child(bone(px(116.), PILL)),
+            )
+            .child(
+                v_flex()
+                    .gap(px(7.))
+                    .child(bone(gpui_kit::relative(0.95), px(9.)))
+                    .child(bone(gpui_kit::relative(0.7), px(9.))),
+            )
+            .child(bone(px(90.), px(8.)))
+            .child(step(0, 120.))
+            .child(step(1, 150.))
+            .child(step(2, 100.)),
+    )
+}
+
+/// The code pane while the result is on its way: a header and lines of
+/// source of different lengths, indented as code is.
+pub(crate) fn code_skeleton() -> AnyElement {
+    // Indent and length of each line, in characters' worth of 8 px.
+    const LINES: [(u8, u8); 14] = [
+        (0, 30),
+        (1, 44),
+        (2, 26),
+        (2, 52),
+        (1, 8),
+        (0, 0),
+        (1, 38),
+        (2, 60),
+        (3, 34),
+        (2, 12),
+        (1, 6),
+        (0, 0),
+        (0, 24),
+        (1, 40),
+    ];
+    let lines = LINES.iter().enumerate().map(|(index, (indent, length))| {
+        h_flex()
+            .h(px(19.))
+            .gap_3()
+            .items_center()
+            .child(
+                div()
+                    .w(px(28.))
+                    .flex()
+                    .justify_end()
+                    .child(bone(px(if index >= 9 { 14. } else { 8. }), px(8.))),
+            )
+            .child(div().w(px(f32::from(*indent) * 24.)))
+            .when(*length > 0, |line| {
+                line.child(bone(px(f32::from(*length) * 8.), px(9.)))
+            })
+    });
+    v_flex()
+        .size_full()
+        .bg(theme::BG_CANVAS)
+        .child(
+            h_flex()
+                .h(px(32.))
+                .flex_none()
+                .px_2()
+                .gap_2()
+                .items_center()
+                .border_b_1()
+                .border_color(theme::LINE)
+                .bg(theme::BG_PANEL)
+                .child(bone(px(12.), px(12.)))
+                .child(bone(px(220.), px(9.)))
+                .child(bone(px(120.), px(9.))),
+        )
+        .child(shimmer(
+            "code-skeleton",
+            v_flex().size_full().py_2().children(lines),
+        ))
+        .into_any_element()
+}
