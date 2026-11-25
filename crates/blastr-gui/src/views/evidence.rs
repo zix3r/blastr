@@ -143,9 +143,17 @@ impl EvidencePanel {
                             .child(subtitle.join(" · ")),
                     ),
             );
+        // A changed symbol is shown as the change, as the graph and the code
+        // pane show it; that another change reaches it too is said below.
         column = match (&item, &change) {
-            (Some(item), _) => column.child(self.item_evidence(item, &analysis, cx)),
-            (None, Some(change)) => column.child(self.change_evidence(change, &analysis, cx)),
+            (_, Some(change)) => {
+                let column = column.child(self.change_evidence(change, &analysis, cx));
+                match &item {
+                    Some(item) => column.child(also_reached(item, &analysis)),
+                    None => column,
+                }
+            }
+            (Some(item), None) => column.child(self.item_evidence(item, &analysis, cx)),
             (None, None) => column.child(
                 div()
                     .text_size(TEXT_UI)
@@ -618,6 +626,22 @@ fn sentence(sentence: &wording::Sentence) -> AnyElement {
                 .with_font_family_overrides(names.into_iter().map(|range| (range, theme::mono()))),
         )
         .into_any_element()
+}
+
+/// That a changed symbol is also reached, and how, under its change.
+fn also_reached(item: &ImpactItem, analysis: &Analysis) -> AnyElement {
+    let mut column =
+        v_flex()
+            .gap_1()
+            .child(section("ALSO REACHED", ""))
+            .child(h_flex().gap_2().child(ui::pill_outlined(
+                wording::class_text(item.class).to_uppercase(),
+                ui::class_accent(item.class),
+            )));
+    if let Some(path) = item.paths.iter().find(|path| path.class == item.class) {
+        column = column.child(sentence(&wording::explanation(item, path, analysis)));
+    }
+    column.into_any_element()
 }
 
 /// What limits the result, from the wording of the analysis.

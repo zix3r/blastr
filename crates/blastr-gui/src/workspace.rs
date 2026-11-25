@@ -595,15 +595,16 @@ impl Workspace {
         if let Some(site) = &selection.site {
             return Some((head, site.clone()));
         }
-        if let Some(item) = self.selected_item() {
-            return Some((head, item.location.clone()));
-        }
+        // A symbol that is both changed and reached is shown as the change.
         if let Some((_, change)) = self.selected_change() {
             return match (&change.new, &change.old) {
                 (Some(new), _) => Some((head, new.clone())),
                 (None, Some(old)) => Some((diff.comparison.base.clone(), old.clone())),
                 (None, None) => None,
             };
+        }
+        if let Some(item) = self.selected_item() {
+            return Some((head, item.location.clone()));
         }
         let entry = self.search.find(&selection.symbol)?;
         Some((head, entry.location.clone()))
