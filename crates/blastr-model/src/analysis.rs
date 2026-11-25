@@ -209,7 +209,8 @@ pub struct ImpactLimits {
 /// Everything that shapes an impact result besides the code itself.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AnalysisParams {
-    /// Most steps an item's path may take for the item to be listed. Test
+    /// Most steps an item's path may take for the item to be listed;
+    /// [`AnalysisParams::UNLIMITED`] lists items at any distance. Test
     /// selection is not limited by it.
     pub depth: u32,
     /// Lowest confidence listed.
@@ -275,10 +276,25 @@ impl Assume {
     }
 }
 
+impl AnalysisParams {
+    /// The depth that lists items at any distance.
+    pub const UNLIMITED: u32 = 0;
+
+    /// The most steps a listed item's path may take: the depth, or no limit
+    /// for [`AnalysisParams::UNLIMITED`].
+    pub fn step_limit(&self) -> u32 {
+        if self.depth == Self::UNLIMITED {
+            u32::MAX
+        } else {
+            self.depth
+        }
+    }
+}
+
 impl Default for AnalysisParams {
     fn default() -> Self {
         AnalysisParams {
-            depth: 8,
+            depth: AnalysisParams::UNLIMITED,
             min_confidence: Confidence::Possible,
             ignore: Vec::new(),
         }
@@ -345,9 +361,15 @@ mod tests {
     }
 
     #[test]
-    fn defaults_list_eight_steps_at_any_confidence() {
+    fn defaults_list_every_distance_at_any_confidence() {
         let params = AnalysisParams::default();
-        assert_eq!(params.depth, 8);
+        assert_eq!(params.depth, AnalysisParams::UNLIMITED);
+        assert_eq!(params.step_limit(), u32::MAX);
+        let shallow = AnalysisParams {
+            depth: 3,
+            ..params.clone()
+        };
+        assert_eq!(shallow.step_limit(), 3);
         assert_eq!(params.min_confidence, Confidence::Possible);
         assert!(params.ignore.is_empty());
     }

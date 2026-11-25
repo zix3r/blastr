@@ -12,8 +12,9 @@ use serde::{Deserialize, Serialize};
 /// How many repositories the start screen remembers.
 const MAX_RECENT: usize = 12;
 
-/// The smallest and largest depth the impact is followed to.
-pub const DEPTHS: std::ops::RangeInclusive<u32> = 1..=64;
+/// The depths the impact can be followed to; the first,
+/// [`AnalysisParams::UNLIMITED`], follows it to any distance.
+pub const DEPTHS: std::ops::RangeInclusive<u32> = AnalysisParams::UNLIMITED..=64;
 
 /// Where and how large the window was.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -59,7 +60,7 @@ pub struct Recent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AnalysisSettings {
-    /// How many steps the impact is followed.
+    /// How many steps the impact is followed; 0 follows it to any distance.
     pub depth: u32,
     /// The lowest confidence the lists and the graph show.
     pub min_confidence: Confidence,
@@ -78,7 +79,7 @@ impl Default for AnalysisSettings {
 }
 
 /// What one repository is analysed with.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RepositorySettings {
     pub path: PathBuf,
@@ -89,6 +90,20 @@ pub struct RepositorySettings {
     /// Whether build scripts and procedural macros are skipped; `None` until
     /// the user was asked.
     pub restricted: Option<bool>,
+}
+
+impl Default for RepositorySettings {
+    /// Every feature on, so that code behind a feature is analysed too.
+    fn default() -> Self {
+        RepositorySettings {
+            path: PathBuf::new(),
+            features: Vec::new(),
+            all_features: true,
+            target: None,
+            ignore: Vec::new(),
+            restricted: None,
+        }
+    }
 }
 
 /// Everything the window remembers.
@@ -161,6 +176,17 @@ impl Settings {
         self.repositories.iter().find(|entry| entry.path == path)
     }
 
+    /// The settings of one repository as they apply now: its own, or the
+    /// defaults until it has any.
+    pub fn repository_or_default(&self, path: &Path) -> RepositorySettings {
+        self.repository(path)
+            .cloned()
+            .unwrap_or_else(|| RepositorySettings {
+                path: path.to_path_buf(),
+                ..RepositorySettings::default()
+            })
+    }
+
     /// The settings of one repository, created on first use.
     pub fn repository_mut(&mut self, path: &Path) -> &mut RepositorySettings {
         match self
@@ -193,7 +219,7 @@ impl Settings {
 
     /// What a comparison of the repository at `root` is run with.
     pub fn analysis_for(&self, root: &Path) -> (AnalysisOptions, AnalysisParams) {
-        let repository = self.repository(root).cloned().unwrap_or_default();
+        let repository = self.repository_or_default(root);
         let options = AnalysisOptions {
             features: repository.features,
             all_features: repository.all_features,
@@ -240,10 +266,39 @@ mod tests {
         let directory = tempfile::tempdir().expect("a directory");
         let settings = Settings::load(&directory.path().join("settings.json"));
         assert_eq!(settings, Settings::default());
-        assert_eq!(settings.analysis.depth, 8);
+        assert_eq!(settings.analysis.depth, AnalysisParams::UNLIMITED);
         assert_eq!(settings.analysis.min_confidence, Confidence::Possible);
         assert!(settings.analysis.refresh_on_save);
         assert!(settings.editor.is_empty());
+        let (options, params) = settings.analysis_for(Path::new("/code/a"));
+        assert!(options.all_features);
+        assert!(options.watch);
+        assert_eq!(params.step_limit(), u32::MAX);
+    }
+
+    #[test]
+    fn a_new_repository_entry_and_a_partial_one_have_every_feature_on() {
+        let mut settings = Settings::default();
+        assert!(settings.repository_mut(Path::new("/code/a")).all_features);
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("settings.json");
+        std::fs::write(&path, r#"{ "repositories": [{ "path": "/code/b" }] }"#).expect("a file");
+        let settings = Settings::load(&path);
+        assert!(
+            settings
+                .repository_or_default(Path::new("/code/b"))
+                .all_features
+        );
+    }
+
+    #[test]
+    fn depth_zero_survives_loading_and_a_large_one_is_capped() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("settings.json");
+        std::fs::write(&path, r#"{ "analysis": { "depth": 0 } }"#).expect("a file");
+        assert_eq!(Settings::load(&path).analysis.depth, 0);
+        std::fs::write(&path, r#"{ "analysis": { "depth": 900 } }"#).expect("a file");
+        assert_eq!(Settings::load(&path).analysis.depth, *DEPTHS.end());
     }
 
     #[test]

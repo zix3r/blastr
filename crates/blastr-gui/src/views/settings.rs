@@ -12,6 +12,7 @@ use gpui_kit::component::setting::{
     NumberFieldOptions, SettingField, SettingGroup, SettingItem, SettingPage,
     Settings as SettingsView,
 };
+use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{Icon, IconName, Sizable as _, WindowExt as _, h_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::{App, Entity, ParentElement, SharedString, Styled, Window, div, px};
@@ -141,20 +142,24 @@ fn analysis_page(workspace: &Entity<Workspace>) -> SettingPage {
                             max: f64::from(*DEPTHS.end()),
                             step: 1.0,
                         },
-                        getter(workspace, |settings| f64::from(settings.analysis.depth)),
+                        getter(workspace, |settings| f64::from(shown_depth(settings))),
                         setter(workspace, |settings, value: f64| {
-                            settings.analysis.depth =
-                                (value.round() as u32).clamp(*DEPTHS.start(), *DEPTHS.end());
+                            settings.analysis.depth = (value.max(0.0).round() as u32)
+                                .clamp(*DEPTHS.start(), *DEPTHS.end());
                         }),
                     ),
                 )
-                .description("How many steps the impact of a change is followed."),
+                .description(
+                    "How many steps the impact of a change is followed. 0 = unlimited: every \
+                     item it reaches is listed.",
+                ),
             )
             .item(
                 SettingItem::new(
                     "Refresh on save",
-                    SettingField::switch(
-                        getter(workspace, |settings| settings.analysis.refresh_on_save),
+                    toggle(
+                        "refresh-on-save",
+                        getter(workspace, shown_refresh_on_save),
                         setter(workspace, |settings, value: bool| {
                             settings.analysis.refresh_on_save = value
                         }),
@@ -163,6 +168,38 @@ fn analysis_page(workspace: &Entity<Workspace>) -> SettingPage {
                 .description("Run a comparison of the working tree again when a file is saved."),
             ),
     )
+}
+
+/// A switch for one setting, drawn in the brand colour when it is on.
+///
+/// The library's own switch field draws *on* as a track in the primary
+/// button's near-white with a near-black knob, and *off* as a dark grey track
+/// with the same knob: in this theme the two read alike, and an enabled
+/// setting looked disabled. This one fills the track when it is on and keeps
+/// a light knob in both states.
+fn toggle(
+    id: &'static str,
+    value: impl Fn(&App) -> bool + 'static,
+    set: impl Fn(bool, &mut App) + 'static,
+) -> SettingField<SharedString> {
+    let set = Rc::new(set);
+    SettingField::render(move |_, _, cx| {
+        let set = set.clone();
+        Switch::new(id)
+            .checked(value(cx))
+            .color(theme::CHANGED.solid)
+            .on_click(move |checked: &bool, _, cx| set(*checked, cx))
+    })
+}
+
+/// The depth the dialog shows: 0 for unlimited.
+fn shown_depth(settings: &Settings) -> u32 {
+    settings.analysis.depth
+}
+
+/// Whether the dialog shows refresh on save as on.
+fn shown_refresh_on_save(settings: &Settings) -> bool {
+    settings.analysis.refresh_on_save
 }
 
 fn repository_page(
@@ -200,12 +237,14 @@ fn repository_page(
             }),
         )
     };
-    let flag = |read: fn(&crate::settings::RepositorySettings) -> bool,
+    let flag = |id: &'static str,
+                read: fn(&crate::settings::RepositorySettings) -> bool,
                 write: fn(&mut crate::settings::RepositorySettings, bool)| {
         let (root_get, root_set) = (root.clone(), root.clone());
-        SettingField::switch(
+        toggle(
+            id,
             getter(workspace, move |settings| {
-                settings.repository(&root_get).is_some_and(read)
+                read(&settings.repository_or_default(&root_get))
             }),
             setter(workspace, move |settings, value: bool| {
                 write(settings.repository_mut(&root_set), value)
@@ -233,7 +272,7 @@ fn repository_page(
             )
             .item(SettingItem::new(
                 "All features",
-                flag(|repository| repository.all_features, |repository, value| repository.all_features = value),
+                flag("all-features", |repository| repository.all_features, |repository, value| repository.all_features = value),
             ))
             .item(
                 SettingItem::new(
@@ -260,6 +299,7 @@ fn repository_page(
                 SettingItem::new(
                     "Restricted mode",
                     flag(
+                        "restricted",
                         |repository| repository.restricted == Some(true),
                         |repository, value| repository.restricted = Some(value),
                     ),
@@ -267,4 +307,23 @@ fn repository_page(
                 .description("Skip build scripts and procedural macros. Code they generate is then invisible."),
             ),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::*;
+
+    #[test]
+    fn a_fresh_settings_file_shows_refresh_on_save_on_and_unlimited_depth() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let settings = Settings::load(&directory.path().join("settings.json"));
+        assert!(shown_refresh_on_save(&settings));
+        assert_eq!(shown_depth(&settings), 0);
+        // A repository with no entry yet shows every feature on.
+        let repository = settings.repository_or_default(Path::new("/code/a"));
+        assert!(repository.all_features);
+        assert_eq!(repository.restricted, None);
+    }
 }

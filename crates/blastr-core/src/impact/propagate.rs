@@ -556,7 +556,7 @@ impl<'a> Search<'a> {
             if symbol.flags.is_test && self.offers(id, u32::MAX).first().is_some_and(wanted) {
                 tests.insert(id);
             }
-            let offers = self.offers(id, params.depth);
+            let offers = self.offers(id, params.step_limit());
             let Some(best) = offers.first() else {
                 continue;
             };
@@ -966,6 +966,16 @@ mod tests {
 
         assert_eq!(summary(&result), vec![("krate::g", Confidence::Likely, 1)]);
         assert_eq!(result.tests, HashSet::from([test]));
+
+        // A depth of zero lists every distance.
+        let unlimited = analyse(&nothing(), &head, &changes);
+        assert_eq!(
+            summary(&unlimited),
+            vec![
+                ("krate::g", Confidence::Likely, 1),
+                ("krate::test", Confidence::Likely, 2),
+            ]
+        );
     }
 
     #[test]
@@ -999,14 +1009,18 @@ mod tests {
         let head = builder.finish();
         let changes = vec![change(ChangeKind::Body, "krate::f", SymbolKind::Function)];
 
-        let result = analyse(&nothing(), &head, &changes);
+        let eight = AnalysisParams {
+            depth: 8,
+            ..AnalysisParams::default()
+        };
+        let result = run(&nothing(), &head, &changes, &eight, &IgnoreSet::empty());
 
         let hub_item = item(&result, "krate::hub");
         assert_eq!(hub_item.distance, 8);
         assert_eq!(hub_item.confidence, Confidence::Likely);
         assert_eq!(hub_item.path_count, 2);
         assert_eq!(hub_item.paths[1].steps.len(), 5);
-        // Within the default depth of eight only the candidate path reaches it.
+        // Within a depth of eight only the candidate path reaches it.
         let test_item = item(&result, "krate::test");
         assert_eq!(test_item.distance, 6);
         assert_eq!(test_item.confidence, Confidence::Possible);
