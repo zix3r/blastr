@@ -7,6 +7,7 @@
 use std::sync::{Arc, OnceLock};
 
 use gpui_kit::component::highlighter::HighlightTheme;
+use gpui_kit::component::scroll::ScrollbarMode;
 use gpui_kit::component::theme::{Theme, ThemeMode};
 use gpui_kit::{App, Fill, Hsla, Pixels, Rgba, SharedString, Window, px};
 
@@ -309,6 +310,10 @@ pub(crate) fn apply(window: Option<&mut Window>, cx: &mut App) {
         colors.scrollbar = Tone::rgba(0x000000, 0).hsla();
         colors.scrollbar_thumb = LINE_STRONG.hsla();
         colors.scrollbar_thumb_hover = FG_4.hsla();
+        // Shown whenever there is more to scroll to. The default shows them
+        // only while scrolling, which hides long code lines: a plain mouse
+        // wheel never scrolls sideways, so that bar would never appear.
+        theme.scrollbar_mode = ScrollbarMode::Always;
         colors.overlay = SCRIM.hsla();
         colors.info = BEHAVE.solid.hsla();
         colors.success = TEST.solid.hsla();
