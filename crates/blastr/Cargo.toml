@@ -23,13 +23,21 @@ path = "src/main.rs"
 name = "blastr-engine"
 path = "src/bin/blastr-engine.rs"
 
-# This package only holds the two programs. The window is the `blastr-gui`
+[[bin]]
+name = "blastr-mcp"
+path = "src/bin/blastr-mcp.rs"
+
+# This package only holds the three programs. The window is the `blastr-gui`
 # library, which depends on blastr-model and blastr-git but not on blastr-core,
 # so editing the analysis pipeline does not recompile the interface; only
-# `blastr-engine` needs blastr-core.
+# `blastr-engine` needs blastr-core. `blastr-mcp`, the MCP server for AI agents,
+# is the `blastr-mcp` library.
 [dependencies]
 blastr-core.workspace = true
 blastr-gui.workspace = true
+blastr-mcp.workspace = true
+blastr-model.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
@@ -37,5 +45,4 @@ tracing-subscriber.workspace = true
 winresource.workspace = true
 
 [dev-dependencies]
-blastr-model.workspace = true
 tempfile.workspace = true

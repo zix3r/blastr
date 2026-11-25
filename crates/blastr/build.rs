@@ -1,11 +1,12 @@
-//! Build script: the Windows icon and file properties of both programs.
+//! Build script: the Windows icon and file properties of the programs.
 //!
 //! Explorer draws the first icon resource of an executable, and GPUI's Windows
 //! backend loads the window and taskbar icon with
 //! `LoadImageW(module, MAKEINTRESOURCE(1), IMAGE_ICON, …)`, so the icon is
 //! embedded under the numeric id `1`. The compiled resource is passed to every
-//! link step of this package, so `blastr.exe` and `blastr-engine.exe` (which
-//! Task Manager shows) carry the same icon and version strings.
+//! link step of this package, so `blastr.exe`, `blastr-engine.exe` and
+//! `blastr-mcp.exe` (which Task Manager shows) carry the same icon and version
+//! strings.
 //!
 //! Windows only. Elsewhere the icon comes from the packaged desktop entry, and
 //! the build script does nothing.

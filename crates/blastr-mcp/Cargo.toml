@@ -1,0 +1,22 @@
+[package]
+name = "blastr-mcp"
+description = "Internal crate of Blastr (the MCP server for AI agents); not a stable API"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+blastr-model.workspace = true
+interprocess = { workspace = true, features = ["tokio"] }
+rmcp.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+rmcp = { workspace = true, features = ["client"] }
