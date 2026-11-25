@@ -80,9 +80,9 @@ fn reports_every_kind_of_manifest_change() {
     assert_eq!(
         descriptions(&changes),
         [
-            "dependency `cc` changed: 1.0 \u{2192} 1.1",
+            "build-dependency `cc` changed: 1.0 \u{2192} 1.1",
             "dependency `legacy` added (workspace)",
-            "dependency `libc` changed: 0.2 \u{2192} 0.3",
+            "dependency `libc` (target cfg(unix)) changed: 0.2 \u{2192} 0.3",
             "dependency `new` added (0.3)",
             "dependency `old` removed",
             "dependency `pinned` features changed",
@@ -97,8 +97,57 @@ fn reports_every_kind_of_manifest_change() {
         assert_eq!(change.symbol.path, "demo");
         assert_eq!(change.symbol.kind, SymbolKind::Module);
         assert_eq!(change.old, None);
-        assert_eq!(change.new, None);
+        let place = change.new.as_ref().expect("placed on the head side");
+        assert_eq!(place.file, RelPath::new("Cargo.toml"));
+        assert_eq!(place.span.start_line, 1);
     }
+}
+
+#[test]
+fn places_the_changes_of_a_deleted_manifest_on_the_base_side() {
+    let changes = manifest_changes(&RelPath::new("crates/demo/Cargo.toml"), Some(OLD), None);
+    assert!(!changes.is_empty());
+    for change in &changes {
+        assert_eq!(change.new, None);
+        let place = change.old.as_ref().expect("placed on the base side");
+        assert_eq!(place.file, RelPath::new("crates/demo/Cargo.toml"));
+        assert_eq!(place.span.start_line, 1);
+    }
+}
+
+#[test]
+fn names_the_table_of_a_dependency_that_is_not_a_plain_one() {
+    let old = "[dependencies]\n";
+    let new = r#"
+[dev-dependencies]
+tester = "1.0"
+
+[build-dependencies]
+cc = "1.0"
+
+[target.'cfg(windows)'.dependencies]
+windows = "0.1"
+"#;
+    let changes = manifest_changes(&RelPath::new("Cargo.toml"), Some(old), Some(new));
+    assert_eq!(
+        descriptions(&changes),
+        [
+            "build-dependency `cc` added (1.0)",
+            "dependency `windows` (target cfg(windows)) added (0.1)",
+            "dev-dependency `tester` added (1.0)",
+        ]
+    );
+}
+
+#[test]
+fn reports_a_dependency_that_changed_tables_as_one_move() {
+    let old = "[dev-dependencies]\nserde = \"1.0\"\nkept = \"1.0\"\n";
+    let new = "[dependencies]\nserde = \"1.1\"\n[dev-dependencies]\nkept = \"1.0\"\n";
+    let changes = manifest_changes(&RelPath::new("Cargo.toml"), Some(old), Some(new));
+    assert_eq!(
+        descriptions(&changes),
+        ["dependency `serde` moved from dev-dependencies to dependencies (1.0 \u{2192} 1.1)"]
+    );
 }
 
 #[test]
@@ -139,15 +188,15 @@ via-git = { git = "https://example.com/y.git" }
 }
 
 #[test]
-fn reports_dependencies_added_to_a_target_table() {
+fn reports_a_dependency_moved_between_target_tables() {
     let old = "[target.'cfg(windows)'.dependencies]\nwindows = \"0.1\"\n";
     let new = "[target.'cfg(windows)'.build-dependencies]\nwindows = \"0.1\"\n";
     let changes = manifest_changes(&RelPath::new("Cargo.toml"), Some(old), Some(new));
     assert_eq!(
         descriptions(&changes),
         [
-            "dependency `windows` added (0.1)",
-            "dependency `windows` removed",
+            "dependency `windows` moved from dependencies (target cfg(windows)) to \
+             build-dependencies (target cfg(windows))",
         ]
     );
 }

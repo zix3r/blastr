@@ -3,11 +3,14 @@
 //! Only what the rest of the analysis cares about is compared: the features a
 //! package offers and the dependencies it names, including the ones declared
 //! for a specific target. Every difference becomes one
-//! [`ChangeKind::Manifest`] change whose detail is a one-line description.
+//! [`ChangeKind::Manifest`] change whose detail is a one-line description and
+//! whose location is the manifest file.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use blastr_model::{Change, ChangeDetail, ChangeKind, RelPath, SymbolKind, SymbolPath};
+use blastr_model::{
+    Change, ChangeDetail, ChangeKind, Location, RelPath, Span, SymbolKind, SymbolPath,
+};
 use toml::{Table, Value};
 
 /// The dependency tables Cargo reads, in the root and under `[target.*]`.
@@ -17,7 +20,8 @@ const DEPENDENCIES: [&str; 3] = ["dependencies", "dev-dependencies", "build-depe
 ///
 /// A side that is absent or does not parse counts as an empty manifest; when
 /// neither side is available the result is empty. The result is sorted by
-/// description and has neither an old nor a new location.
+/// description. Each change is placed on the first line of the manifest: on
+/// the head side, or on the base side when the file exists only there.
 pub fn manifest_changes(path: &RelPath, old: Option<&str>, new: Option<&str>) -> Vec<Change> {
     let old_text = old.and_then(parse);
     let new_text = new.and_then(parse);
@@ -37,16 +41,35 @@ pub fn manifest_changes(path: &RelPath, old: Option<&str>, new: Option<&str>) ->
         .or(old_doc.package)
         .unwrap_or_else(|| path.as_str().to_owned());
     let symbol = SymbolPath::new(name, SymbolKind::Module);
+    let (old_place, new_place) = match (old, new) {
+        (_, Some(text)) => (None, Some(first_line(path, text))),
+        (Some(text), None) => (Some(first_line(path, text)), None),
+        (None, None) => (None, None),
+    };
     descriptions
         .into_iter()
         .map(|description| Change {
             kind: ChangeKind::Manifest,
             symbol: symbol.clone(),
-            old: None,
-            new: None,
+            old: old_place.clone(),
+            new: new_place.clone(),
             detail: ChangeDetail::Manifest(description),
         })
         .collect()
+}
+
+/// The first line of the manifest at `path` whose text is `text`.
+fn first_line(path: &RelPath, text: &str) -> Location {
+    let end = text.find('\n').unwrap_or(text.len());
+    Location {
+        file: path.clone(),
+        span: Span {
+            start: 0,
+            end: u32::try_from(end).unwrap_or(u32::MAX),
+            start_line: 1,
+            end_line: 1,
+        },
+    }
 }
 
 /// Parses one manifest; `None` when the text is missing or not valid TOML.
@@ -65,12 +88,51 @@ struct Dependency {
     default_features: bool,
 }
 
+/// The table a dependency is declared in.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct DependencyTable {
+    /// The `cfg(...)` or triple of a `[target.*]` table; `None` at the root.
+    target: Option<String>,
+    /// `dependencies`, `dev-dependencies` or `build-dependencies`.
+    section: &'static str,
+}
+
+impl DependencyTable {
+    /// How a dependency of this table is called: `dev-dependency`.
+    fn noun(&self) -> &'static str {
+        match self.section {
+            "dev-dependencies" => "dev-dependency",
+            "build-dependencies" => "build-dependency",
+            _ => "dependency",
+        }
+    }
+
+    /// The start of a description of dependency `name` in this table:
+    /// "dev-dependency `x`", "dependency `x` (target cfg(windows))".
+    fn subject(&self, name: &str) -> String {
+        match &self.target {
+            None => format!("{} `{name}`", self.noun()),
+            Some(target) => format!("{} `{name}` (target {target})", self.noun()),
+        }
+    }
+
+    /// The table's name in a sentence: "dev-dependencies",
+    /// "dependencies (target cfg(windows))".
+    fn name(&self) -> String {
+        match &self.target {
+            None => self.section.to_owned(),
+            Some(target) => format!("{} (target {target})", self.section),
+        }
+    }
+}
+
 /// What one manifest says that the comparison needs.
 #[derive(Debug, Default)]
 struct Doc {
     package: Option<String>,
     features: BTreeMap<String, Vec<String>>,
-    dependencies: BTreeMap<(String, String), Dependency>,
+    /// The dependencies, by name and then by the table they are in.
+    dependencies: BTreeMap<String, BTreeMap<DependencyTable, Dependency>>,
 }
 
 /// Reads one manifest table into the comparable form.
@@ -91,7 +153,11 @@ fn read(table: &Table) -> Doc {
     }
     for section in DEPENDENCIES {
         if let Some(entries) = table.get(section).and_then(Value::as_table) {
-            read_dependencies(section, entries, &mut doc.dependencies);
+            let table = DependencyTable {
+                target: None,
+                section,
+            };
+            read_dependencies(&table, entries, &mut doc.dependencies);
         }
     }
     if let Some(targets) = table.get("target").and_then(Value::as_table) {
@@ -101,8 +167,11 @@ fn read(table: &Table) -> Doc {
             };
             for section in DEPENDENCIES {
                 if let Some(entries) = target_table.get(section).and_then(Value::as_table) {
-                    let label = format!("target.{target}.{section}");
-                    read_dependencies(&label, entries, &mut doc.dependencies);
+                    let table = DependencyTable {
+                        target: Some(target.clone()),
+                        section,
+                    };
+                    read_dependencies(&table, entries, &mut doc.dependencies);
                 }
             }
         }
@@ -110,15 +179,17 @@ fn read(table: &Table) -> Doc {
     doc
 }
 
-/// Adds the dependencies of one table, keeping the table's identity in the key
-/// so that a dependency can move between tables.
+/// Adds the dependencies of one table, keeping the table with each so that a
+/// dependency can move between tables.
 fn read_dependencies(
-    section: &str,
+    table: &DependencyTable,
     entries: &Table,
-    out: &mut BTreeMap<(String, String), Dependency>,
+    out: &mut BTreeMap<String, BTreeMap<DependencyTable, Dependency>>,
 ) {
     for (name, value) in entries {
-        out.insert((section.to_owned(), name.clone()), dependency(value));
+        out.entry(name.clone())
+            .or_default()
+            .insert(table.clone(), dependency(value));
     }
 }
 
@@ -198,31 +269,59 @@ fn features(old: &Doc, new: &Doc, out: &mut BTreeSet<String>) {
 }
 
 /// Compares the dependency tables of both manifests.
+///
+/// A dependency that leaves exactly one table and enters exactly one other is
+/// one move, not a removal and an addition.
 fn dependencies(old: &Doc, new: &Doc, out: &mut BTreeSet<String>) {
-    for (key, after) in &new.dependencies {
-        let name = &key.1;
-        match old.dependencies.get(key) {
-            None => {
-                out.insert(format!("dependency `{name}` added ({})", after.version));
+    let none = BTreeMap::new();
+    let names: BTreeSet<&String> = old
+        .dependencies
+        .keys()
+        .chain(new.dependencies.keys())
+        .collect();
+    for name in names {
+        let before = old.dependencies.get(name).unwrap_or(&none);
+        let after = new.dependencies.get(name).unwrap_or(&none);
+        let removed: Vec<(&DependencyTable, &Dependency)> = before
+            .iter()
+            .filter(|(table, _)| !after.contains_key(*table))
+            .collect();
+        let added: Vec<(&DependencyTable, &Dependency)> = after
+            .iter()
+            .filter(|(table, _)| !before.contains_key(*table))
+            .collect();
+        if let ([(from, was)], [(to, now)]) = (removed.as_slice(), added.as_slice()) {
+            let mut description = format!(
+                "dependency `{name}` moved from {} to {}",
+                from.name(),
+                to.name()
+            );
+            if was.version != now.version {
+                description.push_str(&format!(" ({} \u{2192} {})", was.version, now.version));
             }
-            Some(before) if before.version != after.version => {
-                out.insert(format!(
-                    "dependency `{name}` changed: {} \u{2192} {}",
-                    before.version, after.version
-                ));
+            out.insert(description);
+        } else {
+            for (table, dependency) in added {
+                let subject = table.subject(name);
+                out.insert(format!("{subject} added ({})", dependency.version));
             }
-            Some(before)
-                if before.features != after.features
-                    || before.default_features != after.default_features =>
-            {
-                out.insert(format!("dependency `{name}` features changed"));
+            for (table, _) in removed {
+                out.insert(format!("{} removed", table.subject(name)));
             }
-            Some(_) => {}
         }
-    }
-    for key in old.dependencies.keys() {
-        if !new.dependencies.contains_key(key) {
-            out.insert(format!("dependency `{}` removed", key.1));
+        for (table, now) in after {
+            let Some(was) = before.get(table) else {
+                continue;
+            };
+            let subject = table.subject(name);
+            if was.version != now.version {
+                out.insert(format!(
+                    "{subject} changed: {} \u{2192} {}",
+                    was.version, now.version
+                ));
+            } else if was.features != now.features || was.default_features != now.default_features {
+                out.insert(format!("{subject} features changed"));
+            }
         }
     }
 }
