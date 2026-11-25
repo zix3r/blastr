@@ -15,9 +15,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use blastr_model::{
-    CancelToken, Cancelled, Certainty, Change, ChangeDetail, ChangeKind, Confidence, EvidencePath,
-    EvidenceStep, ImpactClass, ImpactItem, ImpactLimits, ImpactTags, Location, RelPath, Span,
-    SymbolId, SymbolPath,
+    CancelToken, Cancelled, Certainty, Change, ChangeDetail, ChangeKind, Confidence, Edge,
+    EvidencePath, EvidenceStep, ImpactClass, ImpactItem, ImpactLimits, ImpactTags, Location,
+    RelPath, Span, SymbolId, SymbolPath,
 };
 
 use super::rules::{self, Graphs, Reach, Side};
@@ -442,36 +442,96 @@ impl<'a> Search<'a> {
     /// The steps of a seed: the `via` step, if any, then the step that reaches
     /// the item, which names it by its head identity.
     fn seed_steps(&self, seed: &Seed) -> Vec<EvidenceStep> {
-        let graph = self.graphs.graph(seed.reach.side);
+        let side = seed.reach.side;
+        let graph = self.graphs.graph(side);
         let path = |id: SymbolId| graph.symbols.get(id.0 as usize).map(|s| s.path.clone());
         let mut steps = Vec::new();
         if let Some(via) = seed.reach.via
             && let Some(edge) = graph.edges.get(via.edge as usize)
             && let (Some(from), Some(to)) = (path(edge.from), path(edge.to))
         {
+            let site = match side {
+                Side::Head => edge.site.clone(),
+                Side::Base => match self.graphs.head_index.by_path(&from) {
+                    Some(head) => self.head_site(head, edge),
+                    None => edge.site.clone(),
+                },
+            };
             steps.push(EvidenceStep {
                 from,
                 to,
                 edge: edge.kind,
                 certainty: via.certainty,
                 detail: edge.detail,
-                site: edge.site.clone(),
+                site,
             });
         }
         let item = self.input.head.symbols.get(seed.item.0 as usize);
         if let Some(edge) = graph.edges.get(seed.reach.edge as usize)
             && let (Some(item), Some(to)) = (item, path(edge.to))
         {
+            let site = match side {
+                Side::Head => edge.site.clone(),
+                Side::Base => self.head_site(seed.item, edge),
+            };
             steps.push(EvidenceStep {
                 from: item.path.clone(),
                 to,
                 edge: edge.kind,
                 certainty: seed.reach.certainty,
                 detail: edge.detail,
-                site: edge.site.clone(),
+                site,
             });
         }
         steps
+    }
+
+    /// Where the reference of the base-side `edge` is written in the head
+    /// symbol `from`.
+    ///
+    /// The evidence is shown in the files of the head side, where the lines of
+    /// the base side may have moved. The reference is the head edge of the same
+    /// kind to a target of the same name, or an unresolved reference of that
+    /// name inside `from`, since its target may be gone; failing both, `from`
+    /// itself.
+    fn head_site(&self, from: SymbolId, edge: &Edge) -> Location {
+        let head = self.input.head;
+        let Some(symbol) = head.symbols.get(from.0 as usize) else {
+            return edge.site.clone();
+        };
+        let Some(target) = self.input.base.symbols.get(edge.to.0 as usize) else {
+            return symbol.location.clone();
+        };
+        let name = last_segment(&target.path.path);
+        let same = self
+            .graphs
+            .head_index
+            .edges_from(from)
+            .iter()
+            .filter_map(|&index| head.edges.get(index as usize))
+            .find(|candidate| {
+                candidate.kind == edge.kind
+                    && head
+                        .symbols
+                        .get(candidate.to.0 as usize)
+                        .is_some_and(|to| last_segment(&to.path.path) == name)
+            });
+        if let Some(same) = same {
+            return same.site.clone();
+        }
+        let span = &symbol.location.span;
+        head.unresolved
+            .iter()
+            .find(|reference| {
+                reference.location.file == symbol.location.file
+                    && span.start <= reference.location.span.start
+                    && reference.location.span.end <= span.end
+                    && last_segment(&reference.text) == name
+            })
+            .map_or_else(
+                || symbol.location.clone(),
+                |reference| reference.location.clone(),
+            )
     }
 
     /// Turns the search into its result.
@@ -652,6 +712,11 @@ fn count_unresolved_in_reach(
         .iter()
         .filter(|reference| inside(&reference.location.file, &reference.location.span))
         .count() as u32
+}
+
+/// The last segment of a path: the name of what it names.
+fn last_segment(path: &str) -> &str {
+    path.rsplit("::").next().unwrap_or(path)
 }
 
 /// The head identities of the changes that make an item count as changed.
@@ -1077,6 +1142,91 @@ mod tests {
         assert_eq!(step.from.path, "krate::caller");
         assert_eq!(step.to.path, "krate::f");
         assert_eq!(step.edge, EdgeKind::Calls);
+    }
+
+    /// A location on `line` of `src/lib.rs`, whose bytes are the line number.
+    fn on_line(line: u32) -> Location {
+        Location {
+            file: RelPath::new("src/lib.rs"),
+            span: Span {
+                start: line,
+                end: line + 1,
+                start_line: line,
+                end_line: line,
+            },
+        }
+    }
+
+    #[test]
+    fn a_base_side_step_is_located_where_the_head_writes_the_reference() {
+        // `Failed(Failure)`: the field's type moved to another module, and
+        // the lines above the field changed, so the base line is not the head
+        // line.
+        let mut builder = GraphBuilder::new();
+        let module = builder.add("krate", SymbolKind::Module);
+        let gone = builder.child(module, "krate::Failure", SymbolKind::Struct);
+        let field = builder.child(module, "krate::Loadable::Failed::0", SymbolKind::Field);
+        builder.edge(field, gone, EdgeKind::UsesType, EdgeDetail::None);
+        let mut base = builder.finish();
+        base.edges[0].site = on_line(92);
+
+        let mut builder = GraphBuilder::new();
+        let module = builder.add("krate", SymbolKind::Module);
+        let moved = builder.child(module, "krate::model::Failure", SymbolKind::Struct);
+        let field = builder.child(module, "krate::Loadable::Failed::0", SymbolKind::Field);
+        builder.symbol(field).location = on_line(70);
+        builder.edge(field, moved, EdgeKind::UsesType, EdgeDetail::None);
+        let mut head = builder.finish();
+        head.edges[0].site = on_line(70);
+        let changes = vec![change(
+            ChangeKind::Removed,
+            "krate::Failure",
+            SymbolKind::Struct,
+        )];
+
+        let result = analyse(&base, &head, &changes);
+
+        let step = &item(&result, "krate::Loadable::Failed::0").paths[0].steps[0];
+        assert_eq!(step.to.path, "krate::Failure");
+        assert_eq!(step.site, on_line(70));
+    }
+
+    #[test]
+    fn a_base_side_step_to_a_removed_function_is_located_at_the_unresolved_call() {
+        let mut builder = GraphBuilder::new();
+        let module = builder.add("krate", SymbolKind::Module);
+        let gone = builder.child(module, "krate::f", SymbolKind::Function);
+        let caller = builder.child(module, "krate::caller", SymbolKind::Function);
+        builder.edge(caller, gone, EdgeKind::Calls, EdgeDetail::None);
+        let mut base = builder.finish();
+        base.edges[0].site = on_line(5);
+
+        let mut builder = GraphBuilder::new();
+        let module = builder.add("krate", SymbolKind::Module);
+        let caller = builder.child(module, "krate::caller", SymbolKind::Function);
+        builder.symbol(caller).location.span = Span {
+            start: 0,
+            end: 100,
+            start_line: 1,
+            end_line: 20,
+        };
+        let mut head = builder.finish();
+        head.unresolved.push(blastr_model::UnresolvedRef {
+            location: on_line(9),
+            text: "f".to_owned(),
+        });
+        let changes = vec![change(
+            ChangeKind::Removed,
+            "krate::f",
+            SymbolKind::Function,
+        )];
+
+        let result = analyse(&base, &head, &changes);
+
+        assert_eq!(
+            item(&result, "krate::caller").paths[0].steps[0].site,
+            on_line(9)
+        );
     }
 
     #[test]
