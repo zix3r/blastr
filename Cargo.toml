@@ -17,6 +17,7 @@ blastr-ra = { path = "crates/blastr-ra", version = "0.2.0" }
 blastr-git = { path = "crates/blastr-git", version = "0.2.0" }
 blastr-core = { path = "crates/blastr-core", version = "0.2.0" }
 blastr-gui = { path = "crates/blastr-gui", version = "0.2.0" }
+blastr-mcp = { path = "crates/blastr-mcp", version = "0.2.0" }
 
 ra_ap_hir = "=0.0.358"
 ra_ap_ide = "=0.0.358"
@@ -28,6 +29,12 @@ ra_ap_syntax = "=0.0.358"
 ra_ap_vfs = "=0.0.358"
 
 gpui-kit = "=0.9.1"
+
+# The MCP server (`blastr-mcp`) and its bridge to the window: a per-user named
+# pipe on Windows, a socket file elsewhere.
+rmcp = { version = "3.11", features = ["server", "macros", "transport-io"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "sync", "time"] }
+interprocess = "2.4"
 
 async-channel = "2"
 blake3 = "1"

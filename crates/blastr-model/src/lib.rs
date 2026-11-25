@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 mod analysis;
+pub mod bridge;
 mod cancel;
 mod hashing;
 mod ignore;
