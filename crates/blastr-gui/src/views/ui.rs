@@ -3,6 +3,7 @@
 //! Meaning is always carried twice: by the colour of these pieces and by the
 //! words they show.
 
+use gpui_kit::AnimationExt as _;
 use gpui_kit::prelude::*;
 
 use std::sync::{Arc, LazyLock};
@@ -521,6 +522,55 @@ pub(crate) fn empty_state(
                 .text_size(TEXT_SMALL)
                 .text_color(theme::FG_3)
                 .child(body.to_owned()),
+        )
+        .into_any_element()
+}
+
+// -- loading states ----------------------------------------------------------
+
+/// A bar that says work is going on without saying how much is left: a
+/// segment that runs along the track.
+pub(crate) fn indeterminate_bar(id: impl Into<ElementId>, height: Pixels) -> AnyElement {
+    div()
+        .relative()
+        .w_full()
+        .h(height)
+        .overflow_hidden()
+        .rounded(height / 2.)
+        .bg(theme::BG_RAISED_2)
+        .child(
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .w(gpui_kit::relative(0.3))
+                .rounded(height / 2.)
+                .bg(theme::CHANGED.solid)
+                .with_animation(
+                    id,
+                    gpui_kit::Animation::new(std::time::Duration::from_millis(1400))
+                        .repeat()
+                        .with_easing(gpui_kit::ease_in_out),
+                    |segment, delta| segment.left(gpui_kit::relative(-0.3 + 1.3 * delta)),
+                ),
+        )
+        .into_any_element()
+}
+
+/// A bar filled to `fraction`, between 0 and 1.
+pub(crate) fn determinate_bar(fraction: f32, height: Pixels) -> AnyElement {
+    div()
+        .w_full()
+        .h(height)
+        .overflow_hidden()
+        .rounded(height / 2.)
+        .bg(theme::BG_RAISED_2)
+        .child(
+            div()
+                .h_full()
+                .w(gpui_kit::relative(fraction.clamp(0., 1.)))
+                .rounded(height / 2.)
+                .bg(theme::CHANGED.solid),
         )
         .into_any_element()
 }

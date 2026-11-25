@@ -7,7 +7,7 @@
 //! was replaced is dropped, and a failed refresh keeps the last good result.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use blastr_model::protocol::{Commit, Failure, JobId, JobKind, Repository};
 use blastr_model::{
@@ -178,6 +178,9 @@ pub struct Session {
     pub cancelled: bool,
     /// The progress of a refresh while the last result stays on screen.
     pub refreshing: Option<Progress>,
+    /// When the comparison, refresh or hypothetical change being computed
+    /// started.
+    pub started: Option<Instant>,
     pub what_if: Option<WhatIf>,
     pub history: History,
     pub run: TaskSlot,
@@ -241,6 +244,7 @@ impl Session {
         self.what_if_run.cancel();
         self.what_if = None;
         self.history.clear();
+        self.started = Some(Instant::now());
         self.run.begin()
     }
 
@@ -312,6 +316,7 @@ impl Session {
     pub fn refresh_started(&mut self, generation: u64) {
         if self.run.is_current(generation) && self.result.ready().is_some() {
             self.refreshing = Some(Progress::default());
+            self.started = Some(Instant::now());
         }
     }
 
@@ -356,6 +361,13 @@ impl Session {
                 .is_some_and(|what_if| what_if.result.is_loading())
     }
 
+    /// How long the work on screen has run, while it runs.
+    pub fn running_for(&self) -> Option<Duration> {
+        self.is_busy()
+            .then(|| self.started.map(|started| started.elapsed()))
+            .flatten()
+    }
+
     /// Whether a finished comparison follows the working tree.
     pub fn is_watching(&self) -> bool {
         self.run.is_running() && self.result.ready().is_some()
@@ -363,6 +375,7 @@ impl Session {
 
     /// Starts a hypothetical change; returns its generation.
     pub fn begin_what_if(&mut self, symbol: SymbolPath, assume: Assume) -> u64 {
+        self.started = Some(Instant::now());
         self.what_if = Some(WhatIf {
             symbol,
             assume,

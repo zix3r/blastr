@@ -25,7 +25,7 @@ use super::graph::GraphView;
 use super::left::LeftPane;
 use super::ui;
 use crate::settings::WindowPlacement;
-use crate::state::loadable::Loadable;
+use crate::state::loadable::{Loadable, STAGES, elapsed_text};
 use crate::state::search::split_name;
 use crate::theme::{self, TEXT_MICRO, TEXT_SMALL, TEXT_UI};
 use crate::workspace::{Workspace, WorkspaceEvent};
@@ -463,18 +463,21 @@ impl Shell {
             |name: IconName, colour: theme::Tone| Icon::new(name).size_3().text_color(colour);
         match session.shown() {
             Loadable::Loading(progress) => {
-                left = left
-                    .child(ui::spinner())
-                    .child(div().text_color(theme::FG_2).child(progress.label()))
-                    .children(progress.fraction().map(progress_bar))
-                    .child(
-                        ui::icon_button("cancel", IconName::Close, "Cancel  Esc").on_click(
-                            cx.listener(|this, _, _, cx| {
-                                this.workspace
-                                    .update(cx, |workspace, cx| workspace.cancel(cx));
-                            }),
-                        ),
-                    );
+                left =
+                    left.child(ui::spinner())
+                        .child(div().text_color(theme::FG_2).child(progress.label()))
+                        .children(progress.fraction().map(progress_bar))
+                        .children(session.running_for().map(|elapsed| {
+                            div().text_color(theme::FG_4).child(elapsed_text(elapsed))
+                        }))
+                        .child(
+                            ui::icon_button("cancel", IconName::Close, "Cancel  Esc").on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.workspace
+                                        .update(cx, |workspace, cx| workspace.cancel(cx));
+                                }),
+                            ),
+                        );
             }
             Loadable::Ready(outcome) => {
                 let text = if session.refreshing.is_some() {
@@ -632,13 +635,31 @@ impl Shell {
         )
     }
 
-    /// The centre: the graph over the code, or the failure.
+    /// The centre: the graph over the code, the progress of the comparison
+    /// on its way, or the failure.
     fn centre(&self, cx: &mut Context<Self>) -> AnyElement {
         let workspace = self.workspace.read(cx);
         let failure = workspace.session.shown().failure().cloned();
+        let loading = workspace.session.shown().is_loading();
+        // A refresh keeps the last result on screen and only runs a thin
+        // bar along the top of it.
+        let refreshing = workspace.session.refreshing.is_some() && !loading;
         let code_height = workspace.settings.panes.code;
         let view = if let Some(failure) = failure {
             failure_card(&failure, cx)
+        } else if loading {
+            v_flex()
+                .size_full()
+                .child(div().flex_1().min_h_0().child(self.progress_view(cx)))
+                .child(
+                    div()
+                        .flex_none()
+                        .h(px(code_height))
+                        .border_t_1()
+                        .border_color(theme::LINE)
+                        .bg(theme::BG_CANVAS),
+                )
+                .into_any_element()
         } else if self.code.read(cx).maximized {
             self.code.clone().into_any_element()
         } else {
@@ -666,7 +687,129 @@ impl Shell {
             .min_w_0()
             .bg(theme::BG_CANVAS)
             .children(self.what_if_banner(cx))
+            .when(refreshing, |centre| {
+                centre.child(
+                    div()
+                        .flex_none()
+                        .child(ui::indeterminate_bar("refresh-bar", px(2.))),
+                )
+            })
             .child(div().flex_1().min_h_0().child(view))
+            .into_any_element()
+    }
+
+    /// What the centre shows while the comparison is on its way: what is
+    /// compared, the stages, the phase and its step, how far it is, how long
+    /// it has run, and a way to stop it.
+    fn progress_view(&self, cx: &mut Context<Self>) -> AnyElement {
+        let session = &self.workspace.read(cx).session;
+        let progress = session.shown().progress().cloned().unwrap_or_default();
+        let elapsed = session.running_for().map(elapsed_text);
+        let what = match (&session.what_if, &session.compare) {
+            (Some(what_if), _) => {
+                format!("What if {}", wording::short_name(&what_if.symbol.path).name)
+            }
+            (None, Some(compare)) => {
+                let (base, head) = compare.labels();
+                format!("Comparing {base} → {head}")
+            }
+            (None, None) => "Comparing".to_owned(),
+        };
+        let stage = progress.stage();
+        let stages = STAGES.iter().enumerate().map(|(index, name)| {
+            let (dot, text) = match index.cmp(&stage) {
+                std::cmp::Ordering::Less => (theme::FG_3, theme::FG_3),
+                std::cmp::Ordering::Equal => (theme::CHANGED.solid, theme::FG),
+                std::cmp::Ordering::Greater => (theme::LINE_STRONG, theme::FG_4),
+            };
+            h_flex()
+                .gap(px(6.))
+                .items_center()
+                .when(index > 0, |step| {
+                    step.child(div().w(px(18.)).h(px(1.)).bg(theme::LINE_STRONG))
+                })
+                .child(div().size(px(6.)).rounded(px(3.)).bg(dot))
+                .child(div().text_color(text).child(*name))
+        });
+        let bar = match progress.fraction() {
+            Some(fraction) => ui::determinate_bar(fraction, px(4.)),
+            None => ui::indeterminate_bar("progress-bar", px(4.)),
+        };
+        let count = progress
+            .total
+            .filter(|total| *total > 0)
+            .map(|total| format!("{} of {total}", progress.done.min(total)));
+        v_flex()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .p_6()
+            .child(
+                v_flex()
+                    .w_full()
+                    .max_w(px(480.))
+                    .gap_3()
+                    .p_4()
+                    .rounded(theme::RADIUS_LG)
+                    .border_1()
+                    .border_color(theme::LINE)
+                    .bg(theme::BG_RAISED)
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .text_size(TEXT_SMALL)
+                            .text_color(theme::FG_3)
+                            .child(ui::spinner())
+                            .child(div().min_w_0().truncate().child(what))
+                            .child(div().flex_1())
+                            .children(elapsed.map(|elapsed| {
+                                div().flex_none().text_color(theme::FG_3).child(elapsed)
+                            })),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(px(15.))
+                                    .text_color(theme::FG)
+                                    .child(progress.label()),
+                            )
+                            .child(
+                                div()
+                                    .min_h(px(16.))
+                                    .text_size(TEXT_SMALL)
+                                    .text_color(theme::FG_3)
+                                    .children(progress.detail()),
+                            ),
+                    )
+                    .child(bar)
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .text_size(TEXT_MICRO)
+                            .child(h_flex().flex_wrap().gap(px(6.)).children(stages))
+                            .child(div().flex_1())
+                            .children(count.map(|count| {
+                                div().flex_none().text_color(theme::FG_3).child(count)
+                            })),
+                    )
+                    .child(
+                        h_flex().justify_end().child(
+                            Button::new("progress-cancel")
+                                .small()
+                                .outline()
+                                .label("Cancel")
+                                .tooltip("Stop the comparison  Esc")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.workspace
+                                        .update(cx, |workspace, cx| workspace.cancel(cx));
+                                })),
+                        ),
+                    ),
+            )
             .into_any_element()
     }
 
