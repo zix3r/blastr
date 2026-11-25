@@ -72,9 +72,9 @@ impl Engine {
         Ok(())
     }
 
-    /// Whether an engine runs.
-    pub(crate) fn is_running(&self) -> bool {
-        self.process.is_some()
+    /// The number of the process that runs now.
+    pub(crate) fn number(&self) -> Option<u64> {
+        self.process.as_ref().map(|process| process.number)
     }
 
     /// Whether `number` is the process that runs now.

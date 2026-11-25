@@ -2,8 +2,12 @@
 //!
 //! One thread reads requests and hands them on; another owns the [`Engine`] and
 //! the [`Session`] and does the work, one request at a time. They share only
-//! two things: the job that runs now, so that a cancellation reaches it at
-//! once, and the jobs cancelled before they started.
+//! the output and which jobs are waiting, running or cancelled, so that a
+//! cancellation reaches a running job at once.
+//!
+//! Every cancellation is acknowledged with [`Response::Cancelled`]: by the work
+//! thread once the job has stopped, or by the reading thread at once for a job
+//! that is not waiting or running any more.
 //!
 //! A comparison of the working tree keeps watching after its first result:
 //! every 250 ms it asks the session whether a saved file changed it, and asks
@@ -66,12 +70,14 @@ pub fn serve_with(
     factory: EngineFactory,
 ) -> io::Result<()> {
     let shared = Arc::new(Shared::default());
+    let output = Arc::new(Output::new(output));
     let (requests, receiver) = mpsc::channel();
     let reader = {
         let shared = Arc::clone(&shared);
+        let output = Arc::downgrade(&output);
         thread::Builder::new()
             .name("blastr-engine-requests".to_owned())
-            .spawn(move || read_requests(input, &shared, &requests))
+            .spawn(move || read_requests(input, &shared, &output, &requests))
             .map_err(|error| {
                 io::Error::other(format!("could not start the request thread: {error}"))
             })?
@@ -87,12 +93,29 @@ pub fn serve_with(
 }
 
 /// Reads requests until the stream ends, cancelling jobs on the way.
-fn read_requests(input: impl Read, shared: &Shared, requests: &Sender<Request>) {
+fn read_requests<W: Write>(
+    input: impl Read,
+    shared: &Shared,
+    output: &std::sync::Weak<Output<W>>,
+    requests: &Sender<Request>,
+) {
     let mut input = input;
     loop {
         match protocol::read_message::<_, Request>(&mut input) {
-            Ok(Some(Request::Cancel { id })) => shared.cancel(id),
+            Ok(Some(Request::Cancel { id })) => {
+                // A job that is not waiting or running has nothing to stop.
+                // The output is held weakly, so that it closes when the work
+                // stops while this thread still waits for input.
+                if !shared.cancel(id)
+                    && let Some(output) = output.upgrade()
+                {
+                    let _ = output.send(&Response::Cancelled { id });
+                }
+            }
             Ok(Some(request)) => {
+                if let Some(id) = request.job() {
+                    shared.queue(id);
+                }
                 if requests.send(request).is_err() {
                     return;
                 }
@@ -109,52 +132,64 @@ fn read_requests(input: impl Read, shared: &Shared, requests: &Sender<Request>) 
 /// State shared by the thread that reads requests and the one that works.
 #[derive(Default)]
 struct Shared {
+    jobs: Mutex<Jobs>,
+}
+
+/// Which jobs are waiting, running and cancelled; one lock guards them all,
+/// so that a job is always in exactly one place when a cancellation looks.
+#[derive(Default)]
+struct Jobs {
     /// The job that runs now, so that a cancellation reaches it at once.
-    current: Mutex<Option<(JobId, CancelToken)>>,
+    current: Option<(JobId, CancelToken)>,
+    /// Jobs read but not started yet.
+    queued: HashSet<JobId>,
     /// Jobs cancelled before they started.
-    cancelled: Mutex<HashSet<JobId>>,
+    cancelled: HashSet<JobId>,
 }
 
 impl Shared {
+    /// The jobs, even after a panic of the other thread.
+    fn jobs(&self) -> std::sync::MutexGuard<'_, Jobs> {
+        self.jobs.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// Notes that `id` was read and waits to start.
+    fn queue(&self, id: JobId) {
+        self.jobs().queued.insert(id);
+    }
+
     /// Makes `id` the job that runs now and returns its cancellation token.
     fn begin(&self, id: JobId) -> CancelToken {
-        let early = self
-            .cancelled
-            .lock()
-            .map(|mut cancelled| cancelled.remove(&id))
-            .unwrap_or(false);
+        let mut jobs = self.jobs();
+        jobs.queued.remove(&id);
         let token = CancelToken::new();
-        if early {
+        if jobs.cancelled.remove(&id) {
             token.cancel();
         }
-        if let Ok(mut current) = self.current.lock() {
-            *current = Some((id, token.clone()));
-        }
+        jobs.current = Some((id, token.clone()));
         token
     }
 
-    /// Stops the job that runs now, or remembers that `id` must not start.
-    fn cancel(&self, id: JobId) {
-        let tripped = match self.current.lock() {
-            Ok(current) => match current.as_ref() {
-                Some((job, token)) if *job == id => {
-                    token.cancel();
-                    true
-                }
-                _ => false,
-            },
-            Err(_) => false,
-        };
-        if !tripped && let Ok(mut cancelled) = self.cancelled.lock() {
-            cancelled.insert(id);
+    /// Stops `id` if it runs now, or remembers that it must not start.
+    ///
+    /// True when the job runs or waits, so that the work thread acknowledges
+    /// the cancellation once the job stops; false when it is not known to
+    /// run or wait, and nobody else would.
+    fn cancel(&self, id: JobId) -> bool {
+        let mut jobs = self.jobs();
+        if let Some((job, token)) = &jobs.current
+            && *job == id
+        {
+            token.cancel();
+            return true;
         }
+        jobs.cancelled.insert(id);
+        jobs.queued.contains(&id)
     }
 
     /// Notes that no job runs any more.
     fn end(&self) {
-        if let Ok(mut current) = self.current.lock() {
-            *current = None;
-        }
+        self.jobs().current = None;
     }
 }
 
@@ -180,9 +215,9 @@ struct Server<W: Write> {
 
 impl<W: Write + Send> Server<W> {
     /// Creates the server; nothing is opened until a request needs it.
-    fn new(output: W, factory: EngineFactory, shared: Arc<Shared>) -> Server<W> {
+    fn new(output: Arc<Output<W>>, factory: EngineFactory, shared: Arc<Shared>) -> Server<W> {
         Server {
-            output: Arc::new(Output::new(output)),
+            output,
             factory: Some(factory),
             engine: None,
             engine_failure: None,
@@ -272,6 +307,17 @@ impl<W: Write + Send> Server<W> {
         }
     }
 
+    /// Notes that job `id` stopped, and acknowledges its cancellation if it
+    /// was cancelled. The token is read after the job left `current`, so a
+    /// cancellation that arrives later is acknowledged by the reading thread.
+    fn finish(&self, id: JobId, cancel: &CancelToken) -> io::Result<()> {
+        self.shared.end();
+        if cancel.is_cancelled() {
+            self.send(&Response::Cancelled { id })?;
+        }
+        Ok(())
+    }
+
     /// Reports a failure of a job.
     fn fail(&self, id: JobId, failure: Failure, watching: bool) -> io::Result<()> {
         match id.kind {
@@ -351,7 +397,7 @@ impl<W: Write + Send> Server<W> {
         };
         let cancel = self.shared.begin(id);
         let result = self.compare_job(id, &repo, &spec, &options, &params, &cancel, requests);
-        self.shared.end();
+        self.finish(id, &cancel)?;
         result
     }
 
@@ -555,7 +601,7 @@ impl<W: Write + Send> Server<W> {
         };
         let cancel = self.shared.begin(id);
         let result = self.what_if_job(id, &repo, &symbol, assume, &options, &params, &cancel);
-        self.shared.end();
+        self.finish(id, &cancel)?;
         result
     }
 
@@ -881,11 +927,56 @@ mod tests {
             },
         )
         .expect("a written request");
-        // The next request is answered, so the comparison answered nothing.
-        let response = ask(&mut input, &mut reader, Request::CacheStatus);
-        assert!(matches!(response, Response::Cache { .. }), "{response:?}");
+        // The next request is answered, so the comparison answered nothing
+        // but that it was cancelled.
+        protocol::write_message(&mut input, &Request::CacheStatus).expect("a written request");
+        loop {
+            let response: Response = protocol::read_message(&mut reader)
+                .expect("a readable response")
+                .expect("a response");
+            match response {
+                Response::Cancelled { id: cancelled } => assert_eq!(cancelled, id),
+                Response::Cache { .. } => break,
+                other => panic!("expected an acknowledgement, got {other:?}"),
+            }
+        }
         drop(input);
         handle.join().expect("the server ends").expect("no error");
+    }
+
+    #[test]
+    fn a_cancellation_of_a_finished_job_is_acknowledged() {
+        let (mut input, mut reader, handle) = server();
+        let id = JobId {
+            kind: protocol::JobKind::WhatIf,
+            generation: 7,
+        };
+        let response = ask(&mut input, &mut reader, Request::Cancel { id });
+        assert_eq!(response, Response::Cancelled { id });
+        drop(input);
+        handle.join().expect("the server ends").expect("no error");
+    }
+
+    #[test]
+    fn a_cancelled_running_job_waits_for_the_work_thread_to_acknowledge() {
+        let shared = Shared::default();
+        let id = JobId {
+            kind: protocol::JobKind::Compare,
+            generation: 3,
+        };
+        shared.queue(id);
+        assert!(
+            shared.cancel(id),
+            "a waiting job is acknowledged when it stops"
+        );
+        let token = shared.begin(id);
+        assert!(token.is_cancelled());
+        assert!(
+            shared.cancel(id),
+            "a running job is acknowledged when it stops"
+        );
+        shared.end();
+        assert!(!shared.cancel(id), "a finished job is acknowledged at once");
     }
 
     #[test]

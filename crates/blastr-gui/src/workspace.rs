@@ -4,6 +4,7 @@
 //! The views observe this entity and redraw when it notifies. Every change is
 //! made by one of its methods, which rebuilds what depends on it at once.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -65,9 +66,8 @@ pub(crate) struct Workspace {
     pub pending_trust: Option<PathBuf>,
     /// The comparison to run again once the repository is opened again.
     restore: Option<Compare>,
-    /// Counts cancellations, so that only the last one's deadline applies.
-    probe: u64,
-    probing: bool,
+    /// Cancelled jobs the engine has not acknowledged yet.
+    cancelling: HashSet<JobId>,
     pub search: SymbolIndex,
     pub filter: Filter,
     pub outline: Outline,
@@ -127,8 +127,7 @@ impl Workspace {
             open_error: None,
             pending_trust: None,
             restore: None,
-            probe: 0,
-            probing: false,
+            cancelling: HashSet::new(),
             search: SymbolIndex::default(),
             filter,
             outline: Outline::default(),
@@ -168,25 +167,29 @@ impl Workspace {
     }
 
     /// Tells the engine about the jobs the session stopped, and replaces it if
-    /// it does not answer in time.
+    /// it does not acknowledge them in time.
     fn flush_cancels(&mut self, cx: &mut Context<Self>) {
         let cancelled = self.session.take_cancelled();
-        if cancelled.is_empty() || !self.engine.is_running() {
+        let Some(number) = self.engine.number() else {
+            return;
+        };
+        if cancelled.is_empty() {
             return;
         }
-        for id in cancelled {
+        for &id in &cancelled {
             let _ = self.engine.send(&Request::Cancel { id });
+            self.cancelling.insert(id);
         }
-        let _ = self.engine.send(&Request::CacheStatus);
-        self.probe += 1;
-        self.probing = true;
-        let probe = self.probe;
         let deadline = cx.background_executor().timer(CANCEL_GRACE);
         cx.spawn(async move |this, cx| {
             deadline.await;
             this.update(cx, |this, cx| {
-                if this.probing && this.probe == probe {
-                    this.probing = false;
+                let mut pending = false;
+                for id in &cancelled {
+                    pending |= this.cancelling.remove(id);
+                }
+                // An engine that started since has nothing to acknowledge.
+                if pending && this.engine.is_current(number) {
                     this.engine.kill();
                     this.resend(cx);
                 }
@@ -322,7 +325,8 @@ impl Workspace {
                 self.session.what_if_failed(id.generation, failure);
                 self.rebuild_rows();
             }
-            Response::Cache { .. } => self.probing = false,
+            Response::Cancelled { id } => _ = self.cancelling.remove(&id),
+            Response::Cache { .. } => {}
         }
         self.refocus();
         cx.notify();

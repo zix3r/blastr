@@ -28,7 +28,7 @@ use crate::{
 ///
 /// 2: opening a repository no longer carries options read from a file; the
 /// window sends the user's settings with every job instead.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Largest frame either side accepts, in bytes.
 ///
@@ -293,6 +293,13 @@ pub enum Response {
         id: JobId,
         /// What went wrong.
         failure: Failure,
+    },
+    /// A job named by [`Request::Cancel`] stopped, or had already stopped.
+    /// Every cancellation is answered with one; the window replaces an
+    /// engine that does not answer in time.
+    Cancelled {
+        /// The job that was cancelled.
+        id: JobId,
     },
     /// What the cache holds, answering [`Request::CacheStatus`] and
     /// [`Request::CacheClear`].
