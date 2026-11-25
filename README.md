@@ -63,8 +63,9 @@ Every [release](https://github.com/zix3r/blastr/releases) carries ready-made bin
 | Windows x86_64 | `blastr-<version>-windows-x86_64.zip` | Unzip anywhere and run `blastr.exe`. |
 | Arch Linux x86_64 | `blastr-<version>-archlinux-x86_64.tar.gz` | Unpack into `~/.local` or `/usr/local` (`tar -xzf … --strip-components=1 -C ~/.local`); this adds `blastr` to `bin` and a desktop entry with its icon. |
 
-Each archive holds two programs that belong together: the window, `blastr`, and the analysis engine,
-`blastr-engine`, which the window starts from its own folder. Keep them side by side.
+Each archive holds three programs that belong together: the window, `blastr`; the analysis engine,
+`blastr-engine`, which the window starts from its own folder; and `blastr-mcp`, the server
+[AI agents](#use-with-ai-agents) start. Keep them side by side.
 
 ### From crates.io
 
@@ -72,7 +73,7 @@ Each archive holds two programs that belong together: the window, `blastr`, and 
 cargo install blastr
 ```
 
-This builds and installs both programs into `~/.cargo/bin`. On Linux it needs the system packages
+This builds and installs all three programs into `~/.cargo/bin`. On Linux it needs the system packages
 listed below.
 
 ### Build from source
@@ -85,7 +86,7 @@ cd blastr
 cargo build --release -p blastr
 ```
 
-Both programs land in `target/release`.
+The programs land in `target/release`.
 
 <details>
 <summary>Linux: system packages</summary>
@@ -120,6 +121,26 @@ traces what a change of the selected symbol would reach.
 | <kbd>Ctrl</kbd> <kbd>E</kbd> | Open the selected location in your editor |
 | <kbd>Ctrl</kbd> <kbd>,</kbd> | Settings |
 | <kbd>Esc</kbd> | Cancel the running analysis |
+
+## Use with AI agents
+
+Agents such as Claude Code, Claude Desktop, Cursor and VS Code can use Blastr through MCP: open a
+repository, choose a comparison, read the impact, its evidence and the tests to run, try a
+*what if*, and point the window at what they are talking about. `blastr-mcp` talks to the open
+window, so keep Blastr running; everything the agent does happens visibly there, and the
+working-tree result it reads refreshes as files are saved.
+
+In Blastr, **Settings → Copy MCP config** copies
+`{"mcpServers":{"blastr":{"command":"<path to blastr-mcp>"}}}` with the real path. Then:
+
+- **Claude Code**: `claude mcp add blastr -- <path to blastr-mcp>`
+- **Claude Desktop, Cursor**: paste that JSON into `claude_desktop_config.json` or
+  `.cursor/mcp.json` (merge it with any servers already there).
+- **VS Code**: add it to `.vscode/mcp.json` under `"servers"` instead of `"mcpServers"`:
+  `{"servers":{"blastr":{"command":"<path to blastr-mcp>"}}}`.
+
+The agent can call `guide` to learn the concepts and tools. Agents can be turned off with
+*Allow AI agents (MCP)* in Settings.
 
 ## How it works
 

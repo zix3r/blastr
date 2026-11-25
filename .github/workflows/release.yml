@@ -54,7 +54,7 @@ jobs:
         run: |
           $name = "blastr-${{ needs.check-version.outputs.version }}-windows-x86_64"
           New-Item -ItemType Directory -Path $name | Out-Null
-          Copy-Item target/release/blastr.exe, target/release/blastr-engine.exe $name
+          Copy-Item target/release/blastr.exe, target/release/blastr-engine.exe, target/release/blastr-mcp.exe $name
           Copy-Item README.md, LICENSE-MIT, LICENSE-APACHE $name
           Compress-Archive -Path $name -DestinationPath "$name.zip"
 
@@ -94,6 +94,7 @@ jobs:
           name="blastr-${{ needs.check-version.outputs.version }}-archlinux-x86_64"
           install -Dm755 target/release/blastr        "$name/bin/blastr"
           install -Dm755 target/release/blastr-engine "$name/bin/blastr-engine"
+          install -Dm755 target/release/blastr-mcp    "$name/bin/blastr-mcp"
           install -Dm644 assets/linux/blastr.desktop  "$name/share/applications/blastr.desktop"
           install -Dm644 assets/icons/blastr-256.png  "$name/share/icons/hicolor/256x256/apps/blastr.png"
           install -Dm644 assets/icons/blastr-512.png  "$name/share/icons/hicolor/512x512/apps/blastr.png"
@@ -140,7 +141,7 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           VERSION: ${{ needs.check-version.outputs.version }}
         run: |
-          for crate in blastr-model blastr-git blastr-ra blastr-core blastr-gui blastr; do
+          for crate in blastr-model blastr-git blastr-ra blastr-core blastr-gui blastr-mcp blastr; do
             status=$(curl -s -o /dev/null -w '%{http_code}' -A 'blastr-release (github.com/zix3r/blastr)' \
               "https://crates.io/api/v1/crates/$crate/$VERSION")
             if [ "$status" = 200 ]; then
