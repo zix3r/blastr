@@ -143,13 +143,22 @@ fn analysis() -> Analysis {
             base_key: None,
             head_key: None,
             changed_files: Vec::new(),
-            changes: vec![Change {
-                kind: ChangeKind::Signature,
-                symbol: SymbolPath::new("billing::tax::vat_rate", SymbolKind::Function),
-                old: Some(at(3)),
-                new: Some(at(3)),
-                detail: ChangeDetail::None,
-            }],
+            changes: vec![
+                Change {
+                    kind: ChangeKind::Signature,
+                    symbol: SymbolPath::new("billing::tax::vat_rate", SymbolKind::Function),
+                    old: Some(at(3)),
+                    new: Some(at(3)),
+                    detail: ChangeDetail::None,
+                },
+                Change {
+                    kind: ChangeKind::Body,
+                    symbol: SymbolPath::new("billing::invoice::render", SymbolKind::Function),
+                    old: Some(at(30)),
+                    new: Some(at(30)),
+                    detail: ChangeDetail::None,
+                },
+            ],
             limits: Vec::new(),
         },
         items: vec![
@@ -230,7 +239,7 @@ fn answer(id: u64, call: Call) -> Vec<FromWindow> {
             status: status(),
             analysis: Some(Box::new(analysis())),
         },
-        Call::FindSymbol { .. } => Answer::Symbols(Vec::new()),
+        Call::FindSymbol { .. } => Answer::Symbols { hits: Vec::new() },
         Call::Show { .. } => Answer::Done,
         _ => Answer::Status(status()),
     };
@@ -269,6 +278,7 @@ async fn lists_every_tool_and_explains_itself() {
             "find_symbol",
             "get_analysis",
             "guide",
+            "list_changes",
             "list_impact",
             "open_repository",
             "set_options",
@@ -336,6 +346,38 @@ async fn answers_from_the_window() {
         "{}",
         text(&explained)
     );
+
+    let changes = call(&client, "list_changes", json!({ "limit": 1 })).await;
+    let data = changes.structured_content.clone().expect("structured");
+    assert_eq!(data["total"], 2);
+    assert_eq!(data["changes"][0]["index"], 0);
+    assert_eq!(data["next_offset"], 1);
+    let bodies = call(&client, "list_changes", json!({ "kind": "body" })).await;
+    assert!(
+        text(&bodies).contains("#1 body billing::invoice::render src/lib.rs:30"),
+        "{}",
+        text(&bodies)
+    );
+    let unknown = call(&client, "list_changes", json!({ "kind": "bodies" })).await;
+    assert_eq!(unknown.is_error, Some(true));
+
+    let changed = call(&client, "explain_impact", json!({ "symbol": "vat_rate" })).await;
+    assert_eq!(changed.is_error, Some(false));
+    let words = text(&changed);
+    assert!(words.contains("Change #0: signature"), "{words}");
+    assert!(words.contains("It reaches 2 needing editing"), "{words}");
+    assert!(words.contains("No test reaches change #0."), "{words}");
+
+    let missing = call(&client, "explain_impact", json!({ "symbol": "Total" })).await;
+    assert_eq!(missing.is_error, Some(true));
+    assert!(
+        text(&missing).contains("Did you mean: billing::invoice::total?"),
+        "{}",
+        text(&missing)
+    );
+
+    let tests = call(&client, "tests_to_run", json!({ "change": 1 })).await;
+    assert!(text(&tests).contains("No test reaches change #1."));
 
     // One connection serves every call.
     assert_eq!(greeted.lock().expect("names").len(), 1);

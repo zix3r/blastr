@@ -42,8 +42,9 @@ rust-analyzer and runs locally, in the Blastr window: these tools need that wind
 
 ## Workflows
 
-- **Review the current comparison**: `status`, then `get_analysis`; `list_impact` for more
-  items (filter by change or class); `explain_impact` for why one is listed; `tests_to_run`.
+- **Review the current comparison**: `status`, then `get_analysis`; `list_changes` for all the
+  changes (filter by kind or file); `list_impact` for more items (filter by change or class);
+  `explain_impact` for why one is listed, or for what a change reaches; `tests_to_run`.
 - **Another comparison**: `compare` with `worktree`, `staged`, a revision (`HEAD~1`, a hash) or
   a range (`main..HEAD`); it waits for the result and returns the summary.
 - **Work in progress**: with the working tree compared, every saved file refreshes the result
@@ -54,9 +55,14 @@ rust-analyzer and runs locally, in the Blastr window: these tools need that wind
   any file. The window shows the what-if until `compare` is called.
 - **Pick tests**: `tests_to_run`, optionally for one change.
 - **Point the user at something**: `show` selects a change or a symbol in the window.
+- **Long runs**: a call that waits for the window (`open_repository`, `compare`, `set_options`,
+  `get_analysis`, `what_if`) stops waiting after 45 seconds and answers "Blastr is still
+  working" with the phase it is in. The window carries on; call `get_analysis` (again, if it
+  says the same) to wait for the result.
 
 Symbols are named by their path, `crate::module::Type::method`; a unique shorter suffix such as
-`Type::method` also works. `find_symbol` looks a name up.
+`Type::method` also works. `find_symbol` looks a name up. A package's library and binaries can
+share a crate name, so two symbols can have the same path; the file:line tells them apart.
 
 ## Tools
 
@@ -68,11 +74,14 @@ Symbols are named by their path, `crate::module::Type::method`; a unique shorter
 - `compare(spec)`: chooses the comparison and returns the analysis summary.
 - `set_options(features, all_features, target, ignore)`: the repository's analysis options;
   runs the comparison again.
-- `get_analysis`: the current result: comparison, changes, counts, tests, top items, limits.
+- `get_analysis`: the current result: comparison, changed files, the first changes, counts,
+  tests, top items, limits.
+- `list_changes(kind, file, offset, limit)`: the changes, paged, each with its number, kind,
+  symbol and file:line.
 - `list_impact(change, class, min_confidence, offset, limit)`: affected items, paged, each with
   its one-line reason.
 - `explain_impact(symbol)`: the evidence paths of one item, step by step, and the tests that
-  reach it.
+  reach it; for a changed symbol, what changed, where, what it reaches and its tests.
 - `tests_to_run(change)`: `cargo test` commands and the selected tests with their reasons.
 - `find_symbol(query, limit)`: symbols matching a name.
 - `what_if(symbol, assume)`: traces an assumed change of one symbol.

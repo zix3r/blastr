@@ -13,13 +13,22 @@ use blastr_model::wording::{
     site_text, step_text, tag_names, target_label, test_reason_text,
 };
 use blastr_model::{
-    Analysis, Confidence, ImpactClass, ImpactItem, SelectedTest, SymbolPath, TestCommand,
-    TestReason,
+    Analysis, Change, ChangeKind, Confidence, ImpactClass, ImpactItem, SelectedTest, SymbolPath,
+    TestCommand, TestReason,
 };
 use serde_json::{Value, json};
 
 /// How many items a summary lists.
 const TOP_ITEMS: usize = 10;
+
+/// How many changes a summary lists.
+const TOP_CHANGES: usize = 20;
+
+/// How many changed files a summary names.
+const TOP_FILES: usize = 5;
+
+/// How many items of each class the explanation of a change lists.
+const TOP_REACHED: usize = 5;
 
 /// How many selected tests an answer lists.
 const MAX_TESTS: usize = 100;
@@ -104,14 +113,38 @@ pub fn summary(status: &Status, analysis: Option<&Analysis>) -> Shaped {
     text.push('\n');
 
     let changes = &analysis.diff.changes;
-    let _ = writeln!(text, "{} {}:", changes.len(), noun(changes.len(), "change"));
-    for (index, change) in changes.iter().enumerate() {
-        let row = change_row(change);
-        let _ = writeln!(
-            text,
-            "#{index} {} {} {}",
-            row.label, row.symbol, row.location
-        );
+    let files = &analysis.diff.changed_files;
+    if changes.is_empty() {
+        if files.is_empty() {
+            text.push_str("0 changes; no files differ.\n");
+        } else {
+            let _ = writeln!(
+                text,
+                "No Rust items changed; only these files differ: {}.",
+                files_text(analysis)
+            );
+        }
+    } else {
+        if !files.is_empty() {
+            let _ = writeln!(
+                text,
+                "Files: {} changed ({})",
+                files.len(),
+                files_text(analysis)
+            );
+        }
+        let _ = writeln!(text, "Changes: {}", kind_counts(changes).join(", "));
+        let _ = writeln!(text, "{} {}:", changes.len(), noun(changes.len(), "change"));
+        for (index, change) in changes.iter().enumerate().take(TOP_CHANGES) {
+            let _ = writeln!(text, "{}", change_line(index, change));
+        }
+        if changes.len() > TOP_CHANGES {
+            let _ = writeln!(
+                text,
+                "… and {} more; `list_changes` pages them.",
+                changes.len() - TOP_CHANGES
+            );
+        }
     }
 
     let editing = count_class(analysis, ImpactClass::Adaptation);
@@ -159,16 +192,18 @@ pub fn summary(status: &Status, analysis: Option<&Analysis>) -> Shaped {
 
     let data = json!({
         "comparison": comparison_data(status, Some(analysis)),
-        "changes": changes.iter().enumerate().map(|(index, change)| {
-            let row = change_row(change);
-            json!({
-                "index": index,
-                "kind": row.label,
-                "symbol": row.symbol,
-                "location": row.location,
-                "note": change_note(change),
-            })
-        }).collect::<Vec<_>>(),
+        "files": {
+            "changed": files.len(),
+            "paths": files.iter().take(TOP_FILES).map(|file| file.path.as_str()).collect::<Vec<_>>(),
+        },
+        "change_counts": kind_counts(changes),
+        "changes": changes
+            .iter()
+            .enumerate()
+            .take(TOP_CHANGES)
+            .map(|(index, change)| change_data(index, change))
+            .collect::<Vec<_>>(),
+        "more_changes": changes.len().saturating_sub(TOP_CHANGES),
         "counts": {
             "needs_editing": editing,
             "may_behave_differently": behaviour,
@@ -251,6 +286,196 @@ pub fn impact_list(
         "offset": offset,
         "items": page.iter().map(|item| item_data(item, analysis)).collect::<Vec<_>>(),
         "next_offset": next,
+        "limits": limit_parts(analysis),
+    });
+    Shaped { text, data }
+}
+
+/// One page of changes, for `list_changes`: those of `kind` (as
+/// [`ChangeKind::as_str`] spells it) in files whose path contains `file`.
+pub fn change_list(
+    status: &Status,
+    analysis: &Analysis,
+    kind: Option<&str>,
+    file: Option<&str>,
+    offset: usize,
+    limit: usize,
+) -> Shaped {
+    let matching: Vec<(usize, &Change)> = analysis
+        .diff
+        .changes
+        .iter()
+        .enumerate()
+        .filter(|(_, change)| kind.is_none_or(|kind| change.kind.as_str() == kind))
+        .filter(|(_, change)| {
+            file.is_none_or(|file| {
+                [&change.new, &change.old]
+                    .into_iter()
+                    .flatten()
+                    .any(|location| location.file.as_str().contains(file))
+            })
+        })
+        .collect();
+    let page: Vec<(usize, &Change)> = matching.iter().skip(offset).take(limit).copied().collect();
+    let next = (offset + page.len() < matching.len()).then_some(offset + page.len());
+
+    let mut text = comparison_line(status, Some(analysis));
+    text.push('\n');
+    if page.is_empty() {
+        let _ = writeln!(
+            text,
+            "No changes here ({} match the filter).",
+            matching.len()
+        );
+    } else {
+        let _ = writeln!(
+            text,
+            "Changes {}–{} of {}:",
+            offset + 1,
+            offset + page.len(),
+            matching.len()
+        );
+        for (index, change) in &page {
+            let _ = writeln!(text, "{}", change_line(*index, change));
+        }
+    }
+    if let Some(next) = next {
+        let _ = writeln!(text, "More: call again with offset {next}.");
+    }
+    text.push_str(&limits_line(analysis));
+
+    let data = json!({
+        "comparison": comparison_data(status, Some(analysis)),
+        "total": matching.len(),
+        "offset": offset,
+        "changes": page.iter().map(|(index, change)| change_data(*index, change)).collect::<Vec<_>>(),
+        "next_offset": next,
+        "limits": limit_parts(analysis),
+    });
+    Shaped { text, data }
+}
+
+/// What the changes numbered `indices` are and what they reach, for
+/// `explain_impact` on a changed symbol.
+pub fn explain_changes(status: &Status, analysis: &Analysis, indices: &[usize]) -> Shaped {
+    let mut text = comparison_line(status, Some(analysis));
+    text.push('\n');
+    let mut explained = Vec::new();
+    for &index in indices {
+        let Some(change) = analysis.diff.changes.get(index) else {
+            continue;
+        };
+        let row = change_row(change);
+        let note = change_note(change);
+        let _ = writeln!(
+            text,
+            "Change #{index}: {} {} — {note}",
+            row.label, row.symbol
+        );
+        let before = change.old.as_ref().map(site_text);
+        let now = change.new.as_ref().map(site_text);
+        if let Some(before) = &before {
+            let _ = writeln!(text, "Before: {before}");
+        }
+        if let Some(now) = &now {
+            let _ = writeln!(text, "Now: {now}");
+        }
+
+        // Each item counts in the class of its best path from this change.
+        let change_number = u32::try_from(index).unwrap_or(u32::MAX);
+        let reached = |class: ImpactClass| -> Vec<&ImpactItem> {
+            analysis
+                .items
+                .iter()
+                .filter(|item| {
+                    item.paths
+                        .iter()
+                        .find(|path| path.change == change_number)
+                        .is_some_and(|path| path.class == class)
+                })
+                .collect()
+        };
+        let editing = reached(ImpactClass::Adaptation);
+        let behaviour = reached(ImpactClass::Behaviour);
+        let _ = writeln!(
+            text,
+            "It reaches {} needing editing and {} that may behave differently.",
+            editing.len(),
+            behaviour.len()
+        );
+        for (class, items) in [
+            (ImpactClass::Adaptation, &editing),
+            (ImpactClass::Behaviour, &behaviour),
+        ] {
+            if items.is_empty() {
+                continue;
+            }
+            let _ = writeln!(text, "Top {}:", class_text(class));
+            for item in items.iter().take(TOP_REACHED) {
+                let _ = writeln!(text, "{}", item_line(item, analysis));
+            }
+        }
+        if editing.len() + behaviour.len() > TOP_REACHED {
+            let _ = writeln!(text, "`list_impact` with change {index} lists them all.");
+        }
+
+        let selected: Vec<&SelectedTest> = analysis
+            .tests
+            .selected
+            .iter()
+            .filter(|test| test_of_change(analysis, test, change_number))
+            .collect();
+        if selected.is_empty() {
+            let _ = writeln!(text, "No test reaches change #{index}.");
+        } else {
+            let _ = writeln!(
+                text,
+                "{} {} selected for it; `tests_to_run` with change {index} gives the commands:",
+                selected.len(),
+                noun(selected.len(), "test")
+            );
+            for test in selected.iter().take(TOP_ITEMS) {
+                let _ = writeln!(
+                    text,
+                    "  {} ({}) {}",
+                    test.symbol.path,
+                    test_reason_text(test.reason),
+                    site_text(&test.location)
+                );
+            }
+            if selected.len() > TOP_ITEMS {
+                let _ = writeln!(text, "  … {} more", selected.len() - TOP_ITEMS);
+            }
+        }
+
+        let mut data = change_data(index, change);
+        data["before"] = json!(before);
+        data["now"] = json!(now);
+        data["needs_editing"] = json!(editing.len());
+        data["may_behave_differently"] = json!(behaviour.len());
+        data["top_items"] = json!(
+            editing
+                .iter()
+                .take(TOP_REACHED)
+                .chain(behaviour.iter().take(TOP_REACHED))
+                .map(|item| item_data(item, analysis))
+                .collect::<Vec<_>>()
+        );
+        data["tests"] = json!(
+            selected
+                .iter()
+                .take(TOP_ITEMS)
+                .map(|test| test.symbol.path.clone())
+                .collect::<Vec<_>>()
+        );
+        data["tests_selected"] = json!(selected.len());
+        explained.push(data);
+    }
+    text.push_str(&limits_line(analysis));
+
+    let data = json!({
+        "comparison": comparison_data(status, Some(analysis)),
+        "changes": explained,
         "limits": limit_parts(analysis),
     });
     Shaped { text, data }
@@ -381,13 +606,20 @@ pub fn tests(status: &Status, analysis: &Analysis, change: Option<u32>) -> Shape
 
     let mut text = comparison_line(status, Some(analysis));
     text.push('\n');
-    let scope = change.map_or(String::new(), |change| format!(" for change #{change}"));
-    let _ = writeln!(
-        text,
-        "{} of {} tests selected{scope}.",
-        selected.len(),
-        selection.total
-    );
+    if selected.is_empty() {
+        let _ = match change {
+            Some(change) => writeln!(text, "No test reaches change #{change}."),
+            None => writeln!(text, "No test reaches these changes."),
+        };
+    } else {
+        let scope = change.map_or(String::new(), |change| format!(" for change #{change}"));
+        let _ = writeln!(
+            text,
+            "{} of {} tests selected{scope}.",
+            selected.len(),
+            selection.total
+        );
+    }
     for command in &commands {
         let _ = writeln!(
             text,
@@ -467,6 +699,52 @@ pub fn symbols(query: &str, hits: &[SymbolHit]) -> Shaped {
         text: text.trim_end().to_owned(),
         data,
     }
+}
+
+/// One change as one line: `#n kind symbol file:line`.
+fn change_line(index: usize, change: &Change) -> String {
+    let row = change_row(change);
+    format!("#{index} {} {} {}", row.label, row.symbol, row.location)
+        .trim_end()
+        .to_owned()
+}
+
+/// One change as JSON.
+fn change_data(index: usize, change: &Change) -> Value {
+    let row = change_row(change);
+    json!({
+        "index": index,
+        "kind": row.label,
+        "symbol": row.symbol,
+        "location": row.location,
+        "note": change_note(change),
+    })
+}
+
+/// How many changes there are of each kind, as `80 added`, in the order of
+/// [`ChangeKind::ALL`].
+fn kind_counts(changes: &[Change]) -> Vec<String> {
+    ChangeKind::ALL
+        .iter()
+        .filter_map(|kind| {
+            let count = changes.iter().filter(|change| change.kind == *kind).count();
+            (count > 0).then(|| format!("{count} {}", kind.as_str()))
+        })
+        .collect()
+}
+
+/// The first changed files, and `…` when there are more.
+fn files_text(analysis: &Analysis) -> String {
+    let files = &analysis.diff.changed_files;
+    let mut names: Vec<&str> = files
+        .iter()
+        .take(TOP_FILES)
+        .map(|file| file.path.as_str())
+        .collect();
+    if files.len() > TOP_FILES {
+        names.push("…");
+    }
+    names.join(", ")
 }
 
 /// One item as one line: class, confidence, distance, path, reason, place.

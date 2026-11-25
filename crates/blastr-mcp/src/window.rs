@@ -33,6 +33,14 @@ const DROPPED: &str = "The connection to the Blastr window dropped before it ans
 /// How long the window may take to answer the greeting.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long a call that runs a job waits for it. Many clients give up on a
+/// tool after 60 s, so the call returns before that and the window carries on.
+const PATIENCE: Duration = Duration::from_secs(45);
+
+/// How the answer of a call that stopped waiting starts; such an answer is
+/// not a failure.
+pub const STILL_WORKING: &str = "Blastr is still working";
+
 /// The window as this server sees it: where it listens and the connection to
 /// it, if one is open.
 pub struct Window {
@@ -88,13 +96,23 @@ impl Window {
     /// waits for the answer.
     ///
     /// Progress is forwarded to the client when it sent a progress token, and
-    /// cancelling the request cancels the window's job. The error is in words
-    /// for the agent.
+    /// cancelling the request cancels the window's job. A call that runs a job
+    /// stops waiting after [`PATIENCE`] and answers an error starting with
+    /// [`STILL_WORKING`]; the window carries on and its late reply is dropped.
+    /// The error is in words for the agent.
     pub async fn call(
         &self,
         context: &RequestContext<RoleServer>,
         call: Call,
     ) -> Result<Answer, String> {
+        let runs_job = matches!(
+            call,
+            Call::Open { .. }
+                | Call::Compare { .. }
+                | Call::SetOptions { .. }
+                | Call::Analysis
+                | Call::WhatIf { .. }
+        );
         let link = self.connect(&client_name(context)).await?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (sender, mut events) = mpsc::unbounded_channel();
@@ -112,11 +130,15 @@ impl Window {
 
         let token = context.meta.get_progress_token();
         let mut step = 0u32;
+        let mut phase: Option<String> = None;
+        let deadline = tokio::time::sleep(PATIENCE);
+        tokio::pin!(deadline);
         loop {
             tokio::select! {
                 event = events.recv() => match event {
                     Some(Event::Reply(result)) => return result,
                     Some(Event::Progress(report)) => {
+                        phase = Some(report.phase.clone());
                         let Some(token) = &token else { continue };
                         step += 1;
                         let mut param = ProgressNotificationParam::new(token.clone(), f64::from(step));
@@ -130,6 +152,15 @@ impl Window {
                     lock(&link.pending).remove(&id);
                     let _ = link.send(&ToWindow::Cancel { id }).await;
                     return Err("Cancelled.".to_owned());
+                }
+                () = &mut deadline, if runs_job => {
+                    lock(&link.pending).remove(&id);
+                    let phase = phase.map_or(String::new(), |phase| format!("phase: {phase}, "));
+                    return Err(format!(
+                        "{STILL_WORKING} ({phase}{} s so far). Call get_analysis to wait for the \
+                         result.",
+                        PATIENCE.as_secs()
+                    ));
                 }
             }
         }

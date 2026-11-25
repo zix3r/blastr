@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use blastr_model::bridge::{Answer, Call, ShowTarget, Status};
 use blastr_model::wording::short_name;
-use blastr_model::{Analysis, Assume, Confidence, ImpactClass, RevSpec, SymbolPath};
+use blastr_model::{Analysis, Assume, ChangeKind, Confidence, ImpactClass, RevSpec, SymbolPath};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -25,7 +25,7 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::task::JoinHandle;
 
 use crate::shape::{self, ImpactFilter, Shaped};
-use crate::window::Window;
+use crate::window::{STILL_WORKING, Window};
 
 /// The guide: what Blastr is, its concepts, workflows and tools.
 const GUIDE: &str = include_str!("guide.md");
@@ -35,8 +35,10 @@ const INSTRUCTIONS: &str = "Blastr shows what a Rust code change can reach, and 
 two revisions of a Cargo project with rust-analyzer and lists the code that needs editing (it \
 refers to something whose shape changed) and the code that may behave differently (it runs \
 through changed code), each with evidence paths, plus the tests to run. It runs locally in the \
-Blastr window, which must be open. Start with `status` or `get_analysis`; after files are saved, \
-`get_analysis` returns the refreshed result. Call `guide` for details.";
+Blastr window, which must be open. Start with `status` or `get_analysis`; `list_changes` and \
+`list_impact` page through the changes and the affected items. After files are saved, \
+`get_analysis` returns the refreshed result; a call that answers \"still working\" is \
+finished by calling `get_analysis` again. Call `guide` for details.";
 
 /// The resource holding the guide.
 const GUIDE_URI: &str = "blastr://guide";
@@ -136,12 +138,29 @@ struct ListParams {
     limit: Option<u32>,
 }
 
+/// Parameters of `list_changes`.
+#[derive(Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct ChangesParams {
+    /// Only changes of this kind: `body`, `signature`, `visibility`, `added`, `removed`,
+    /// `renamed`, `field`, `variant`, `trait-item`, `impl`, `const-value`, `type-alias`,
+    /// `macro-def`, `attribute`, `manifest` or `non-semantic`.
+    kind: Option<String>,
+    /// Only changes in files whose path contains this text, such as `src/lib.rs` or
+    /// `crates/core/`.
+    file: Option<String>,
+    /// How many matching changes to skip; default 0.
+    offset: Option<u32>,
+    /// How many changes to list; default 25, at most 100.
+    limit: Option<u32>,
+}
+
 /// Parameters of `explain_impact`.
 #[derive(Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 struct ExplainParams {
-    /// The affected item, by its path (`crate::module::Type::method`) or a unique suffix of it
-    /// (`Type::method`).
+    /// The affected item or changed symbol, by its path (`crate::module::Type::method`) or a
+    /// unique suffix of it (`Type::method`).
     symbol: String,
 }
 
@@ -267,12 +286,15 @@ impl Server {
             limit: 200,
         };
         let hits = match self.window.call(context, call).await? {
-            Answer::Symbols(hits) => hits,
+            Answer::Symbols { hits } => hits,
             other => return Err(unexpected(&other)),
         };
         let found = matching(text, hits.iter().map(|hit| &hit.symbol));
         pick(text, found)?.ok_or_else(|| {
-            format!("No symbol `{text}` was found. `find_symbol` lists symbols by name.")
+            format!(
+                "No symbol `{text}` was found.{} `find_symbol` lists symbols by name.",
+                suggestions(text, hits.iter().map(|hit| &hit.symbol))
+            )
         })
     }
 }
@@ -439,9 +461,46 @@ impl Server {
         finish(result)
     }
 
+    /// The changes, numbered as in `get_analysis`, paged, each with its kind, symbol and
+    /// file:line. Filter by kind or file.
+    #[tool(
+        name = "list_changes",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn list_changes(
+        &self,
+        Parameters(params): Parameters<ChangesParams>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        let result = async {
+            let kind = params.kind.as_deref().map(str::trim);
+            if let Some(kind) = kind
+                && !ChangeKind::ALL.iter().any(|known| known.as_str() == kind)
+            {
+                let known: Vec<&str> = ChangeKind::ALL.iter().map(|kind| kind.as_str()).collect();
+                return Err(format!(
+                    "`{kind}` is not a change kind; use one of {}.",
+                    known.join(", ")
+                ));
+            }
+            let (status, analysis) = self.current(&context).await?;
+            let offset = params.offset.unwrap_or(0) as usize;
+            Ok(shape::change_list(
+                &status,
+                &analysis,
+                kind,
+                params.file.as_deref(),
+                offset,
+                page_size(params.limit),
+            ))
+        };
+        finish(result.await)
+    }
+
     /// Why one affected item is listed: its class, confidence and distance, a sentence
     /// explaining it, up to three evidence paths with every step's file:line, and the selected
-    /// tests that reach it.
+    /// tests that reach it. For a changed symbol: what the change is, where, what it reaches
+    /// and the tests selected for it.
     #[tool(
         name = "explain_impact",
         annotations(read_only_hint = true, open_world_hint = false)
@@ -465,20 +524,22 @@ impl Server {
             }
             let changes = analysis.diff.changes.iter().map(|change| &change.symbol);
             if let Some(symbol) = pick(text, matching(text, changes))? {
-                let index = analysis
+                let indices: Vec<usize> = analysis
                     .diff
                     .changes
                     .iter()
-                    .position(|change| change.symbol == symbol)
-                    .unwrap_or_default();
-                return Err(format!(
-                    "`{}` is changed itself (change #{index}), not affected by another change. \
-                     `list_impact` with change {index} lists what it reaches.",
-                    symbol.path
-                ));
+                    .enumerate()
+                    .filter(|(_, change)| change.symbol == symbol)
+                    .map(|(index, _)| index)
+                    .collect();
+                return Ok(shape::explain_changes(&status, &analysis, &indices));
             }
+            let items = analysis.items.iter().map(|item| &item.symbol);
+            let changes = analysis.diff.changes.iter().map(|change| &change.symbol);
             Err(format!(
-                "`{text}` is not among the affected items of this comparison."
+                "`{text}` is neither an affected item nor a changed symbol of this comparison.{} \
+                 `find_symbol` looks a name up.",
+                suggestions(text, items.chain(changes))
             ))
         };
         finish(result.await)
@@ -518,7 +579,7 @@ impl Server {
             limit: page_size(params.limit) as u32,
         };
         let result = match self.window.call(&context, call).await {
-            Ok(Answer::Symbols(hits)) => Ok(shape::symbols(&params.query, &hits)),
+            Ok(Answer::Symbols { hits }) => Ok(shape::symbols(&params.query, &hits)),
             Ok(other) => Err(unexpected(&other)),
             Err(error) => Err(error),
         };
@@ -835,10 +896,15 @@ tool `status`; unless the working tree is already compared, call `compare` with 
 call `get_analysis`, `explain_impact` for the items that need editing, and `tests_to_run`. Report \
 what the edit reaches, what still needs editing, and which tests cover it.";
 
-/// A tool result from an answer or an error in words.
+/// A tool result from an answer or an error in words. A call that stopped
+/// waiting for the window is not an error: the agent is told to ask again.
 fn finish(result: Result<Shaped, String>) -> CallToolResult {
     match result {
         Ok(shaped) => done(shaped),
+        Err(error) if error.starts_with(STILL_WORKING) => done(Shaped {
+            data: serde_json::json!({ "still_working": error }),
+            text: error,
+        }),
         Err(error) => CallToolResult::error(vec![ContentBlock::text(error)]),
     }
 }
@@ -923,6 +989,34 @@ fn matching<'a>(text: &str, candidates: impl Iterator<Item = &'a SymbolPath>) ->
         }
     }
     unique
+}
+
+/// Up to five paths among `candidates` that contain the last `::` segment of
+/// `text`, ignoring case, as a sentence starting with a space; empty when
+/// there are none.
+fn suggestions<'a>(text: &str, candidates: impl Iterator<Item = &'a SymbolPath>) -> String {
+    let name = text
+        .rsplit("::")
+        .next()
+        .unwrap_or(text)
+        .trim()
+        .to_lowercase();
+    if name.is_empty() {
+        return String::new();
+    }
+    let mut found: Vec<&str> = Vec::new();
+    for symbol in candidates {
+        if found.len() == 5 {
+            break;
+        }
+        if symbol.path.to_lowercase().contains(&name) && !found.contains(&symbol.path.as_str()) {
+            found.push(&symbol.path);
+        }
+    }
+    if found.is_empty() {
+        return String::new();
+    }
+    format!(" Did you mean: {}?", found.join(", "))
 }
 
 /// The one symbol of `found`, `None` when there is none, or an error listing
