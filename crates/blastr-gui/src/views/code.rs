@@ -10,14 +10,14 @@ use gpui_kit::component::diff::{
     Diff, DiffDecoration, DiffFile, DiffLinePosition, DiffLineRange, DiffMode, DiffSide, DiffState,
 };
 use gpui_kit::component::input::{
-    Editor, EditorState, GutterDecoration, GutterDecorationCollection, RangeDecoration,
+    Editor, EditorState, GutterDecoration, GutterDecorationCollection, InputEvent, RangeDecoration,
     RangeDecorationCollection, RangeDecorationStyle,
 };
 use gpui_kit::component::{Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    AnyElement, Context, Entity, IntoElement, ParentElement, Render, Styled, Subscription, Task,
-    Window, div, point, px,
+    AnyElement, Context, Entity, IntoElement, ParentElement, Render, SharedString, Styled,
+    Subscription, Task, Window, div, point, px,
 };
 use similar::TextDiff;
 
@@ -59,9 +59,11 @@ pub(crate) struct CodePane {
     diff: Entity<DiffState>,
     decorations: Vec<DiffDecoration>,
     editor: Entity<EditorState>,
+    /// The text the editor was given, which it must keep.
+    shown: SharedString,
     marks: Option<(RangeDecorationCollection, GutterDecorationCollection)>,
     read: Task<()>,
-    _subscription: Subscription,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl CodePane {
@@ -71,14 +73,13 @@ impl CodePane {
         cx: &mut Context<Self>,
     ) -> CodePane {
         let diff = cx.new(|cx| DiffState::new(Vec::new(), cx));
-        let editor = cx.new(|cx| {
-            let mut state = EditorState::new(window, cx).language("rust").folding(false);
-            state.set_readonly(true, cx);
-            state
-        });
-        let subscription = cx.observe_in(&workspace, window, |this, _, window, cx| {
-            this.sync(window, cx)
-        });
+        let editor = cx.new(|cx| source_state(window, cx));
+        let subscriptions = vec![
+            cx.observe_in(&workspace, window, |this, _, window, cx| {
+                this.sync(window, cx)
+            }),
+            cx.subscribe_in(&editor, window, Self::keep_text),
+        ];
         CodePane {
             workspace,
             maximized: false,
@@ -89,9 +90,29 @@ impl CodePane {
             diff,
             decorations: Vec::new(),
             editor,
+            shown: SharedString::default(),
             marks: None,
             read: Task::ready(()),
-            _subscription: subscription,
+            _subscriptions: subscriptions,
+        }
+    }
+
+    /// Puts back the text the editor was given, should anything have changed
+    /// it.
+    ///
+    /// The editor is read-only, which rejects every edit the user makes;
+    /// this is the second line, so that no path the library might not
+    /// guard can leave other code on screen than the file's.
+    fn keep_text(
+        &mut self,
+        editor: &Entity<EditorState>,
+        event: &InputEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if matches!(event, InputEvent::Change) && editor.read(cx).value() != self.shown {
+            let text = self.shown.clone();
+            editor.update(cx, |state, cx| state.set_value(text, window, cx));
         }
     }
 
@@ -288,6 +309,7 @@ impl CodePane {
                 .with_color(accent.solid.hsla())
         }));
         let marks = self.marks.take();
+        self.shown = text.clone().into();
         self.editor.update(cx, |state, cx| {
             state.set_value(text, window, cx);
             let line_height = state.line_height().unwrap_or(px(18.75));
@@ -436,11 +458,7 @@ impl Render for CodePane {
                 .decorations(self.decorations.clone())
                 .size_full()
                 .into_any_element(),
-            Content::Source => Editor::new(&self.editor)
-                .readonly(true)
-                .bordered(false)
-                .size_full()
-                .into_any_element(),
+            Content::Source => source_editor(&self.editor).into_any_element(),
         };
         v_flex()
             .size_full()
@@ -450,6 +468,27 @@ impl Render for CodePane {
             })
             .child(div().flex_1().min_h_0().child(body))
     }
+}
+
+/// The state of the source view: Rust, unfolded, and read-only from the
+/// start, before it is first drawn.
+fn source_state(window: &mut Window, cx: &mut Context<EditorState>) -> EditorState {
+    let mut state = EditorState::new(window, cx).language("rust").folding(false);
+    state.set_readonly(true, cx);
+    state
+}
+
+/// The source view: selectable, copyable and searchable, never editable.
+///
+/// Read-only makes the editor reject typing, IME composition, cut, paste,
+/// undo and every editing command, and leaves the edit items of its menu
+/// disabled; a paste is also swallowed before it reaches the editor.
+fn source_editor(state: &Entity<EditorState>) -> Editor {
+    Editor::new(state)
+        .readonly(true)
+        .bordered(false)
+        .on_paste(|_, _, _| true)
+        .size_full()
 }
 
 /// Reads a file of one side of the comparison.
