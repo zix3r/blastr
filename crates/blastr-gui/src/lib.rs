@@ -1,7 +1,7 @@
 //! Blastr's desktop interface.
 //!
-//! [`workspace::Workspace`] holds the state every view reads: the session, the
-//! settings and the connection to the analysis engine. The views in [`views`]
+//! `workspace::Workspace` holds the state every view reads: the session, the
+//! settings and the connection to the analysis engine. The views in `views`
 //! are separate entities that read it and call its transitions.
 
 mod app;

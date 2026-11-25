@@ -57,7 +57,7 @@ impl Workspace {
     ///
     /// A load that comes back without the procedural macros a crate of the
     /// workspace depends on is tried again; what it lost is returned with the
-    /// project rather than refused, see [`Workspace::load_once`].
+    /// project rather than refused, see `Workspace::load_once`.
     pub fn load(
         root: &Path,
         manifest_dir: &Path,

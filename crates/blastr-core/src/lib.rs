@@ -2,7 +2,7 @@
 //!
 //! This crate holds the error type, the [`Engine`] that owns the cache and
 //! runs comparisons, the structural comparison of two revision graphs in
-//! [`diff`], the impact analysis in [`impact`], and the engine's side of the
+//! `diff`, the impact analysis in `impact`, and the engine's side of the
 //! engine process in [`service`]. The types it shares with the window live in
 //! `blastr-model`.
 
