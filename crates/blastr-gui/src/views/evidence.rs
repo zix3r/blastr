@@ -792,6 +792,7 @@ fn step_row(
                 .child(
                     div()
                         .h(ui::SUB_LINE)
+                        .line_height(ui::SUB_LINE)
                         .truncate()
                         .text_size(TEXT_SMALL)
                         .text_color(theme::FG_3)

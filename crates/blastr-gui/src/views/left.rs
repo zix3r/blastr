@@ -413,6 +413,7 @@ impl LeftPane {
                             .child(
                                 div()
                                     .h(ui::SUB_LINE)
+                                    .line_height(ui::SUB_LINE)
                                     .pl(ui::SECOND_LEAD)
                                     .truncate()
                                     .text_size(px(11.))
