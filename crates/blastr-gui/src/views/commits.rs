@@ -28,7 +28,7 @@ pub(crate) fn compare_chip(
         .compare
         .as_ref()
         .map_or_else(|| ("".to_owned(), "Choose".to_owned()), Compare::labels);
-    let trigger = ui::no_drag(Button::new("compare-chip"))
+    let trigger = Button::new("compare-chip")
         .outline()
         .small()
         .h(ui::TOOLBAR_TARGET)
@@ -49,11 +49,13 @@ pub(crate) fn compare_chip(
                 .text_color(theme::FG_4),
         );
     let workspace = workspace.clone();
-    Popover::new("compare-menu")
+    // The title bar is a drag area: keep it from taking the press. On the
+    // chip itself this would also hide the press from the popover, which
+    // opens on the mouse-down of the element around its trigger.
+    let menu = Popover::new("compare-menu")
         .trigger(trigger)
         .content(move |_, _, cx| {
             let state = workspace.read(cx);
-            let dirty = state.session.repo.as_ref().is_some_and(|repo| repo.dirty);
             let current = state.session.compare.clone();
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -64,7 +66,9 @@ pub(crate) fn compare_chip(
                 .w(px(460.))
                 .max_h(px(420.))
                 .overflow_y_scroll();
-            if dirty {
+            // Always offered: whether the tree is dirty is only known from when
+            // the repository opened, and files may have been edited since.
+            {
                 let selected = current == Some(Compare::WorkingTree);
                 let workspace = workspace.clone();
                 list = list.child(
@@ -168,7 +172,9 @@ pub(crate) fn compare_chip(
                         .text_color(theme::FG_4)
                         .child(text)
                 }))
-        })
+        });
+    ui::no_drag(div().id("compare"))
+        .child(menu)
         .into_any_element()
 }
 
