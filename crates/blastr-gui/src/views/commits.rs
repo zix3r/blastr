@@ -28,7 +28,7 @@ pub(crate) fn compare_chip(
         .compare
         .as_ref()
         .map_or_else(|| ("".to_owned(), "Choose".to_owned()), Compare::labels);
-    let trigger = Button::new("compare-chip")
+    let trigger = ui::no_drag(Button::new("compare-chip"))
         .outline()
         .small()
         .h(ui::TOOLBAR_TARGET)

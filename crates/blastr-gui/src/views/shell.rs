@@ -377,8 +377,7 @@ impl Shell {
         let ready = session.repo.is_some();
         let busy = session.is_busy();
         let refreshable = ready && session.compare.is_some() && !busy;
-        let search = h_flex()
-            .id("symbol-search")
+        let search = ui::no_drag(h_flex().id("symbol-search"))
             .flex_none()
             .w(px(300.))
             .h(px(28.))
@@ -791,8 +790,7 @@ impl Render for Shell {
 
 /// A chip of the title bar.
 fn chip(id: &'static str, icon: IconName) -> gpui_kit::Stateful<gpui_kit::Div> {
-    h_flex()
-        .id(id)
+    ui::no_drag(h_flex().id(id))
         .flex_shrink(1.)
         .min_w_0()
         .h(ui::TOOLBAR_TARGET)

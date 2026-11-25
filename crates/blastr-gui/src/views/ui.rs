@@ -398,7 +398,8 @@ pub(crate) const TOOLBAR_TARGET: Pixels = px(28.);
 ///
 /// The icon is drawn in a quiet colour until the pointer is on the target,
 /// which then fills; a disabled action keeps its place and says what it would
-/// do, so the row never reflows when a comparison starts or finishes.
+/// do, so the row never reflows when a comparison starts or finishes. The
+/// target is taken out of the bar's drag area (see [`no_drag`]).
 pub(crate) fn toolbar_button(
     id: impl Into<ElementId>,
     content: impl IntoElement,
@@ -406,8 +407,7 @@ pub(crate) fn toolbar_button(
     enabled: bool,
 ) -> Stateful<Div> {
     let tip: SharedString = tip.into();
-    let button = div()
-        .id(id)
+    let button = no_drag(div().id(id))
         .flex()
         .flex_none()
         .items_center()
@@ -424,6 +424,18 @@ pub(crate) fn toolbar_button(
     } else {
         button.cursor_default()
     }
+}
+
+/// Takes a title bar control out of the window's drag area.
+///
+/// The title bar marks its whole row as the platform's caption, and on
+/// Windows the hit test answers `HTCAPTION` wherever the hitboxes under the
+/// pointer include that row. A press on a control there starts the system's
+/// window-move loop, which swallows the release, so the click never lands.
+/// An occluding hitbox ends the hit test at the control: the press is the
+/// control's alone, and the empty bar around it still drags and maximises.
+pub(crate) fn no_drag<E: InteractiveElement>(element: E) -> E {
+    element.occlude()
 }
 
 /// The icon of a title bar action: readable at rest, dimmed when the action
