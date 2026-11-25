@@ -32,6 +32,9 @@ pub enum Compare {
         newest: Commit,
         from_parent: bool,
     },
+    /// A revision, a range or the index as an agent names it, such as
+    /// `HEAD~1` or `main..HEAD`.
+    Typed(RevSpec),
 }
 
 impl Compare {
@@ -57,6 +60,7 @@ impl Compare {
                     ..RevSpec::default()
                 }
             }
+            Compare::Typed(spec) => spec.clone(),
         }
     }
 
@@ -73,6 +77,16 @@ impl Compare {
                 let parent = if *from_parent { "^" } else { "" };
                 (format!("{}{parent}", oldest.short), newest.short.clone())
             }
+            Compare::Typed(spec) => match (spec.rev.as_deref(), spec.parent) {
+                (Some(rev), _) if rev.contains("..") => {
+                    let (base, head) = rev.split_once("..").unwrap_or((rev, rev));
+                    (base.to_owned(), head.to_owned())
+                }
+                (Some(rev), Some(parent)) => (format!("{rev}^{parent}"), rev.to_owned()),
+                (Some(rev), None) => (format!("{rev}^"), rev.to_owned()),
+                (None, _) if spec.staged => ("HEAD".to_owned(), "Index".to_owned()),
+                (None, _) => ("HEAD".to_owned(), "Working tree".to_owned()),
+            },
         }
     }
 
@@ -691,6 +705,22 @@ mod tests {
         );
         assert!(Compare::WorkingTree.watches());
         assert!(!range.watches());
+        let typed = |rev: &str| {
+            Compare::Typed(RevSpec {
+                rev: Some(rev.to_owned()),
+                ..RevSpec::default()
+            })
+        };
+        assert_eq!(
+            typed("main..HEAD").labels(),
+            ("main".to_owned(), "HEAD".to_owned())
+        );
+        assert_eq!(
+            typed("HEAD~1").labels(),
+            ("HEAD~1^".to_owned(), "HEAD~1".to_owned())
+        );
+        assert_eq!(typed("HEAD~1").spec().rev.as_deref(), Some("HEAD~1"));
+        assert!(!typed("HEAD~1").watches());
     }
 
     #[test]

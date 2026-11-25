@@ -4,7 +4,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -15,11 +15,11 @@ use gpui_kit::component::setting::{
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{Icon, IconName, Sizable as _, WindowExt as _, h_flex};
 use gpui_kit::prelude::*;
-use gpui_kit::{App, Entity, ParentElement, SharedString, Styled, Window, div, px};
+use gpui_kit::{App, ClipboardItem, Entity, ParentElement, SharedString, Styled, Window, div, px};
 
 use crate::settings::{DEPTHS, Settings, ignore_problem, parse_list};
 use crate::theme::{self, TEXT_SMALL, TEXT_UI};
-use crate::workspace::Workspace;
+use crate::workspace::{Workspace, WorkspaceEvent};
 
 /// Opens the settings dialog.
 pub(crate) fn open(workspace: Entity<Workspace>, window: &mut Window, cx: &mut App) {
@@ -29,7 +29,11 @@ pub(crate) fn open(workspace: Entity<Workspace>, window: &mut Window, cx: &mut A
     window.open_dialog(cx, move |dialog, _, cx| {
         let rerun = workspace.read(cx).rerun_needed;
         let root = workspace.read(cx).root().map(PathBuf::from);
-        let mut pages = vec![editor_page(&workspace), analysis_page(&workspace)];
+        let mut pages = vec![
+            editor_page(&workspace),
+            analysis_page(&workspace),
+            agents_page(&workspace),
+        ];
         if let Some(root) = root {
             pages.push(repository_page(&workspace, root, drafts.clone()));
         }
@@ -189,6 +193,65 @@ fn analysis_page(workspace: &Entity<Workspace>) -> SettingPage {
     )
 }
 
+fn agents_page(workspace: &Entity<Workspace>) -> SettingPage {
+    let copy = workspace.clone();
+    SettingPage::new("AI agents").group(
+        SettingGroup::new()
+            .title("AI agents")
+            .description(
+                "Agents such as Claude Code use Blastr through its MCP server, blastr-mcp, while \
+                 this window is open: what they open, compare and select is shown here.",
+            )
+            .item(
+                SettingItem::new(
+                    "Allow AI agents (MCP)",
+                    toggle(
+                        "agents",
+                        getter(workspace, |settings| settings.agents),
+                        setter(workspace, |settings, value: bool| settings.agents = value),
+                    ),
+                )
+                .description("When off, every request of an agent is refused."),
+            )
+            .item(
+                SettingItem::new(
+                    "MCP config",
+                    SettingField::render(move |_, _, _| {
+                        let copy = copy.clone();
+                        Button::new("copy-mcp-config")
+                            .small()
+                            .outline()
+                            .label("Copy MCP config")
+                            .on_click(move |_, _, cx| {
+                                let config = mcp_config(&mcp_program());
+                                copy.update(cx, |_, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(config));
+                                    cx.emit(WorkspaceEvent::Notice(
+                                        "Copied the MCP config".to_owned(),
+                                    ));
+                                });
+                            })
+                    }),
+                )
+                .description("The entry that adds Blastr to an agent's MCP servers."),
+            ),
+    )
+}
+
+/// The MCP server, which is installed next to the window.
+fn mcp_program() -> PathBuf {
+    let name = format!("blastr-mcp{}", std::env::consts::EXE_SUFFIX);
+    std::env::current_exe()
+        .map(|exe| exe.with_file_name(&name))
+        .unwrap_or_else(|_| PathBuf::from(name))
+}
+
+/// The MCP config that starts `program` as the server `blastr`.
+fn mcp_config(program: &Path) -> String {
+    let command = program.to_string_lossy();
+    serde_json::json!({ "mcpServers": { "blastr": { "command": command } } }).to_string()
+}
+
 /// A switch for one setting, drawn in the brand colour when it is on.
 ///
 /// The library's own switch field draws *on* as a track in the primary
@@ -344,5 +407,17 @@ mod tests {
         let repository = settings.repository_or_default(Path::new("/code/a"));
         assert!(repository.all_features);
         assert_eq!(repository.restricted, None);
+    }
+
+    #[test]
+    fn the_mcp_config_names_the_server_beside_the_window() {
+        let config = mcp_config(Path::new(r"C:\Program Files\Blastr\blastr-mcp.exe"));
+        assert_eq!(
+            config,
+            r#"{"mcpServers":{"blastr":{"command":"C:\\Program Files\\Blastr\\blastr-mcp.exe"}}}"#
+        );
+        let program = mcp_program();
+        let name = program.file_name().expect("a name").to_string_lossy();
+        assert_eq!(name, format!("blastr-mcp{}", std::env::consts::EXE_SUFFIX));
     }
 }

@@ -13,8 +13,9 @@ use blastr_model::protocol::{Failure, JobId, JobKind, Request, Response};
 use blastr_model::{
     Assume, Change, CommitInfo, Confidence, ImpactItem, Location, Source, SymbolPath,
 };
-use gpui_kit::{ClipboardItem, Context, EventEmitter, Task};
+use gpui_kit::{ClipboardItem, Context, EventEmitter, Subscription, Task};
 
+use crate::agents::Agents;
 use crate::engine::{self, Engine, Incoming};
 use crate::settings::Settings;
 use crate::state::outline::{Block, Filter, Outline, TestRow, test_rows};
@@ -78,8 +79,12 @@ pub(crate) struct Workspace {
     pub rerun_needed: bool,
     /// The change whose propagation the graph shows.
     focus: Option<usize>,
+    /// The AI agents connected through `blastr-mcp`.
+    pub agents: Agents,
     save: Task<()>,
     _receive: Task<()>,
+    _receive_agents: Task<()>,
+    _answer_agents: Subscription,
 }
 
 impl EventEmitter<WorkspaceEvent> for Workspace {}
@@ -99,6 +104,18 @@ impl Workspace {
                 }
             }
         });
+        let messages = crate::agents::listen(blastr_model::bridge::socket_path());
+        let receive_agents = cx.spawn(async move |this, cx| {
+            while let Ok(event) = messages.recv().await {
+                if this
+                    .update(cx, |this, cx| this.agent_event(event, cx))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+        let answer_agents = cx.observe_self(|this, _| this.answer_agents());
         if settings.editor.is_empty() {
             let found = cx
                 .background_executor()
@@ -136,8 +153,11 @@ impl Workspace {
             commits: Commits::default(),
             rerun_needed: false,
             focus: None,
+            agents: Agents::default(),
             save: Task::ready(()),
             _receive: receive,
+            _receive_agents: receive_agents,
+            _answer_agents: answer_agents,
         }
     }
 
@@ -265,10 +285,15 @@ impl Workspace {
                     Err(failure) => self.open_error = Some(failure.message),
                 }
             }
-            Response::Progress { id, report } => match id.kind {
-                JobKind::Compare => self.session.progress(id.generation, report.into()),
-                JobKind::WhatIf => self.session.what_if_progress(id.generation, report.into()),
-            },
+            Response::Progress { id, report } => {
+                if self.is_current(id) {
+                    self.agents.progress(&report);
+                }
+                match id.kind {
+                    JobKind::Compare => self.session.progress(id.generation, report.into()),
+                    JobKind::WhatIf => self.session.what_if_progress(id.generation, report.into()),
+                }
+            }
             Response::Changes { id, diff } => {
                 self.session.changes_arrived(id.generation, Arc::new(diff));
                 self.rebuild_rows();
@@ -429,6 +454,12 @@ impl Workspace {
 
     /// Starts a comparison.
     pub(crate) fn choose(&mut self, compare: Compare, cx: &mut Context<Self>) {
+        // Nothing runs before the user answered the trust question; the
+        // answer starts this comparison.
+        if self.pending_trust.is_some() {
+            self.restore = Some(compare);
+            return;
+        }
         let spec = compare.spec();
         let generation = self.session.choose(compare);
         self.start_compare(generation, spec, cx);
@@ -487,13 +518,22 @@ impl Workspace {
 
     /// Traces what a change of the selected symbol would reach.
     pub(crate) fn begin_what_if(&mut self, assume: Assume, cx: &mut Context<Self>) {
-        let (Some(repo), Some(selection)) = (
-            self.root().map(Path::to_path_buf),
-            self.session.selection().cloned(),
-        ) else {
+        if let Some(selection) = self.session.selection().cloned() {
+            self.begin_what_if_of(selection.symbol, assume, cx);
+        }
+    }
+
+    /// Traces what a change of `symbol` would reach.
+    pub(crate) fn begin_what_if_of(
+        &mut self,
+        symbol: SymbolPath,
+        assume: Assume,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repo) = self.root().map(Path::to_path_buf) else {
             return;
         };
-        let generation = self.session.begin_what_if(selection.symbol.clone(), assume);
+        let generation = self.session.begin_what_if(symbol.clone(), assume);
         self.flush_cancels(cx);
         let request = Request::WhatIf {
             id: JobId {
@@ -501,7 +541,7 @@ impl Workspace {
                 generation,
             },
             repo,
-            symbol: selection.symbol,
+            symbol,
             assume,
             options: self.session.options.clone(),
             params: self.session.params.clone(),

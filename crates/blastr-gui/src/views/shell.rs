@@ -587,6 +587,19 @@ impl Shell {
         if session.options.exec == ExecMode::Restricted {
             right = right.child(separator()).child("Restricted mode");
         }
+        let clients = workspace.agents.clients();
+        if !clients.is_empty() {
+            let before = matches!(session.shown(), Loadable::Ready(_))
+                || session.params.depth != blastr_model::AnalysisParams::default().depth
+                || session.options.exec == ExecMode::Restricted;
+            right = right.when(before, |right| right.child(separator())).child(
+                h_flex()
+                    .gap_1p5()
+                    .items_center()
+                    .child(div().size(px(6.)).rounded_full().bg(theme::TEST.solid))
+                    .child(clients.join(", ")),
+            );
+        }
         StatusBar::new()
             .h(px(26.))
             .bg(theme::BG_BAR)

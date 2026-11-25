@@ -4,6 +4,7 @@
 //! settings and the connection to the analysis engine. The views in `views`
 //! are separate entities that read it and call its transitions.
 
+mod agents;
 mod app;
 mod editor;
 mod engine;

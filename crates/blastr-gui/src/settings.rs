@@ -107,7 +107,7 @@ impl Default for RepositorySettings {
 }
 
 /// Everything the window remembers.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub window: Option<WindowPlacement>,
@@ -120,6 +120,24 @@ pub struct Settings {
     pub code_zoom: u16,
     pub analysis: AnalysisSettings,
     pub repositories: Vec<RepositorySettings>,
+    /// Whether AI agents may use the window through `blastr-mcp`.
+    pub agents: bool,
+}
+
+impl Default for Settings {
+    /// Agents allowed, everything else empty.
+    fn default() -> Self {
+        Settings {
+            window: None,
+            panes: Panes::default(),
+            recent: Vec::new(),
+            editor: String::new(),
+            code_zoom: 0,
+            analysis: AnalysisSettings::default(),
+            repositories: Vec::new(),
+            agents: true,
+        }
+    }
 }
 
 impl Settings {
@@ -272,6 +290,7 @@ mod tests {
         assert_eq!(settings.analysis.min_confidence, Confidence::Possible);
         assert!(settings.analysis.refresh_on_save);
         assert!(settings.editor.is_empty());
+        assert!(settings.agents);
         let (options, params) = settings.analysis_for(Path::new("/code/a"));
         assert!(options.all_features);
         assert!(options.watch);
