@@ -1,7 +1,7 @@
-//! The one code pane: the diff of a selected change, or the read-only source
-//! of any other selection with the lines of its evidence marked.
+//! The one code pane: the diff of a selected change, or the source of any
+//! other selection with the lines of its evidence marked, both in the same
+//! diff view and both limited to the symbol and its evidence.
 
-use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use blastr_model::{Location, RelPath, Source, SymbolPath, wording};
@@ -9,17 +9,13 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::diff::{
     Diff, DiffDecoration, DiffFile, DiffLinePosition, DiffLineRange, DiffMode, DiffSide, DiffState,
 };
-use gpui_kit::component::input::{
-    Editor, EditorState, GutterDecoration, GutterDecorationCollection, InputEvent, RangeDecoration,
-    RangeDecorationCollection, RangeDecorationStyle,
-};
 use gpui_kit::component::{Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    AnyElement, Context, Entity, IntoElement, ParentElement, Render, SharedString, Styled,
-    Subscription, Task, Window, div, point, px,
+    AnyElement, Context, Entity, IntoElement, ParentElement, Render, Styled, Subscription, Task,
+    Window, div, px,
 };
-use similar::TextDiff;
+use similar::{ChangeTag, TextDiff};
 
 use super::ui;
 use crate::theme::{self, Accent, TEXT_MICRO, TEXT_SMALL};
@@ -33,7 +29,7 @@ enum Content {
     Loading,
     /// The diff of a change.
     Diff,
-    /// The source of a file.
+    /// Source without changes, in the same diff view.
     Source,
 }
 
@@ -58,10 +54,8 @@ pub(crate) struct CodePane {
     title: String,
     diff: Entity<DiffState>,
     decorations: Vec<DiffDecoration>,
-    editor: Entity<EditorState>,
-    /// The text the editor was given, which it must keep.
-    shown: SharedString,
-    marks: Option<(RangeDecorationCollection, GutterDecorationCollection)>,
+    /// Whether the user wants a diff side by side; source is always unified.
+    split: bool,
     read: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -72,14 +66,11 @@ impl CodePane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> CodePane {
-        let diff = cx.new(|cx| DiffState::new(Vec::new(), cx));
-        let editor = cx.new(|cx| source_state(window, cx));
-        let subscriptions = vec![
-            cx.observe_in(&workspace, window, |this, _, window, cx| {
-                this.sync(window, cx)
-            }),
-            cx.subscribe_in(&editor, window, Self::keep_text),
-        ];
+        // The patch holds only the lines worth showing: fold none of them.
+        let diff = cx.new(|cx| DiffState::new(Vec::new(), cx).with_context_lines(None));
+        let subscriptions = vec![cx.observe_in(&workspace, window, |this, _, window, cx| {
+            this.sync(window, cx)
+        })];
         CodePane {
             workspace,
             maximized: false,
@@ -89,30 +80,9 @@ impl CodePane {
             title: String::new(),
             diff,
             decorations: Vec::new(),
-            editor,
-            shown: SharedString::default(),
-            marks: None,
+            split: false,
             read: Task::ready(()),
             _subscriptions: subscriptions,
-        }
-    }
-
-    /// Puts back the text the editor was given, should anything have changed
-    /// it.
-    ///
-    /// The editor is read-only, which rejects every edit the user makes;
-    /// this is the second line, so that no path the library might not
-    /// guard can leave other code on screen than the file's.
-    fn keep_text(
-        &mut self,
-        editor: &Entity<EditorState>,
-        event: &InputEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if matches!(event, InputEvent::Change) && editor.read(cx).value() != self.shown {
-            let text = self.shown.clone();
-            editor.update(cx, |state, cx| state.set_value(text, window, cx));
         }
     }
 
@@ -168,58 +138,33 @@ impl CodePane {
                 .old
                 .as_ref()
                 .map_or(file.clone(), |location| location.file.clone());
+            let (side, span) = match (&change.new, &change.old) {
+                (Some(new), _) => (DiffSide::Modified, new.span),
+                (None, Some(old)) => (DiffSide::Original, old.span),
+                (None, None) => return,
+            };
+            let span = (span.start_line, span.end_line);
             let texts = cx.background_executor().spawn(async move {
                 let base = read_source(&root, &comparison.base, &old_file).unwrap_or_default();
                 let head = read_source(&root, &comparison.head, &file).unwrap_or_default();
-                (patch(&old_file, &file, &base, &head), head)
+                // A hypothetical change has no diff: its source, as context.
+                let changed = base != head;
+                let patch = patch(&old_file, &file, &base, &head, side, &[span]);
+                (patch, changed)
             });
             self.content = Content::Loading;
             self.read = cx.spawn_in(window, async move |this, cx| {
-                let (patch, head) = texts.await;
-                this.update_in(cx, |this, window, cx| {
-                    let files = DiffFile::parse(&patch).unwrap_or_default();
-                    let path = files
-                        .first()
-                        .map(|file| file.path().clone())
-                        .unwrap_or_default();
-                    let (side, span) = match (&change.new, &change.old) {
-                        (Some(new), _) => (DiffSide::Modified, new.span),
-                        (None, Some(old)) => (DiffSide::Original, old.span),
-                        (None, None) => return,
-                    };
-                    let (start, end) = (
-                        span.start_line as usize,
-                        span.end_line.max(span.start_line) as usize,
-                    );
-                    // A hypothetical change has no diff: show its source.
-                    if files.is_empty() {
-                        let lines = (span.start_line, span.end_line);
-                        this.show_source(
-                            head,
-                            theme::CHANGED,
-                            lines,
-                            &[],
-                            span.start_line,
-                            window,
-                            cx,
-                        );
-                        return;
-                    }
-                    self_decorate(this, path.clone(), side, start, end);
-                    this.diff.update(cx, |state, cx| {
-                        state.set_files(files, cx);
-                        state.scroll_to_line(
-                            DiffLinePosition::new(path, side, start.saturating_sub(3).max(1)),
-                            cx,
-                        );
-                    });
-                    this.content = Content::Diff;
-                    cx.notify();
+                let (patch, changed) = texts.await;
+                this.update_in(cx, |this, _, cx| {
+                    this.show(&patch, side, theme::CHANGED, span, &[], span.0, changed, cx);
                 })
                 .ok();
             });
         } else if let Some((source, location)) = workspace.selection_location() {
-            // Anything else: its source, with the lines of its evidence marked.
+            // Anything else: its source, with the lines of its evidence
+            // marked. The item's own code is unchanged, so it is always shown
+            // as context from the selection's side, never as a diff, even when
+            // other lines of its file changed.
             let item = workspace.selected_item();
             let accent = item.map_or(theme::CHANGED, |item| ui::class_accent(item.class));
             let mut lines: Vec<(u32, u32)> = item
@@ -242,7 +187,7 @@ impl CodePane {
                 lines.insert(0, (first.site.span.start_line, first.site.span.end_line));
             }
             // A clicked evidence step marks its line; a search hit, which
-            // names the whole symbol, only the gutter.
+            // names the whole symbol, only the symbol.
             if let (Some(site), Some(item)) = (&key.site, item)
                 && *site != item.location
             {
@@ -254,20 +199,25 @@ impl CodePane {
             self.location = Some(location.clone());
             self.title = name;
             let file = location.file.clone();
-            let text = cx
-                .background_executor()
-                .spawn(async move { read_source(&root, &source, &file) });
+            let mut shown = vec![span];
+            shown.extend(&lines);
+            let patch = cx.background_executor().spawn(async move {
+                let text = read_source(&root, &source, &file)?;
+                Some(self::patch(
+                    &file,
+                    &file,
+                    &text,
+                    &text,
+                    DiffSide::Modified,
+                    &shown,
+                ))
+            });
             self.content = Content::Loading;
             self.read = cx.spawn_in(window, async move |this, cx| {
-                let text = text.await;
-                this.update_in(cx, |this, window, cx| {
-                    let Some(text) = text else {
-                        this.content =
-                            Content::Note("Source unavailable", "The file could not be read.");
-                        cx.notify();
-                        return;
-                    };
-                    this.show_source(text, accent, span, &lines, focus, window, cx);
+                let patch = patch.await.unwrap_or_default();
+                this.update_in(cx, |this, _, cx| {
+                    let side = DiffSide::Modified;
+                    this.show(&patch, side, accent, span, &lines, focus, false, cx);
                 })
                 .ok();
             });
@@ -278,58 +228,61 @@ impl CodePane {
         cx.notify();
     }
 
-    /// Puts `text` in the editor, marks the symbol and its evidence, and
-    /// scrolls to `focus`.
+    /// Puts `patch` in the diff view, marks the symbol's `span` and its
+    /// evidence `lines` on `side`, and scrolls to `focus`; a patch without
+    /// changes shows as source.
     #[allow(clippy::too_many_arguments)]
-    fn show_source(
+    fn show(
         &mut self,
-        text: String,
+        patch: &str,
+        side: DiffSide,
         accent: Accent,
         span: (u32, u32),
         lines: &[(u32, u32)],
         focus: u32,
-        window: &mut Window,
+        changed: bool,
         cx: &mut Context<Self>,
     ) {
-        let starts = line_starts(&text);
-        let fills: Vec<RangeDecoration> = lines
-            .iter()
-            .map(|(first, last)| {
-                RangeDecoration::new(line_range(&starts, text.len(), *first, *last))
-                    .with_style(RangeDecorationStyle::Fill)
-                    .with_color(accent.solid.hsla().alpha(0.16))
-            })
+        let Some(file) = DiffFile::parse(patch)
+            .unwrap_or_default()
+            .into_iter()
+            .next()
+        else {
+            self.content = Content::Note("Source unavailable", "The file could not be read.");
+            cx.notify();
+            return;
+        };
+        let path = file.path().clone();
+        let mode = if changed && self.split {
+            DiffMode::Split
+        } else {
+            DiffMode::Unified
+        };
+        let range = |(first, last): (u32, u32), alpha: f32| {
+            DiffDecoration::new(DiffLineRange::new(
+                path.clone(),
+                side,
+                first as usize,
+                last.max(first) as usize,
+            ))
+            .with_background(accent.solid.hsla().alpha(alpha))
+        };
+        // Where marks overlap, the last one shows: the evidence over the symbol.
+        self.decorations = std::iter::once(range(span, 0.07))
+            .chain(lines.iter().map(|line| range(*line, 0.16)))
             .collect();
-        let mut bars = vec![
-            GutterDecoration::new(line_range(&starts, text.len(), span.0, span.1))
-                .with_color(accent.line.hsla()),
-        ];
-        bars.extend(lines.iter().map(|(first, last)| {
-            GutterDecoration::new(line_range(&starts, text.len(), *first, *last))
-                .with_color(accent.solid.hsla())
-        }));
-        let marks = self.marks.take();
-        self.shown = text.clone().into();
-        self.editor.update(cx, |state, cx| {
-            state.set_value(text, window, cx);
-            let line_height = state.line_height().unwrap_or(px(18.75));
-            let top = focus.saturating_sub(6) as f32;
-            state.set_scroll_offset(point(px(0.), -line_height * top), cx);
+        self.diff.update(cx, |state, cx| {
+            state.set_mode(mode, cx);
+            state.set_files([file], cx);
+            // The patch shows the context above the focus, so this line is in it.
+            let line = (focus as usize).saturating_sub(CONTEXT).max(1);
+            state.scroll_to_line(DiffLinePosition::new(path, side, line), cx);
         });
-        self.marks = Some(match marks {
-            Some((fill, bar)) => {
-                fill.set(fills, cx);
-                bar.set(bars, cx);
-                (fill, bar)
-            }
-            None => self.editor.update(cx, |state, cx| {
-                (
-                    state.create_range_decorations_collection(fills, cx),
-                    state.create_gutter_decorations_collection(bars, cx),
-                )
-            }),
-        });
-        self.content = Content::Source;
+        self.content = if changed {
+            Content::Diff
+        } else {
+            Content::Source
+        };
         cx.notify();
     }
 
@@ -392,6 +345,7 @@ impl CodePane {
                         .ghost()
                         .label(if split { "Unified" } else { "Side by side" })
                         .on_click(cx.listener(move |this, _, _, cx| {
+                            this.split = !split;
                             let mode = if split {
                                 DiffMode::Unified
                             } else {
@@ -434,31 +388,16 @@ impl CodePane {
     }
 }
 
-/// Sets the decoration of the changed symbol in the diff.
-fn self_decorate(
-    pane: &mut CodePane,
-    path: gpui_kit::SharedString,
-    side: DiffSide,
-    start: usize,
-    end: usize,
-) {
-    pane.decorations = vec![
-        DiffDecoration::new(DiffLineRange::new(path, side, start, end))
-            .with_background(theme::CHANGED.solid.hsla().alpha(0.07)),
-    ];
-}
-
 impl Render for CodePane {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let body = match &self.content {
             Content::Note(title, body) => ui::empty_state(IconName::FileText, None, title, body),
             Content::Loading => ui::empty_state(IconName::Loader, None, "Reading the file", ""),
-            Content::Diff => Diff::new(&self.diff)
+            Content::Diff | Content::Source => Diff::new(&self.diff)
                 .header_visible(false)
                 .decorations(self.decorations.clone())
                 .size_full()
                 .into_any_element(),
-            Content::Source => source_editor(&self.editor).into_any_element(),
         };
         v_flex()
             .size_full()
@@ -468,27 +407,6 @@ impl Render for CodePane {
             })
             .child(div().flex_1().min_h_0().child(body))
     }
-}
-
-/// The state of the source view: Rust, unfolded, and read-only from the
-/// start, before it is first drawn.
-fn source_state(window: &mut Window, cx: &mut Context<EditorState>) -> EditorState {
-    let mut state = EditorState::new(window, cx).language("rust").folding(false);
-    state.set_readonly(true, cx);
-    state
-}
-
-/// The source view: selectable, copyable and searchable, never editable.
-///
-/// Read-only makes the editor reject typing, IME composition, cut, paste,
-/// undo and every editing command, and leaves the edit items of its menu
-/// disabled; a paste is also swallowed before it reaches the editor.
-fn source_editor(state: &Entity<EditorState>) -> Editor {
-    Editor::new(state)
-        .readonly(true)
-        .bordered(false)
-        .on_paste(|_, _, _| true)
-        .size_full()
 }
 
 /// Reads a file of one side of the comparison.
@@ -505,67 +423,165 @@ fn read_source(root: &Path, source: &Source, file: &RelPath) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-/// The unified diff of one file, with the whole file as context so that every
-/// line can be scrolled to.
-fn patch(old: &RelPath, new: &RelPath, base: &str, head: &str) -> String {
+/// The lines of context shown around a symbol and its evidence.
+const CONTEXT: usize = 3;
+
+/// The unified diff of one file, limited to the lines `areas` names on
+/// `side` (first and last, counted from one) and [`CONTEXT`] lines around
+/// each, with their real line numbers.
+///
+/// The lines of the other side that sit between shown lines, such as those
+/// a change removed, are shown too. Identical texts give a patch of context
+/// only; nothing to show gives no hunk.
+fn patch(
+    old: &RelPath,
+    new: &RelPath,
+    base: &str,
+    head: &str,
+    side: DiffSide,
+    areas: &[(u32, u32)],
+) -> String {
     let diff = TextDiff::from_lines(base, head);
-    let mut unified = diff.unified_diff();
-    unified
-        .context_radius(usize::MAX / 4)
-        .header(&format!("a/{old}"), &format!("b/{new}"));
-    let text = unified.to_string();
-    if text.is_empty() {
-        return String::new();
+    let rows: Vec<_> = diff.iter_all_changes().collect();
+    let wanted = |line: usize| {
+        areas.iter().any(|&(first, last)| {
+            let (first, last) = (first.max(1) as usize, last.max(first) as usize);
+            line + CONTEXT >= first && line <= last + CONTEXT
+        })
+    };
+    let line_on_side = |row: usize| match side {
+        DiffSide::Original => rows[row].old_index(),
+        DiffSide::Modified => rows[row].new_index(),
+    };
+    // A row with a line on `side` is shown when that line is wanted; another
+    // when a neighbouring row that has one is shown.
+    let mut shown: Vec<Option<bool>> = (0..rows.len())
+        .map(|row| line_on_side(row).map(|index| wanted(index + 1)))
+        .collect();
+    let mut before = vec![false; rows.len()];
+    let mut last = false;
+    for (row, value) in shown.iter().enumerate() {
+        before[row] = last;
+        last = value.unwrap_or(last);
     }
-    // A file the comparison only adds or removes still needs both headers.
+    let mut after = false;
+    for row in (0..rows.len()).rev() {
+        let value = shown[row].unwrap_or(before[row] || after);
+        after = shown[row].unwrap_or(after);
+        shown[row] = Some(value);
+    }
+    let mut text = format!("--- a/{old}\n+++ b/{new}\n");
+    let (mut old_line, mut new_line) = (0, 0);
+    let mut row = 0;
+    while row < rows.len() {
+        if shown[row] != Some(true) {
+            old_line += usize::from(rows[row].old_index().is_some());
+            new_line += usize::from(rows[row].new_index().is_some());
+            row += 1;
+            continue;
+        }
+        let end = (row..rows.len())
+            .find(|&row| shown[row] != Some(true))
+            .unwrap_or(rows.len());
+        let hunk = &rows[row..end];
+        let olds = hunk.iter().filter(|row| row.old_index().is_some()).count();
+        let news = hunk.iter().filter(|row| row.new_index().is_some()).count();
+        let start = |line: usize, count: usize| if count == 0 { line } else { line + 1 };
+        text.push_str(&format!(
+            "@@ -{},{olds} +{},{news} @@\n",
+            start(old_line, olds),
+            start(new_line, news)
+        ));
+        for change in hunk {
+            let sign = match change.tag() {
+                ChangeTag::Equal => ' ',
+                ChangeTag::Delete => '-',
+                ChangeTag::Insert => '+',
+            };
+            let value = change.value();
+            text.push(sign);
+            text.push_str(value.strip_suffix('\n').unwrap_or(value));
+            text.push('\n');
+            if !value.ends_with('\n') {
+                text.push_str("\\ No newline at end of file\n");
+            }
+        }
+        old_line += olds;
+        new_line += news;
+        row = end;
+    }
     text
-}
-
-/// The byte offset where each line starts.
-fn line_starts(text: &str) -> Vec<usize> {
-    std::iter::once(0)
-        .chain(text.match_indices('\n').map(|(at, _)| at + 1))
-        .collect()
-}
-
-/// The bytes of the lines `first` to `last`, counted from one, without the
-/// final line break.
-fn line_range(starts: &[usize], length: usize, first: u32, last: u32) -> Range<usize> {
-    let index = |line: u32| (line.max(1) as usize - 1).min(starts.len().saturating_sub(1));
-    let start = starts.get(index(first)).copied().unwrap_or(0);
-    let end = starts
-        .get(index(last.max(first)) + 1)
-        .map_or(length, |next| next.saturating_sub(1));
-    start..end.max(start)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_line_range_covers_whole_lines() {
-        let text = "one\ntwo\nthree";
-        let starts = line_starts(text);
-        assert_eq!(&text[line_range(&starts, text.len(), 2, 2)], "two");
-        assert_eq!(&text[line_range(&starts, text.len(), 2, 3)], "two\nthree");
-        assert_eq!(&text[line_range(&starts, text.len(), 9, 9)], "three");
+    /// Lines `line 1` to `line {count}`, each ending in a line break.
+    fn numbered(count: usize) -> String {
+        (1..=count).map(|line| format!("line {line}\n")).collect()
     }
 
     #[test]
-    fn a_patch_carries_both_headers_and_every_line() {
-        let patch = patch(
-            &RelPath::new("src/a.rs"),
-            &RelPath::new("src/a.rs"),
-            "a\nb\nc\n",
-            "a\nB\nc\n",
-        );
+    fn a_changed_symbol_shows_only_its_area_and_its_changes() {
+        let path = RelPath::new("src/a.rs");
+        let base = numbered(40);
+        let head = base
+            .replace("line 2\n", "line two\n")
+            .replace("line 20\n", "line twenty\n");
+        // The symbol is lines 19 to 21; the change on line 2 is far away.
+        let patch = patch(&path, &path, &base, &head, DiffSide::Modified, &[(19, 21)]);
         assert!(
-            patch.starts_with("--- a/src/a.rs\n+++ b/src/a.rs\n"),
+            patch.starts_with("--- a/src/a.rs\n+++ b/src/a.rs\n@@ -16,9 +16,9 @@\n"),
             "{patch}"
         );
-        assert!(patch.contains(" a\n-b\n+B\n c\n"), "{patch}");
+        assert!(patch.contains("-line 20\n+line twenty\n"), "{patch}");
+        assert!(!patch.contains("line two"), "{patch}");
+        assert!(!patch.contains("line 15\n") && !patch.contains("line 25\n"));
         let files = DiffFile::parse(&patch).expect("a patch");
         assert_eq!(files.len(), 1);
+        assert_eq!((files[0].additions(), files[0].deletions()), (1, 1));
+        assert_eq!(files[0].language().as_str(), "rust");
+    }
+
+    #[test]
+    fn an_item_shows_its_lines_and_every_evidence_line_as_context() {
+        let path = RelPath::new("src/a.rs");
+        let text = numbered(40);
+        // The item is lines 10 to 12; evidence on line 11 and, outside it,
+        // on line 30.
+        let areas = [(10, 12), (11, 11), (30, 30)];
+        let patch = patch(&path, &path, &text, &text, DiffSide::Modified, &areas);
+        let hunks: Vec<&str> = patch
+            .lines()
+            .filter(|line| line.starts_with("@@"))
+            .collect();
+        // Real line numbers, not from one: 7 to 15 and 27 to 33.
+        assert_eq!(hunks, ["@@ -7,9 +7,9 @@", "@@ -27,7 +27,7 @@"], "{patch}");
+        let body: Vec<&str> = patch
+            .lines()
+            .skip(2)
+            .filter(|line| !line.starts_with("@@"))
+            .collect();
+        assert!(body.iter().all(|line| line.starts_with(' ')), "{patch}");
+        let shown: Vec<usize> = body
+            .iter()
+            .map(|line| line.trim_start_matches(" line ").parse().unwrap())
+            .collect();
+        let expected: Vec<usize> = (7..=15).chain(27..=33).collect();
+        assert_eq!(shown, expected);
+        let files = DiffFile::parse(&patch).expect("a patch");
+        assert!(!files[0].has_changes());
+    }
+
+    #[test]
+    fn a_last_line_without_a_break_is_marked() {
+        let path = RelPath::new("a.rs");
+        let patch = patch(&path, &path, "a\nb", "a\nb", DiffSide::Modified, &[(2, 2)]);
+        assert!(
+            patch.ends_with("@@ -1,2 +1,2 @@\n a\n b\n\\ No newline at end of file\n"),
+            "{patch}"
+        );
+        DiffFile::parse(&patch).expect("a patch");
     }
 }
