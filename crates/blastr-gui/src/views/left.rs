@@ -751,7 +751,10 @@ impl Render for LeftPane {
                 }
             }))
             .child(
+                // Two equal halves across the whole column, so the second
+                // list is as easy to find as the first.
                 TabBar::new("left-tabs")
+                    .w_full()
                     .underline()
                     .small()
                     .selected_index(self.tab)
@@ -759,8 +762,8 @@ impl Render for LeftPane {
                         this.tab = *index;
                         cx.notify();
                     }))
-                    .child(Tab::new().label("Changes and impact"))
-                    .child(Tab::new().label("Tests to run")),
+                    .child(Tab::new().flex_1().label("Changes and impact"))
+                    .child(Tab::new().flex_1().label("Tests to run")),
             )
             .when(self.tab == 0, |this| this.child(self.toolbar(cx)))
             .when(self.tab == 1, |this| this.children(self.tests_header(cx)))
