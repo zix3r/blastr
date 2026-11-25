@@ -441,7 +441,11 @@ impl Engine {
             None => root.clone(),
         };
         run.cancel.check()?;
-        run.progress.report(&format!("load {phase}"), 0, None);
+        let within = crate::pipeline::Within {
+            inner: run.progress,
+            phase: format!("load {phase}"),
+        };
+        within.report(&within.phase, 0, None);
         let options = blastr_ra::LoadOptions {
             features: run.options.features.clone(),
             all_features: run.options.all_features,
@@ -450,7 +454,7 @@ impl Engine {
             target_dir: Some(self.paths.target_dir()),
         };
         let workspace =
-            blastr_ra::Workspace::load(&root, &manifest_dir, &options, run.progress, run.cancel)?;
+            blastr_ra::Workspace::load(&root, &manifest_dir, &options, &within, run.cancel)?;
         run.cancel.check()?;
         Ok(Loaded::new(workspace))
     }

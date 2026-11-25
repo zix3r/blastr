@@ -690,7 +690,8 @@ fn directory_name(path: &Path) -> String {
 /// The output stream of the engine, shared with the progress reporters.
 struct Output<W> {
     stream: Mutex<W>,
-    last_progress: Mutex<Instant>,
+    /// When the last report was sent, and its phase.
+    last_progress: Mutex<(Instant, String)>,
     broken: AtomicBool,
 }
 
@@ -699,7 +700,7 @@ impl<W: Write> Output<W> {
     fn new(stream: W) -> Output<W> {
         Output {
             stream: Mutex::new(stream),
-            last_progress: Mutex::new(Instant::now() - PROGRESS_INTERVAL),
+            last_progress: Mutex::new((Instant::now() - PROGRESS_INTERVAL, String::new())),
             broken: AtomicBool::new(false),
         }
     }
@@ -720,14 +721,16 @@ impl<W: Write> Output<W> {
         written
     }
 
-    /// Sends a progress report, at most once every [`PROGRESS_INTERVAL`].
+    /// Sends a progress report, at most once every [`PROGRESS_INTERVAL`]
+    /// within one phase: the first report of a new phase is always sent, so
+    /// the window never misses a step that was quick.
     fn report(&self, id: JobId, phase: &str, done: u64, total: Option<u64>) {
         if let Ok(mut last) = self.last_progress.lock() {
             let now = Instant::now();
-            if now.duration_since(*last) < PROGRESS_INTERVAL {
+            if last.1 == phase && now.duration_since(last.0) < PROGRESS_INTERVAL {
                 return;
             }
-            *last = now;
+            *last = (now, phase.to_owned());
         }
         let _ = self.send(&Response::Progress {
             id,

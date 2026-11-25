@@ -24,6 +24,30 @@ use crate::impact::ImpactInput;
 /// The file name whose changes are reported as manifest changes.
 pub(crate) const MANIFEST_FILE: &str = "Cargo.toml";
 
+/// Reports a step's progress under the phase that runs it.
+///
+/// rust-analyzer names its own steps (`metadata`, `database`, `extract`)
+/// without saying which side they belong to; under `load head` its
+/// `database` is reported as `load head: database`, and a step named as
+/// the phase it runs under (`extract` under `extract head`) as the phase.
+pub(crate) struct Within<'a> {
+    /// Where the reports go.
+    pub(crate) inner: &'a dyn Progress,
+    /// The phase the steps run under.
+    pub(crate) phase: String,
+}
+
+impl Progress for Within<'_> {
+    fn report(&self, step: &str, done: u64, total: Option<u64>) {
+        if self.phase.starts_with(step) {
+            self.inner.report(&self.phase, done, total);
+        } else {
+            self.inner
+                .report(&format!("{}: {step}", self.phase), done, total);
+        }
+    }
+}
+
 /// What every step of one run against an open repository reads.
 #[derive(Clone, Copy)]
 pub(crate) struct Run<'a> {
@@ -78,8 +102,12 @@ impl Loaded {
 
     /// Extracts the graph of the project as it is loaded now.
     pub(crate) fn extract(&self, run: &Run<'_>, phase: &str) -> Result<RevisionGraph> {
-        run.progress.report(&format!("extract {phase}"), 0, None);
-        let graph = self.workspace.extract(run.progress, run.cancel)?;
+        let within = Within {
+            inner: run.progress,
+            phase: format!("extract {phase}"),
+        };
+        within.report(&within.phase, 0, None);
+        let graph = self.workspace.extract(&within, run.cancel)?;
         run.cancel.check()?;
         Ok(graph)
     }
@@ -322,4 +350,32 @@ pub(crate) fn union_of(left: &[String], right: &[String]) -> Vec<String> {
     union.sort();
     union.dedup();
     union
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::*;
+
+    #[test]
+    fn a_step_is_reported_under_the_phase_that_runs_it() {
+        let seen = Mutex::new(Vec::new());
+        let sink = |phase: &str, done: u64, total: Option<u64>| {
+            seen.lock().unwrap().push((phase.to_owned(), done, total));
+        };
+        let within = Within {
+            inner: &sink,
+            phase: "extract head".to_owned(),
+        };
+        within.report("extract", 3, Some(9));
+        within.report("database", 0, None);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                ("extract head".to_owned(), 3, Some(9)),
+                ("extract head: database".to_owned(), 0, None),
+            ]
+        );
+    }
 }
