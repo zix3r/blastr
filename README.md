@@ -110,10 +110,13 @@ traces what a change of the selected symbol would reach.
 
 | Keys | |
 |---|---|
+| <kbd>Ctrl</kbd> <kbd>O</kbd> | Open a repository |
 | <kbd>Ctrl</kbd> <kbd>P</kbd> | Find any symbol |
+| <kbd>Ctrl</kbd> <kbd>R</kbd> | Run the comparison again |
 | <kbd>Ctrl</kbd> <kbd>F</kbd> | Filter the changes and impact |
 | <kbd>Ctrl</kbd> <kbd>M</kbd> | Give the code pane the whole centre, or the graph back |
 | <kbd>Alt</kbd> <kbd>←</kbd> / <kbd>→</kbd> | Back and forward through the selection |
+| <kbd>Ctrl</kbd> <kbd>+</kbd> / <kbd>-</kbd> / <kbd>0</kbd> | Zoom the code in, out, or back to 100% |
 | <kbd>Ctrl</kbd> <kbd>E</kbd> | Open the selected location in your editor |
 | <kbd>Ctrl</kbd> <kbd>,</kbd> | Settings |
 | <kbd>Esc</kbd> | Cancel the running analysis |
@@ -157,7 +160,8 @@ machine ends up in a commit.
 ## Status
 
 Blastr is a bachelor's project at Kaunas University of Technology, built to be used. It is in
-active development and has not been released yet.
+active development; releases are on [GitHub](https://github.com/zix3r/blastr/releases) and
+[crates.io](https://crates.io/crates/blastr).
 
 ## Support
 
