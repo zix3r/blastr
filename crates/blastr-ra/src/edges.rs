@@ -774,7 +774,16 @@ impl<'db> Collector<'_, 'db> {
         {
             let def = self.resolve(path);
             match def {
-                Some(Definition::Function(function)) => self.call_to(function, from, path.syntax()),
+                Some(Definition::Function(function)) => {
+                    // `Trait::method(value)` passes the receiver first.
+                    let db = self.input.db;
+                    let receiver = self
+                        .guard(|| Some(function.self_param(db).is_some()))
+                        .unwrap_or(false)
+                        .then(|| call.arg_list().and_then(|list| list.args().next()))
+                        .flatten();
+                    self.call_to(function, from, path.syntax(), receiver.as_ref());
+                }
                 // `Wrapper(1)` and `State::Busy(1)` are constructor calls.
                 Some(def @ (Definition::Adt(_) | Definition::EnumVariant(_))) => {
                     self.constructs(def, from, path.syntax(), false);
@@ -894,9 +903,9 @@ impl<'db> Collector<'_, 'db> {
         name_ref: &ast::NameRef,
         from: SymbolId,
     ) {
-        self.call_to(function, from, name_ref.syntax());
-        let called = self.std_method(function);
         let receiver = call.receiver();
+        self.call_to(function, from, name_ref.syntax(), receiver.as_ref());
+        let called = self.std_method(function);
         // `ToString::to_string` calls the `Display::fmt` of the receiver.
         if let Some(receiver) = &receiver
             && is_to_string(called.clone())
@@ -1467,26 +1476,34 @@ impl<'db> Collector<'_, 'db> {
             return;
         }
         let sema = self.input.sema;
-        let resolved = if let Some(expr) = ast::BinExpr::cast(node.clone()) {
-            self.guard(|| sema.resolve_bin_expr(&expr))
+        // The operand the operator method takes as `self`.
+        let (resolved, operand) = if let Some(expr) = ast::BinExpr::cast(node.clone()) {
+            (self.guard(|| sema.resolve_bin_expr(&expr)), expr.lhs())
         } else if let Some(expr) = ast::PrefixExpr::cast(node.clone()) {
-            self.guard(|| sema.resolve_prefix_expr(&expr))
+            (self.guard(|| sema.resolve_prefix_expr(&expr)), expr.expr())
         } else if let Some(expr) = ast::IndexExpr::cast(node.clone()) {
-            self.guard(|| sema.resolve_index_expr(&expr))
+            (self.guard(|| sema.resolve_index_expr(&expr)), expr.base())
         } else {
-            None
+            (None, None)
         };
         if let Some(function) = resolved {
-            self.call_to(function, from, node);
+            self.call_to(function, from, node, operand.as_ref());
         }
     }
 
     /// Adds the edge of a call to `function`.
     ///
     /// A call that resolves to a trait method declaration dispatches through the
-    /// receiver, so every implementation of the trait in the workspace may be
-    /// reached as well.
-    fn call_to(&mut self, function: Function, from: SymbolId, node: &SyntaxNode) {
+    /// receiver, so the implementations of the trait in the workspace that a
+    /// value of the `receiver`'s type can reach may be reached as well; all of
+    /// them when there is no receiver or its type is not known.
+    fn call_to(
+        &mut self,
+        function: Function,
+        from: SymbolId,
+        node: &SyntaxNode,
+        receiver: Option<&ast::Expr>,
+    ) {
         let Some(id) = self.input.symbols.get(DefKey::Function(function)) else {
             return;
         };
@@ -1496,18 +1513,43 @@ impl<'db> Collector<'_, 'db> {
         if let Some(AssocItemContainer::Trait(trait_)) =
             self.guard(|| Some(function.as_assoc_item(db)?.container(db)))
         {
-            self.dispatch_candidates(trait_, function, from, node);
+            let value = match receiver {
+                Some(receiver) => self.receiver_value(receiver),
+                None => ValueType::Unknown,
+            };
+            self.dispatch_candidates(trait_, function, from, node, value);
+        }
+    }
+
+    /// Which impls a call through a trait can reach from its receiver.
+    ///
+    /// A method call dereferences its receiver until a method fits, so a value
+    /// of a type from outside the workspace, such as a `Box` or an `Rc`, may
+    /// reach any impl.
+    fn receiver_value(&mut self, receiver: &ast::Expr) -> ValueType {
+        let db = self.input.db;
+        match self.typed_value(receiver) {
+            ValueType::Data(adt)
+                if !self
+                    .input
+                    .workspace_crates
+                    .contains(&adt.module(db).krate(db).base()) =>
+            {
+                ValueType::Unknown
+            }
+            value => value,
         }
     }
 
     /// Adds a candidate edge to every workspace implementation of `trait_` that
-    /// has an item named like `method`.
+    /// has an item named like `method` and that `value` can reach.
     fn dispatch_candidates(
         &mut self,
         trait_: Trait,
         method: Function,
         from: SymbolId,
         node: &SyntaxNode,
+        value: ValueType,
     ) {
         let Some(name) = self.guard(|| Some(method.name(self.input.db))) else {
             return;
@@ -1517,7 +1559,7 @@ impl<'db> Collector<'_, 'db> {
             .get(&trait_)
             .into_iter()
             .flatten()
-            .filter(|found| found.name == name)
+            .filter(|found| found.name == name && value.can_reach(found.ty))
             .map(|found| found.symbol)
             .collect();
         for id in targets {

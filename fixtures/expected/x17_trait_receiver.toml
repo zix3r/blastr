@@ -1,0 +1,38 @@
+# A call that resolves to a trait method reaches only the impls its receiver's
+# type can reach. `Plain` keeps the default `greet`, so a call on a `Plain`
+# resolves to the trait's method, and `Loud`'s own `greet` is no candidate of
+# it. A receiver of a generic type may be either.
+crates = ["x17_trait_receiver"]
+exact_changes = true
+
+[[edge]]
+from = "x17_trait_receiver::plain_greeting"
+to = "x17_trait_receiver::Greeter::greet"
+kind = "calls"
+certainty = "resolved"
+
+[[no_edge]]
+from = "x17_trait_receiver::plain_greeting"
+to = "x17_trait_receiver::<impl Greeter for Loud>::greet"
+
+[[edge]]
+from = "x17_trait_receiver::plain_greeting_by_path"
+to = "x17_trait_receiver::Greeter::greet"
+kind = "calls"
+certainty = "resolved"
+
+[[no_edge]]
+from = "x17_trait_receiver::plain_greeting_by_path"
+to = "x17_trait_receiver::<impl Greeter for Loud>::greet"
+
+[[edge]]
+from = "x17_trait_receiver::any_greeting"
+to = "x17_trait_receiver::<impl Greeter for Loud>::greet"
+kind = "may-dispatch-to"
+certainty = "candidate"
+
+[[edge]]
+from = "x17_trait_receiver::Greeter::greet"
+to = "x17_trait_receiver::<impl Greeter for Loud>::name"
+kind = "may-dispatch-to"
+certainty = "candidate"

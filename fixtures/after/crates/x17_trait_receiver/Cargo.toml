@@ -1,0 +1,8 @@
+[package]
+name = "x17-trait-receiver"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "x17_trait_receiver"
+path = "src/lib.rs"
