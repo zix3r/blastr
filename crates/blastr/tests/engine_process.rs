@@ -304,6 +304,10 @@ fn a_cancelled_comparison_is_acknowledged() {
     driver.send(&Request::Cancel { id });
     let sent = std::time::Instant::now();
 
+    // On a small repository the job can finish before the cancel arrives.
+    // Either way the cancel is acknowledged: when the job stops, or at once
+    // for a job the engine is no longer running.
+    let mut finished = false;
     loop {
         match driver.next().expect("an answer") {
             Response::Cancelled { id: cancelled } => {
@@ -311,7 +315,8 @@ fn a_cancelled_comparison_is_acknowledged() {
                 break;
             }
             Response::Result { .. } | Response::Failed { .. } => {
-                panic!("a cancelled job does not finish")
+                assert!(!finished, "a job finishes once");
+                finished = true;
             }
             _ => {}
         }
