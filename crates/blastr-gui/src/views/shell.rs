@@ -347,32 +347,6 @@ impl Shell {
                         })),
                 )
                 .child(compare);
-            let options = &session.options;
-            let mut parts = Vec::new();
-            if options.all_features {
-                parts.push("all features".to_owned());
-            } else if !options.features.is_empty() {
-                parts.push(format!("features: {}", options.features.join(", ")));
-            }
-            if let Some(target) = &options.target {
-                parts.push(format!("target: {target}"));
-            }
-            if options.exec == ExecMode::Restricted {
-                parts.push("restricted".to_owned());
-            }
-            if !parts.is_empty() {
-                chips = chips.child(
-                    chip("options-chip", IconName::Settings2)
-                        .on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx)))
-                        .child(
-                            div()
-                                .max_w(px(260.))
-                                .truncate()
-                                .text_color(theme::FG_2)
-                                .child(parts.join(" · ")),
-                        ),
-                );
-            }
         }
         let ready = session.repo.is_some();
         let busy = session.is_busy();
