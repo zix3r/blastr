@@ -49,6 +49,9 @@ gpui_kit::actions!(
     ]
 );
 
+/// Left edge at or past which a window is minimised (Windows places it at -32000).
+const MINIMISED_X: f32 = -30000.;
+
 /// The root view of the main window.
 pub(crate) struct Shell {
     pub(crate) workspace: Entity<Workspace>,
@@ -116,13 +119,23 @@ impl Shell {
 
     /// Keeps the window's place for the next start.
     fn remember_bounds(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let bounds = window.bounds();
+        // Windows parks a minimised window at (-32000, -32000); that is not
+        // a place to reopen at, and minimising changes nothing worth keeping.
+        if f32::from(window.bounds().origin.x) <= MINIMISED_X {
+            return;
+        }
+        // The bounds the window restores to, also while it is maximised.
+        let (bounds, maximized) = match window.window_bounds() {
+            gpui_kit::WindowBounds::Maximized(bounds) => (bounds, true),
+            gpui_kit::WindowBounds::Windowed(bounds)
+            | gpui_kit::WindowBounds::Fullscreen(bounds) => (bounds, false),
+        };
         let placement = WindowPlacement {
             x: f32::from(bounds.origin.x),
             y: f32::from(bounds.origin.y),
             width: f32::from(bounds.size.width),
             height: f32::from(bounds.size.height),
-            maximized: window.is_maximized(),
+            maximized,
         };
         self.workspace.update(cx, |workspace, cx| {
             workspace.settings.window = Some(placement);
