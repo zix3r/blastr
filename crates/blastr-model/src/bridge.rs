@@ -199,7 +199,10 @@ pub enum Answer {
         analysis: Option<Box<Analysis>>,
     },
     /// Matching symbols, best first.
-    Symbols(Vec<SymbolHit>),
+    Symbols {
+        /// The symbols found.
+        hits: Vec<SymbolHit>,
+    },
     /// The call was carried out.
     Done,
 }
@@ -260,6 +263,41 @@ mod tests {
         assert!(!line.contains('\n'), "one message per line");
         let back: ToWindow = serde_json::from_str(&line).expect("parses");
         assert_eq!(back, message);
+    }
+
+    #[test]
+    fn every_answer_survives_a_round_trip_through_json() {
+        let hit = SymbolHit {
+            symbol: SymbolPath::new("demo::run", crate::SymbolKind::Function),
+            kind: "fn".into(),
+            location: Location {
+                file: crate::RelPath("src/lib.rs".into()),
+                span: crate::Span {
+                    start: 0,
+                    end: 3,
+                    start_line: 1,
+                    end_line: 1,
+                },
+            },
+        };
+        let answers = [
+            Answer::Status(Status::default()),
+            Answer::Analysis {
+                status: Status::default(),
+                analysis: None,
+            },
+            Answer::Symbols { hits: vec![hit] },
+            Answer::Done,
+        ];
+        for answer in answers {
+            let message = FromWindow::Reply {
+                id: 1,
+                result: Ok(answer),
+            };
+            let line = serde_json::to_string(&message).expect("serialises");
+            let back: FromWindow = serde_json::from_str(&line).expect("parses");
+            assert_eq!(back, message);
+        }
     }
 
     #[test]

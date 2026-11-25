@@ -160,8 +160,24 @@ fn serve(
 /// closes or the window forgets it.
 fn write_messages(mut output: &LocalSocketStream, messages: &mpsc::Receiver<FromWindow>) {
     for message in messages {
-        let Ok(mut line) = serde_json::to_string(&message) else {
-            continue;
+        let mut line = match serde_json::to_string(&message) {
+            Ok(line) => line,
+            // A reply that cannot be written still answers its call, so the
+            // agent is never left waiting.
+            Err(error) => {
+                let FromWindow::Reply { id, .. } = message else {
+                    eprintln!("blastr: could not write a message to an agent: {error}");
+                    continue;
+                };
+                let failure = FromWindow::Reply {
+                    id,
+                    result: Err(format!("Blastr could not send its answer: {error}")),
+                };
+                match serde_json::to_string(&failure) {
+                    Ok(line) => line,
+                    Err(_) => continue,
+                }
+            }
         };
         line.push('\n');
         if output
@@ -528,7 +544,7 @@ impl Workspace {
                         location: entry.location.clone(),
                     })
                     .collect();
-                Ok(Some(Answer::Symbols(hits)))
+                Ok(Some(Answer::Symbols { hits }))
             }
             Call::WhatIf { symbol, assume } => {
                 if self.root().is_none() {
