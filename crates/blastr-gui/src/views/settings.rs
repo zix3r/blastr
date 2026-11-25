@@ -18,7 +18,7 @@ use gpui_kit::prelude::*;
 use gpui_kit::{App, Entity, ParentElement, SharedString, Styled, Window, div, px};
 
 use crate::settings::{DEPTHS, Settings, ignore_problem, parse_list};
-use crate::theme::{self, TEXT_SMALL};
+use crate::theme::{self, TEXT_SMALL, TEXT_UI};
 use crate::workspace::Workspace;
 
 /// Opens the settings dialog.
@@ -34,15 +34,34 @@ pub(crate) fn open(workspace: Entity<Workspace>, window: &mut Window, cx: &mut A
             pages.push(repository_page(&workspace, root, drafts.clone()));
         }
         let again = workspace.clone();
+        // The categories are drawn as the window's side panels are, the page
+        // beside them on the same surface, set in the window's sizes.
+        let mut sidebar = gpui_kit::StyleRefinement::default()
+            .text_size(TEXT_UI)
+            .border_r_1()
+            .border_color(theme::LINE);
+        sidebar.background = Some(theme::BG_PANEL.hsla().into());
+        let header = gpui_kit::StyleRefinement::default().text_size(TEXT_UI);
         dialog
             .w(px(820.))
-            .title("Settings")
+            .bg(theme::BG_PANEL)
+            .border_color(theme::LINE_STRONG)
+            .title(div().text_size(px(15.)).child("Settings"))
             .child(
-                div().h(px(460.)).child(
-                    SettingsView::new("settings")
-                        .sidebar_width(px(190.))
-                        .pages(pages),
-                ),
+                div()
+                    .h(px(460.))
+                    .text_size(TEXT_UI)
+                    .border_1()
+                    .border_color(theme::LINE)
+                    .rounded(theme::RADIUS_LG)
+                    .overflow_hidden()
+                    .child(
+                        SettingsView::new("settings")
+                            .sidebar_width(px(190.))
+                            .sidebar_style(&sidebar)
+                            .header_style(&header)
+                            .pages(pages),
+                    ),
             )
             .footer(
                 h_flex()

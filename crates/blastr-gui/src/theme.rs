@@ -280,6 +280,20 @@ pub(crate) fn apply(window: Option<&mut Window>, cx: &mut App) {
         colors.drag_border = CHANGED.solid.hsla();
         colors.drop_target = CHANGED.bg.hsla();
         colors.skeleton = BG_RAISED_2.hsla();
+        // The settings dialog's category list: a side panel like the
+        // window's own, its selected page a selected row.
+        colors.sidebar = BG_PANEL.hsla();
+        colors.sidebar_foreground = FG_2.hsla();
+        colors.sidebar_border = LINE.hsla();
+        colors.sidebar_accent = BG_SELECTED.hsla();
+        colors.sidebar_accent_foreground = FG.hsla();
+        colors.sidebar_primary = CHANGED.solid.hsla();
+        colors.sidebar_primary_foreground = FG.hsla();
+        colors.group_box = BG_RAISED.hsla();
+        colors.group_box_foreground = FG.hsla();
+        // A switch's track is dark when off; the switches fill it when on.
+        colors.switch = LINE_STRONG.hsla();
+        colors.switch_thumb = FG.hsla();
         theme.radius = RADIUS_MD;
         theme.radius_lg = RADIUS_LG;
         theme.font_size = TEXT_UI;
