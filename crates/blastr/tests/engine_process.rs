@@ -280,6 +280,50 @@ fn an_engine_killed_mid_run_ends_its_stream_and_another_one_answers() {
 }
 
 #[test]
+fn a_cancelled_comparison_is_acknowledged() {
+    let temp = tempfile::tempdir().expect("a temporary directory");
+    repository(temp.path());
+
+    let mut driver = Driver::start();
+    driver.handshake();
+    let id = JobId {
+        kind: JobKind::Compare,
+        generation: 1,
+    };
+    driver.send(&Request::Compare {
+        id,
+        repo: temp.path().to_path_buf(),
+        spec: RevSpec {
+            worktree: true,
+            ..RevSpec::default()
+        },
+        options: AnalysisOptions::default(),
+        params: AnalysisParams::default(),
+    });
+    std::thread::sleep(Duration::from_millis(150));
+    driver.send(&Request::Cancel { id });
+    let sent = std::time::Instant::now();
+
+    loop {
+        match driver.next().expect("an answer") {
+            Response::Cancelled { id: cancelled } => {
+                assert_eq!(cancelled, id);
+                break;
+            }
+            Response::Result { .. } | Response::Failed { .. } => {
+                panic!("a cancelled job does not finish")
+            }
+            _ => {}
+        }
+    }
+    eprintln!("acknowledged after {:?}", sent.elapsed());
+
+    // The engine is free for the next request.
+    driver.send(&Request::CacheStatus);
+    assert!(matches!(driver.next(), Some(Response::Cache { .. })));
+}
+
+#[test]
 fn an_engine_asked_to_shut_down_leaves_its_stream() {
     let mut driver = Driver::start();
     driver.handshake();
