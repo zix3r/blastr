@@ -116,6 +116,8 @@ pub struct Settings {
     /// The command that opens a file, with `{file}`, `{line}` and `{column}`;
     /// empty until an editor is found or chosen.
     pub editor: String,
+    /// The code pane's text size in percent; 0 means 100.
+    pub code_zoom: u16,
     pub analysis: AnalysisSettings,
     pub repositories: Vec<RepositorySettings>,
 }

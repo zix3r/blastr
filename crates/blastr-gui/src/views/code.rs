@@ -9,7 +9,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::diff::{
     Diff, DiffDecoration, DiffFile, DiffLinePosition, DiffLineRange, DiffMode, DiffSide, DiffState,
 };
-use gpui_kit::component::{Icon, IconName, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{Disableable as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::{
     AnyElement, Context, Entity, IntoElement, ParentElement, Render, Styled, Subscription, Task,
@@ -71,6 +71,7 @@ impl CodePane {
         let subscriptions = vec![cx.observe_in(&workspace, window, |this, _, window, cx| {
             this.sync(window, cx)
         })];
+        theme::set_code_zoom(workspace.read(cx).settings.code_zoom, cx);
         CodePane {
             workspace,
             maximized: false,
@@ -84,6 +85,25 @@ impl CodePane {
             read: Task::ready(()),
             _subscriptions: subscriptions,
         }
+    }
+
+    /// The text size in percent.
+    fn zoom(&self, cx: &Context<Self>) -> u16 {
+        theme::code_zoom(self.workspace.read(cx).settings.code_zoom)
+    }
+
+    /// Makes the text one step bigger or smaller, or back to 100% with
+    /// `None`, and remembers it.
+    pub(crate) fn change_zoom(&mut self, bigger: Option<bool>, cx: &mut Context<Self>) {
+        let zoom = match bigger {
+            Some(bigger) => theme::step_code_zoom(self.zoom(cx), bigger),
+            None => 100,
+        };
+        self.workspace.update(cx, |workspace, cx| {
+            workspace.update_settings(cx, |settings| settings.code_zoom = zoom)
+        });
+        theme::set_code_zoom(zoom, cx);
+        cx.notify();
     }
 
     /// Shows or hides the graph above the pane.
@@ -355,6 +375,7 @@ impl CodePane {
                         })),
                 )
             })
+            .child(self.zoom_controls(cx))
             .child(
                 Button::new("code-open-editor")
                     .xsmall()
@@ -383,6 +404,34 @@ impl CodePane {
                     },
                 )
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_maximized(cx))),
+            )
+            .into_any_element()
+    }
+}
+
+impl CodePane {
+    /// Smaller, the size (click for 100%) and bigger.
+    fn zoom_controls(&self, cx: &mut Context<Self>) -> AnyElement {
+        let zoom = self.zoom(cx);
+        h_flex()
+            .items_center()
+            .child(
+                ui::icon_button("code-zoom-out", IconName::Minus, "Smaller text  Ctrl -")
+                    .disabled(zoom == theme::CODE_ZOOMS[0])
+                    .on_click(cx.listener(|this, _, _, cx| this.change_zoom(Some(false), cx))),
+            )
+            .child(
+                Button::new("code-zoom-reset")
+                    .xsmall()
+                    .ghost()
+                    .label(format!("{zoom}%"))
+                    .tooltip("Text size; click for 100%  Ctrl 0")
+                    .on_click(cx.listener(|this, _, _, cx| this.change_zoom(None, cx))),
+            )
+            .child(
+                ui::icon_button("code-zoom-in", IconName::Plus, "Bigger text  Ctrl +")
+                    .disabled(zoom == theme::CODE_ZOOMS[theme::CODE_ZOOMS.len() - 1])
+                    .on_click(cx.listener(|this, _, _, cx| this.change_zoom(Some(true), cx))),
             )
             .into_any_element()
     }

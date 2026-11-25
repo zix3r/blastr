@@ -160,8 +160,46 @@ pub(crate) const TEXT_UI: Pixels = px(13.);
 pub(crate) const TEXT_SMALL: Pixels = px(12.);
 /// Size of labels and counts.
 pub(crate) const TEXT_MICRO: Pixels = px(11.);
-/// Size of symbol names and source text.
+/// Size of symbol names.
 pub(crate) const TEXT_MONO: Pixels = px(12.5);
+/// Size of source text in the code pane at 100% zoom.
+pub(crate) const CODE_TEXT: Pixels = px(15.);
+/// The code pane's zoom steps, in percent.
+pub(crate) const CODE_ZOOMS: [u16; 11] = [60, 70, 80, 90, 100, 110, 125, 150, 175, 200, 250];
+
+/// The zoom step nearest to `percent`; 0 (never chosen) is 100%.
+pub(crate) fn code_zoom(percent: u16) -> u16 {
+    if percent == 0 {
+        return 100;
+    }
+    CODE_ZOOMS
+        .into_iter()
+        .min_by_key(|step| step.abs_diff(percent))
+        .unwrap_or(100)
+}
+
+/// The zoom step after `percent`, one step bigger or smaller.
+pub(crate) fn step_code_zoom(percent: u16, bigger: bool) -> u16 {
+    let current = code_zoom(percent);
+    let at = CODE_ZOOMS
+        .iter()
+        .position(|step| *step == current)
+        .unwrap_or(4);
+    let next = if bigger {
+        (at + 1).min(CODE_ZOOMS.len() - 1)
+    } else {
+        at.saturating_sub(1)
+    };
+    CODE_ZOOMS[next]
+}
+
+/// Sizes the code pane's text. The diff view reads the library's mono size,
+/// which nothing else on screen uses.
+pub(crate) fn set_code_zoom(percent: u16, cx: &mut App) {
+    let scale = f32::from(code_zoom(percent)) / 100.;
+    Theme::update(cx, |theme| theme.mono_font_size = CODE_TEXT * scale);
+    cx.refresh_windows();
+}
 /// Corner radius of small tags.
 pub(crate) const RADIUS_SM: Pixels = px(4.);
 /// Corner radius of chips, buttons and inputs.
@@ -297,7 +335,7 @@ pub(crate) fn apply(window: Option<&mut Window>, cx: &mut App) {
         theme.radius = RADIUS_MD;
         theme.radius_lg = RADIUS_LG;
         theme.font_size = TEXT_UI;
-        theme.mono_font_size = TEXT_MONO;
+        theme.mono_font_size = CODE_TEXT;
         if let Ok(highlight) = serde_json::from_str::<HighlightTheme>(HIGHLIGHT) {
             theme.highlight_theme = Arc::new(highlight);
         }
@@ -343,3 +381,20 @@ const HIGHLIGHT: &str = r##"{
     }
   }
 }"##;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn code_zoom_snaps_to_steps_and_stops_at_the_ends() {
+        assert_eq!(code_zoom(0), 100);
+        assert_eq!(code_zoom(103), 100);
+        assert_eq!(code_zoom(1000), 250);
+        assert_eq!(step_code_zoom(100, true), 110);
+        assert_eq!(step_code_zoom(100, false), 90);
+        assert_eq!(step_code_zoom(250, true), 250);
+        assert_eq!(step_code_zoom(60, false), 60);
+        assert_eq!(step_code_zoom(0, true), 110);
+    }
+}

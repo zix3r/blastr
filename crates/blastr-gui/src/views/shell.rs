@@ -43,6 +43,9 @@ gpui_kit::actions!(
         Cancel,
         FocusFilter,
         ToggleCode,
+        CodeZoomIn,
+        CodeZoomOut,
+        CodeZoomReset,
     ]
 );
 
@@ -898,6 +901,17 @@ impl Render for Shell {
             }))
             .on_action(cx.listener(|this, _: &ToggleCode, _, cx| {
                 this.code.update(cx, |code, cx| code.toggle_maximized(cx));
+            }))
+            .on_action(cx.listener(|this, _: &CodeZoomIn, _, cx| {
+                this.code
+                    .update(cx, |code, cx| code.change_zoom(Some(true), cx));
+            }))
+            .on_action(cx.listener(|this, _: &CodeZoomOut, _, cx| {
+                this.code
+                    .update(cx, |code, cx| code.change_zoom(Some(false), cx));
+            }))
+            .on_action(cx.listener(|this, _: &CodeZoomReset, _, cx| {
+                this.code.update(cx, |code, cx| code.change_zoom(None, cx));
             }))
             .child(self.title_bar(window, cx))
             .child(div().flex_1().min_h_0().child(content))

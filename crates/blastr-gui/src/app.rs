@@ -7,8 +7,8 @@ use gpui_kit::{AppContext as _, Bounds, KeyBinding, WindowBounds, WindowOptions,
 
 use crate::settings::Settings;
 use crate::views::shell::{
-    Back, Cancel, FocusFilter, Forward, OpenEditor, OpenPalette, OpenRepository, OpenSettings,
-    Refresh, Shell, ToggleCode,
+    Back, Cancel, CodeZoomIn, CodeZoomOut, CodeZoomReset, FocusFilter, Forward, OpenEditor,
+    OpenPalette, OpenRepository, OpenSettings, Refresh, Shell, ToggleCode,
 };
 
 /// The key context the window's shortcuts are bound in.
@@ -32,6 +32,10 @@ pub(crate) fn run(start_dir: Option<PathBuf>) {
                 KeyBinding::new("ctrl-r", Refresh, Some(CONTEXT)),
                 KeyBinding::new("ctrl-f", FocusFilter, Some(CONTEXT)),
                 KeyBinding::new("ctrl-m", ToggleCode, Some(CONTEXT)),
+                KeyBinding::new("ctrl-=", CodeZoomIn, Some(CONTEXT)),
+                KeyBinding::new("ctrl-+", CodeZoomIn, Some(CONTEXT)),
+                KeyBinding::new("ctrl--", CodeZoomOut, Some(CONTEXT)),
+                KeyBinding::new("ctrl-0", CodeZoomReset, Some(CONTEXT)),
                 KeyBinding::new("alt-left", Back, Some(CONTEXT)),
                 KeyBinding::new("alt-right", Forward, Some(CONTEXT)),
                 KeyBinding::new("ctrl-e", OpenEditor, Some(CONTEXT)),
