@@ -202,6 +202,20 @@ pub fn greet_point(point: &Point) -> u8 {
         "unexpected `Expands` edges"
     );
 
+    // The item an attribute macro is written on is written out even though the
+    // macro re-emits it, while the constant the macro adds is generated.
+    let from_macro = |path: &str| {
+        graph
+            .symbols
+            .iter()
+            .find(|symbol| symbol.path.path == path)
+            .unwrap_or_else(|| panic!("`{path}` is in the graph"))
+            .flags
+            .from_macro
+    };
+    assert!(!from_macro("app::handler"));
+    assert!(from_macro("app::TAGGED_MARK"));
+
     // The derives of the standard library are not definitions of the workspace,
     // so they add nothing.
     assert!(

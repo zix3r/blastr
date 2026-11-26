@@ -1,5 +1,7 @@
 # A function a macro writes has no text of its own: the macro is edited, and the
-# function is written again, so it is never a *needs editing* item.
+# function is written again, so it is never a *needs editing* item. It still
+# read the removed field, so it is listed as behaving differently rather than
+# left out.
 crates = ["i33_generated_reader"]
 exact_changes = true
 
@@ -12,5 +14,9 @@ symbol = "i33_generated_reader::Point::y"
 kind = "body"
 symbol = "i33_generated_reader::vertical"
 
-[[no_impact]]
+[[impact]]
 symbol = "i33_generated_reader::vertical"
+class = "behaviour"
+confidence = "likely"
+reason = "uses-changed-field"
+distance = 1

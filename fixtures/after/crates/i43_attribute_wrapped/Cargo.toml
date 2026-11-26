@@ -1,0 +1,9 @@
+[package]
+name = "i43-attribute-wrapped"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "i43_attribute_wrapped"
+path = "src/lib.rs"
+proc-macro = true

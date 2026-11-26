@@ -918,9 +918,12 @@ impl<'a> Extractor<'a> {
     ///
     /// An attribute macro is written *on* an item: its call node is that whole
     /// item, attributes and doc comments included. The item itself, which the
-    /// macro rewrites, keeps the range of the whole item — it is written out,
-    /// and only its body was replaced — while the items the macro generates are
-    /// located at the attribute alone.
+    /// macro rewrites, and the items nested in it map back to their own text
+    /// inside that range — they are written out, even when the macro replaced
+    /// the body around them, as `#[tokio::main]` does — while the items the
+    /// macro generates are located at one of the item's attributes. The
+    /// macro's input has the invoking attribute removed, so the rewritten item
+    /// usually starts after it rather than at the start of the call node.
     fn written_by_macro(&self, file: HirFileId, location: &Location) -> bool {
         let Some(call) = file.macro_file() else {
             return false;
@@ -934,7 +937,16 @@ impl<'a> Extractor<'a> {
         let Some(site) = self.locate(node.file_id, node.value.text_range()) else {
             return true;
         };
-        !(site.file == location.file && site.span == location.span)
+        if !within(&site, location) {
+            return true;
+        }
+        let Some(item) = ast::Item::cast(node.value) else {
+            return false;
+        };
+        ast::HasAttrs::attrs(&item).any(|attr| {
+            self.locate(node.file_id, attr.syntax().text_range())
+                .is_some_and(|attr| within(&attr, location))
+        })
     }
 
     fn push(&mut self, raw: Raw, key: Option<DefKey>) -> usize {
@@ -1166,6 +1178,13 @@ fn sort_locations(locations: &mut Vec<Location>) {
         left_key.cmp(&right_key)
     });
     locations.dedup_by(|left, right| left == right);
+}
+
+/// Whether `inner` lies inside `outer`, in the same file.
+fn within(outer: &Location, inner: &Location) -> bool {
+    outer.file == inner.file
+        && outer.span.start <= inner.span.start
+        && inner.span.end <= outer.span.end
 }
 
 /// Collects the items declared directly in `node`, without descending into the

@@ -363,7 +363,9 @@ impl<'a> Search<'a> {
     /// The paths every arrival offers `item` within `limit` steps, best first.
     ///
     /// An item a macro or a derive produced has no text of its own to edit, so
-    /// it never takes the class of an adaptation; it still carries behaviour on.
+    /// it never takes the class of an adaptation: such a path makes it behave
+    /// differently instead, so that it is still listed, and it carries behaviour
+    /// on like any other.
     fn offers(&self, item: SymbolId, limit: u32) -> Vec<Offer> {
         let from_macro = self
             .input
@@ -374,7 +376,12 @@ impl<'a> Search<'a> {
         let mut offers: Vec<Offer> = self.arrivals[item.0 as usize]
             .iter()
             .flat_map(|&arrival| self.offers_of(item, arrival, limit))
-            .filter(|offer| !(from_macro && offer.class == ImpactClass::Adaptation))
+            .map(|mut offer| {
+                if from_macro {
+                    offer.class = ImpactClass::Behaviour;
+                }
+                offer
+            })
             .collect();
         offers.sort_by_key(Offer::key);
         offers
@@ -910,6 +917,32 @@ mod tests {
             ImpactClass::Adaptation,
             "the best path comes first"
         );
+    }
+
+    #[test]
+    fn a_generated_caller_of_a_changed_signature_behaves_differently() {
+        let mut builder = GraphBuilder::new();
+        let module = builder.add("krate", SymbolKind::Module);
+        let signature = builder.child(module, "krate::f", SymbolKind::Function);
+        let generated = builder.child(module, "krate::generated", SymbolKind::Function);
+        builder.symbol(generated).flags.from_macro = true;
+        builder.edge(generated, signature, EdgeKind::Calls, EdgeDetail::None);
+        let head = builder.finish();
+        let changes = vec![change(
+            ChangeKind::Signature,
+            "krate::f",
+            SymbolKind::Function,
+        )];
+
+        let result = analyse(&nothing(), &head, &changes);
+
+        assert_eq!(
+            summary(&result),
+            [("krate::generated", Confidence::Likely, 1)]
+        );
+        let item = item(&result, "krate::generated");
+        assert_eq!(item.class, ImpactClass::Behaviour);
+        assert_eq!(item.paths[0].class, ImpactClass::Behaviour);
     }
 
     #[test]

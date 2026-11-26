@@ -1,0 +1,11 @@
+[package]
+name = "i43-attribute-wrapped-user"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "i43_attribute_wrapped_user"
+path = "src/lib.rs"
+
+[dependencies]
+i43-attribute-wrapped = { path = "../i43_attribute_wrapped" }

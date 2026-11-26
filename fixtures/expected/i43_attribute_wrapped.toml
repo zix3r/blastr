@@ -1,0 +1,67 @@
+# Callers whose whole item an attribute macro re-emits, the way `#[tokio::main]`
+# rewrites `async fn main`. The macro's input is the item without the attribute,
+# and the signature and the statements keep their own tokens, so each caller and
+# its call are written in the file: a changed signature or a removal makes the
+# caller need editing exactly as it would without the attribute, and a body
+# change makes it behave differently.
+crates = ["i43_attribute_wrapped", "i43_attribute_wrapped_user"]
+exact_changes = true
+exact_impact = true
+
+[[change]]
+kind = "signature"
+symbol = "i43_attribute_wrapped_user::reshaped"
+
+[[change]]
+kind = "removed"
+symbol = "i43_attribute_wrapped_user::dropped"
+
+[[change]]
+kind = "body"
+symbol = "i43_attribute_wrapped_user::reworked"
+
+# The call is an ordinary reference of the rewritten caller, which also expands
+# the macro.
+[[edge]]
+from = "i43_attribute_wrapped_user::calls_reshaped"
+to = "i43_attribute_wrapped_user::reshaped"
+kind = "calls"
+side = "both"
+certainty = "resolved"
+
+[[edge]]
+from = "i43_attribute_wrapped_user::calls_reshaped"
+to = "i43_attribute_wrapped::wrapped"
+kind = "expands"
+side = "both"
+certainty = "resolved"
+
+# No doc comment: the item starts after the attribute.
+[[impact]]
+symbol = "i43_attribute_wrapped_user::calls_reshaped"
+class = "adaptation"
+confidence = "definite"
+reason = "signature-changed"
+distance = 1
+
+# A doc comment after the attribute: the item starts at the doc comment.
+[[impact]]
+symbol = "i43_attribute_wrapped_user::calls_reshaped_documented"
+class = "adaptation"
+confidence = "definite"
+reason = "signature-changed"
+distance = 1
+
+[[impact]]
+symbol = "i43_attribute_wrapped_user::calls_dropped"
+class = "adaptation"
+confidence = "definite"
+reason = "refers-to-removed"
+distance = 1
+
+[[impact]]
+symbol = "i43_attribute_wrapped_user::calls_reworked"
+class = "behaviour"
+confidence = "likely"
+reason = "calls-changed"
+distance = 1
