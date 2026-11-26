@@ -1258,6 +1258,17 @@ fn fixtures() {
     let analysis = engine
         .analyze(&request, &NoProgress, &CancelToken::new(), &mut |_| {})
         .unwrap_or_else(|error| fail(error));
+    // Every crate of the fixture workspaces has code, so none may be reported
+    // as yielding no symbols.
+    assert!(
+        !analysis
+            .diff
+            .limits
+            .iter()
+            .any(|limit| matches!(limit, blastr_model::Limit::CratesWithoutSymbols { .. })),
+        "{:?}",
+        analysis.diff.limits
+    );
     // Both graphs come from the cache the analysis filled.
     let [base, head] = [
         &analysis.diff.comparison.base,

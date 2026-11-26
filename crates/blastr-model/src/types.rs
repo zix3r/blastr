@@ -460,6 +460,12 @@ pub enum Limit {
         /// How many, on both sides together.
         count: u32,
     },
+    /// Crates of the workspace that were loaded but yielded no symbols at all,
+    /// so nothing they contain is part of the analysis.
+    CratesWithoutSymbols {
+        /// The crates, as `name (root file)`, sorted and without duplicates.
+        crates: Vec<String>,
+    },
 }
 
 /// The result of comparing two sides structurally.

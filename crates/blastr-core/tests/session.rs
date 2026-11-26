@@ -8,10 +8,12 @@
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::sync::Mutex;
 
-use blastr_core::{AnalysisRequest, Engine};
+use blastr_core::{AnalysisRequest, Engine, Session};
 use blastr_model::{
-    AnalysisOptions, AnalysisParams, CancelToken, ImpactClass, NoProgress, RevSpec,
+    AnalysisOptions, AnalysisParams, Assume, CancelToken, ImpactClass, NoProgress, RevSpec,
+    RevisionGraph, SymbolKind, SymbolPath,
 };
 
 /// The library of the crate under test.
@@ -150,4 +152,94 @@ fn a_session_reports_what_a_save_affects() {
         .clone();
     assert!(refresh.diff.changes.is_empty());
     assert!(refresh.items.is_empty());
+    // The reverted file is no longer a changed file, yet the loaded project
+    // has to get its text back, or the graph keeps describing the edit.
+    let body = |graph: &RevisionGraph| {
+        graph
+            .symbols
+            .iter()
+            .find(|symbol| symbol.path.path == "session_app::used")
+            .map(|symbol| symbol.body_hash)
+    };
+    assert_eq!(body(session.head_graph()), body(session.base_graph()));
+}
+
+/// Opens a session on `dir` comparing `HEAD` with the working tree, with its
+/// cache in `cache`.
+fn open_session(dir: &Path, cache: &Path) -> (Engine, Session) {
+    let engine = Engine::with_paths(blastr_model::Paths::under(cache));
+    let spec = RevSpec {
+        worktree: true,
+        ..RevSpec::default()
+    };
+    let request = AnalysisRequest {
+        repo_root: dir,
+        spec: &spec,
+        options: &AnalysisOptions::default(),
+        params: &AnalysisParams::default(),
+    };
+    let session = engine
+        .session(&request, &NoProgress, &CancelToken::new(), &mut |_| {})
+        .expect("the session opens");
+    (engine, session)
+}
+
+/// Runs a what-if on `used` and returns the phases it reported.
+fn what_if_phases(engine: &Engine, dir: &Path) -> Vec<String> {
+    let phases = Mutex::new(Vec::new());
+    let record = |phase: &str, _done: u64, _total: Option<u64>| {
+        phases
+            .lock()
+            .expect("the lock is not poisoned")
+            .push(phase.to_owned());
+    };
+    let analysis = engine
+        .what_if(
+            dir,
+            &SymbolPath::new("session_app::used", SymbolKind::Function),
+            Assume::Body,
+            &AnalysisOptions::default(),
+            &AnalysisParams::default(),
+            &record,
+            &CancelToken::new(),
+        )
+        .expect("the what-if runs");
+    assert!(!analysis.items.is_empty());
+    phases.into_inner().expect("the lock is not poisoned")
+}
+
+/// A what-if right after a session opened, or after it refreshed, reads the
+/// graph of the working tree the session made instead of loading the project
+/// a second time, which on a large workspace takes the better part of a
+/// minute.
+#[test]
+fn a_what_if_reuses_the_graph_of_the_session() {
+    let temp = tempfile::tempdir().expect("create a temporary directory");
+    let dir = temp.path();
+    repository(dir);
+    // The load writes a `Cargo.lock`. A working tree the load itself changes
+    // is not stored, because a save during the load would look the same.
+    fs::write(dir.join(".gitignore"), "target\nCargo.lock\n").expect("write the ignore file");
+    let outside = tempfile::tempdir().expect("create a second temporary directory");
+    let (engine, mut session) = open_session(dir, outside.path());
+
+    let phases = what_if_phases(&engine, dir);
+    assert!(
+        !phases.iter().any(|phase| phase == "load head"),
+        "{phases:?}"
+    );
+
+    fs::write(
+        dir.join("src/lib.rs"),
+        LIB.replace("value * 2", "value * 3"),
+    )
+    .expect("write the library");
+    session
+        .refresh(&NoProgress, &CancelToken::new(), &mut |_| {})
+        .expect("the session refreshes");
+    let phases = what_if_phases(&engine, dir);
+    assert!(
+        !phases.iter().any(|phase| phase == "load head"),
+        "{phases:?}"
+    );
 }

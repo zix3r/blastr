@@ -11,11 +11,13 @@ use std::sync::Arc;
 
 use blastr_git::Repo;
 use blastr_model::{
-    Analysis, AnalysisOptions, AnalysisParams, CancelToken, Comparison, DiffResult, Progress,
-    RevSpec, RevisionGraph, Source,
+    Analysis, AnalysisKey, AnalysisOptions, AnalysisParams, CancelToken, ChangedFile, Comparison,
+    DiffResult, FileStatus, Progress, RelPath, RevSpec, RevisionGraph, Source,
 };
 
-use crate::engine::{AnalysisRequest, Engine, open_repo, toolchain_version};
+use crate::cache::{Cache, Kind};
+use crate::codec;
+use crate::engine::{AnalysisRequest, Engine, analysis_key, open_repo, toolchain_version};
 use crate::error::{Error, Result};
 use crate::pipeline::{Loaded, Run, Sides, pipeline, union_of};
 
@@ -38,6 +40,14 @@ pub struct Session {
     seen: String,
     /// The [`Repo::worktree_stamp`] at which `seen` was last confirmed.
     stamp: String,
+    /// The files whose text in the loaded project may differ from the base
+    /// side: the ones that differed when the project was loaded or last
+    /// refreshed.
+    applied: Vec<RelPath>,
+    /// The engine's cache, which keeps the graph of the working tree so that
+    /// a what-if or a symbol search of the same content does not load the
+    /// project a second time.
+    cache: Cache,
 }
 
 impl Session {
@@ -99,10 +109,6 @@ impl Session {
         on_changes: &mut dyn FnMut(&DiffResult),
     ) -> Result<&Analysis> {
         cancel.check()?;
-        // Taken before anything is read, so that a save during the refresh
-        // makes the session stale again.
-        let stamp = self.repo.worktree_stamp()?;
-        let seen = worktree_id(&self.repo)?;
         let repo = &self.repo;
         let run = Run {
             repo,
@@ -111,12 +117,41 @@ impl Session {
             progress,
             cancel,
         };
+        // Taken before anything is read, so that a save during the refresh
+        // makes the session stale again.
+        let stamp = repo.worktree_stamp()?;
+        let head_key = analysis_key(&run, &Source::Worktree)?;
+        let seen = head_key
+            .as_ref()
+            .map(|key| key.source.clone())
+            .unwrap_or_default();
         let changed_files = repo.changed_files(&self.comparison)?;
-        progress.report("apply", changed_files.len() as u64, None);
-        let head = self
-            .loaded
-            .overlay(&run, &Source::Worktree, &changed_files)?;
+        let touched = touched_paths(&changed_files);
+        // The loaded project keeps the text a file was last given. A file
+        // edited when the session opened, or given its text by an earlier
+        // refresh, that no longer differs from the base side is not among the
+        // changed files, so it is given the text it has now.
+        let mut edits = changed_files.clone();
+        for path in &self.applied {
+            if touched.contains(path) {
+                continue;
+            }
+            let status = if repo.read_file(&Source::Worktree, path)?.is_some() {
+                FileStatus::Modified
+            } else {
+                FileStatus::Deleted
+            };
+            edits.push(ChangedFile {
+                path: path.clone(),
+                old_path: None,
+                status,
+            });
+        }
+        progress.report("apply", edits.len() as u64, None);
+        let head = self.loaded.overlay(&run, &Source::Worktree, &edits)?;
+        self.applied = touched;
         self.sides.head = Arc::new(head);
+        self.sides.head_key = head_key;
         self.analysis = pipeline(
             &run,
             &self.comparison,
@@ -125,6 +160,13 @@ impl Session {
             &self.params,
             on_changes,
         )?;
+        remember(
+            &self.cache,
+            &self.sides.head_key,
+            &analysis_key(&run, &Source::Worktree)?,
+            &self.sides.head,
+            &self.loaded.missing_macros,
+        );
         self.seen = seen;
         self.stamp = stamp;
         Ok(&self.analysis)
@@ -163,9 +205,10 @@ impl Engine {
             progress,
             cancel,
         };
-        let base_key = self.key(&run, &comparison.base)?;
-        let head_key = self.key(&run, &comparison.head)?;
+        let base_key = analysis_key(&run, &comparison.base)?;
+        let head_key = analysis_key(&run, &comparison.head)?;
         let changed_files = repo.changed_files(&comparison)?;
+        let applied = touched_paths(&changed_files);
 
         let base = self.fetch(&run, &comparison.base, &base_key, "base")?;
         let loaded = self.load(&run, &Source::Worktree, "head")?;
@@ -187,7 +230,18 @@ impl Engine {
         )?;
         // Taken after the load, which may write `Cargo.lock`.
         let stamp = repo.worktree_stamp()?;
-        let seen = worktree_id(&repo)?;
+        let loaded_key = analysis_key(&run, &Source::Worktree)?;
+        let seen = loaded_key
+            .as_ref()
+            .map(|key| key.source.clone())
+            .unwrap_or_default();
+        remember(
+            self.cache(),
+            &sides.head_key,
+            &loaded_key,
+            &sides.head,
+            &loaded.missing_macros,
+        );
         Ok(Session {
             repo,
             spec: request.spec.clone(),
@@ -200,8 +254,51 @@ impl Engine {
             analysis,
             seen,
             stamp,
+            applied,
+            cache: self.cache().clone(),
         })
     }
+}
+
+/// Stores the graph of the working tree under `key`, so that a what-if or a
+/// symbol search of the same content reads it instead of loading the project
+/// again: a load of a large workspace takes the better part of a minute, and
+/// the session has just done one.
+///
+/// `before` is the key of the working tree before the graph was made, `after`
+/// the one once it was; the graph is stored under `after`, whose lock-file
+/// hash already counts a `Cargo.lock` the load wrote. It is only stored when
+/// it is complete and the content did not change in between: a file saved
+/// while the graph was made would otherwise leave a graph of one content under
+/// the key of another. A cache that cannot be written costs only speed, so the
+/// failure is logged.
+fn remember(
+    cache: &Cache,
+    before: &Option<AnalysisKey>,
+    after: &Option<AnalysisKey>,
+    graph: &RevisionGraph,
+    missing_macros: &[String],
+) {
+    let (Some(before), Some(key)) = (before, after) else {
+        return;
+    };
+    if !missing_macros.is_empty() || before.source != key.source {
+        return;
+    }
+    let stored =
+        codec::encode(graph).and_then(|bytes| Ok(cache.put(Kind::Graph, &key.hash(), &bytes)?));
+    if let Err(error) = stored {
+        tracing::warn!("could not keep the graph of the working tree: {error}");
+    }
+}
+
+/// The paths of `files`, with the old path of a renamed file.
+fn touched_paths(files: &[ChangedFile]) -> Vec<RelPath> {
+    files
+        .iter()
+        .flat_map(|file| std::iter::once(&file.path).chain(&file.old_path))
+        .cloned()
+        .collect()
 }
 
 /// The content id of the working tree as it is on disk now.

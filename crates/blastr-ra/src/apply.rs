@@ -8,8 +8,9 @@
 //!   revisions keeps its id; a file it has never seen gets a fresh one,
 //! - the source roots are partitioned again, so that an added file belongs to
 //!   the same local source root as the rest of its package (the crate graph
-//!   itself is unchanged, which is why the caller requires the two revisions to
-//!   share their `Cargo.toml` and `Cargo.lock`),
+//!   itself is unchanged, which is why the caller only applies a revision
+//!   whose changed files cannot change the crates: no manifest, lock file or
+//!   build script, and no target added where Cargo discovers one),
 //! - one [`ChangeWithProcMacros`] carries the new texts into the database;
 //!   `AnalysisHost::apply_change` then invalidates everything derived from them.
 

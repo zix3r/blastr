@@ -481,10 +481,17 @@ fn loaded_targets(root: &Path, vfs: &ra_ap_vfs::Vfs, targets: Vec<Target>) -> Ve
     for target in targets {
         let root_path: &Path = target.root.as_ref();
         let Some(root_file) = root.relative(root_path) else {
+            // A member's root outside the repository cannot be reported in
+            // it; the crate is left out, and the log says so.
+            tracing::warn!(
+                "leaving out `{}`: its root is outside the project",
+                target.name
+            );
             continue;
         };
         let path = VfsPath::from(target.root);
         let Some((file_id, _excluded)) = vfs.file_id(&path) else {
+            tracing::warn!("leaving out `{}`: its root was not loaded", target.name);
             continue;
         };
         crates.push(MemberCrate {

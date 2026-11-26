@@ -14,7 +14,8 @@ use std::time::{Duration, SystemTime};
 use blastr_git::Repo;
 use blastr_model::{
     Analysis, AnalysisKey, AnalysisOptions, AnalysisParams, Assume, CancelToken, ChangedFile,
-    Comparison, DiffResult, Paths, Progress, RelPath, RevSpec, RevisionGraph, Source, SymbolPath,
+    Comparison, DiffResult, FileStatus, Paths, Progress, RelPath, RevSpec, RevisionGraph, Source,
+    SymbolPath,
 };
 
 use blastr_model::protocol::CacheStatus;
@@ -40,6 +41,12 @@ const UNKNOWN_TOOLCHAIN: &str = "unknown";
 
 /// The file name that fixes the dependency graph of the project.
 const LOCK_FILE: &str = "Cargo.lock";
+
+/// The file name of a package's build script, which Cargo finds by it.
+const BUILD_SCRIPT: &str = "build.rs";
+
+/// The directories in which Cargo discovers targets by their file names.
+const TARGET_DIRECTORIES: &[&str] = &["bin", "tests", "examples", "benches"];
 
 /// Text hashed into every result key ahead of the two analysis keys, so that a
 /// result key can never repeat a digest computed for another purpose.
@@ -176,8 +183,8 @@ impl Engine {
 
         // Both keys are known without loading anything, so a finished analysis
         // is found before any snapshot or project load starts.
-        let base_key = self.key(&run, &comparison.base)?;
-        let head_key = self.key(&run, &comparison.head)?;
+        let base_key = analysis_key(&run, &comparison.base)?;
+        let head_key = analysis_key(&run, &comparison.head)?;
         let result_key = match (&base_key, &head_key) {
             (Some(base), Some(head)) => Some(result_key(base, head, request.params)?),
             // A side without a content id cannot be named, so its analysis
@@ -243,13 +250,14 @@ impl Engine {
             progress,
             cancel,
         };
-        let key = self.key(&run, &Source::Worktree)?;
+        let key = analysis_key(&run, &Source::Worktree)?;
         let fetched = self.fetch(&run, &Source::Worktree, &key, "head")?;
         let change = crate::impact::whatif::assumed_change(&fetched.graph, symbol, assume)?;
         // The working tree is compared with itself, so none of its lines
         // changed.
         let limits = collect_limits(
             &run,
+            &fetched.graph,
             &fetched.graph,
             fetched.graph.failed_queries,
             &BTreeMap::new(),
@@ -292,7 +300,7 @@ impl Engine {
             progress,
             cancel,
         };
-        let key = self.key(&run, source)?;
+        let key = analysis_key(&run, source)?;
         Ok(Arc::new(self.fetch(&run, source, &key, "head")?.graph))
     }
 
@@ -326,9 +334,9 @@ impl Engine {
     /// The two graphs of a comparison.
     ///
     /// A side found in the cache is read from it. When neither side is, and
-    /// both are the same Cargo project, the project is loaded once from the
-    /// base side and the head side is applied on top of it; otherwise each
-    /// missing side is loaded on its own.
+    /// no changed file changes the crates of the project, the project is
+    /// loaded once from the base side and the head side is applied on top of
+    /// it; otherwise each missing side is loaded on its own.
     pub(crate) fn sides(
         &self,
         run: &Run<'_>,
@@ -339,7 +347,7 @@ impl Engine {
     ) -> Result<Sides> {
         let base = self.cached(&base_key)?;
         let head = self.cached(&head_key)?;
-        if base.is_none() && head.is_none() && self.same_project(run, comparison)? {
+        if base.is_none() && head.is_none() && same_project(changed_files) {
             // One project load, two extractions; the project is dropped before
             // the graphs are stored so that it does not stay in memory.
             let (base, head, missing_macros) = {
@@ -459,21 +467,6 @@ impl Engine {
         Ok(Loaded::new(workspace))
     }
 
-    /// True when both sides are the same Cargo project, so that the project
-    /// loaded from the base side describes both: `Cargo.toml` and `Cargo.lock`
-    /// in the manifest directory are byte-for-byte equal, or absent from both.
-    fn same_project(&self, run: &Run<'_>, comparison: &Comparison) -> Result<bool> {
-        for name in [MANIFEST_FILE, LOCK_FILE] {
-            let path = project_file(run.options, name);
-            if run.repo.read_file(&comparison.base, &path)?
-                != run.repo.read_file(&comparison.head, &path)?
-            {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-
     /// Writes one graph into the cache under `key`; nothing happens without a key.
     fn store(&self, key: &Option<AnalysisKey>, graph: &RevisionGraph) -> Result<()> {
         if let Some(key) = key {
@@ -484,38 +477,91 @@ impl Engine {
         Ok(())
     }
 
-    /// The analysis key of one side, computed without loading the project;
-    /// `None` when the source has no content id.
-    pub(crate) fn key(&self, run: &Run<'_>, source: &Source) -> Result<Option<AnalysisKey>> {
-        let Some(content_id) = run.repo.content_id(source)? else {
-            return Ok(None);
-        };
-        let options = run.options;
-        let mut features = options.features.clone();
-        features.sort();
-        features.dedup();
-        let cargo_lock = match run
-            .repo
-            .read_file(source, &project_file(options, LOCK_FILE))?
-        {
-            Some(bytes) => blake3::hash(&bytes).to_hex().to_string(),
-            None => String::new(),
-        };
-        Ok(Some(AnalysisKey {
-            repository: run.repo.repository_id(),
-            source: content_id,
-            features,
-            all_features: options.all_features,
-            target: options.target.clone(),
-            cfg_test: true,
-            cargo_lock,
-            toolchain: run.toolchain.to_owned(),
-            rust_analyzer: blastr_ra::RUST_ANALYZER_VERSION.to_owned(),
-            blastr: build_id().to_owned(),
-            exec: options.exec,
-            manifest_dir: options.manifest_dir.clone(),
-        }))
+    /// The cache the engine reads and writes graphs in.
+    pub(crate) fn cache(&self) -> &Cache {
+        &self.cache
     }
+}
+
+/// The analysis key of one side, computed without loading the project;
+/// `None` when the source has no content id.
+pub(crate) fn analysis_key(run: &Run<'_>, source: &Source) -> Result<Option<AnalysisKey>> {
+    let Some(content_id) = run.repo.content_id(source)? else {
+        return Ok(None);
+    };
+    let options = run.options;
+    let mut features = options.features.clone();
+    features.sort();
+    features.dedup();
+    let cargo_lock = match run
+        .repo
+        .read_file(source, &project_file(options, LOCK_FILE))?
+    {
+        Some(bytes) => blake3::hash(&bytes).to_hex().to_string(),
+        None => String::new(),
+    };
+    Ok(Some(AnalysisKey {
+        repository: run.repo.repository_id(),
+        source: content_id,
+        features,
+        all_features: options.all_features,
+        target: options.target.clone(),
+        cfg_test: true,
+        cargo_lock,
+        toolchain: run.toolchain.to_owned(),
+        rust_analyzer: blastr_ra::RUST_ANALYZER_VERSION.to_owned(),
+        blastr: build_id().to_owned(),
+        exec: options.exec,
+        manifest_dir: options.manifest_dir.clone(),
+    }))
+}
+
+/// True when both sides are the same Cargo project, so that the project
+/// loaded from the base side describes both: none of the files that differ
+/// between them can change which crates the project has, how they depend on
+/// each other, or what their build scripts produce.
+///
+/// Applying the head side to a loaded project only replaces file texts; it
+/// cannot add a crate. Comparing the root `Cargo.toml` alone is not enough: a
+/// commit that adds a member under a `members = ["crates/*"]` glob, or a
+/// binary to a member's own manifest, leaves the root manifest and the lock
+/// file alone, and the applied head side would silently lack the new crates.
+fn same_project(changed_files: &[ChangedFile]) -> bool {
+    !changed_files.iter().any(|file| {
+        changes_project(&file.path, file.status)
+            || file
+                .old_path
+                .as_ref()
+                .is_some_and(|old| changes_project(old, file.status))
+    })
+}
+
+/// True when a file at `path` that changed with `status` can change the crates
+/// of a Cargo project: a manifest or lock file anywhere in the tree, Cargo's
+/// configuration, a build script, or a Rust file added, removed or renamed
+/// where Cargo finds targets by their location (`src/lib.rs`, `src/main.rs`,
+/// `src/bin`, `tests`, `examples` and `benches`).
+///
+/// A file that only looks like one of these costs a second project load, while
+/// a crate graph that misses one is silently wrong, so the test errs on the
+/// side of a load.
+fn changes_project(path: &RelPath, status: FileStatus) -> bool {
+    let segments: Vec<&str> = path.as_str().split('/').collect();
+    let Some((name, directories)) = segments.split_last() else {
+        return false;
+    };
+    if matches!(*name, MANIFEST_FILE | LOCK_FILE | BUILD_SCRIPT) || directories.contains(&".cargo")
+    {
+        return true;
+    }
+    if status == FileStatus::Modified || !name.ends_with(".rs") {
+        return false;
+    }
+    let crate_root = matches!(*name, "lib.rs" | "main.rs") && directories.last() == Some(&"src");
+    crate_root
+        || directories
+            .iter()
+            .any(|directory| TARGET_DIRECTORIES.contains(directory))
 }
 
 /// Opens the repository that holds `dir`.
@@ -734,6 +780,64 @@ mod tests {
             cache_dir: dir.to_path_buf(),
             config_dir: dir.join("config"),
         }
+    }
+
+    /// A changed file at `path` with `status`.
+    fn changed(path: &str, status: FileStatus) -> ChangedFile {
+        ChangedFile {
+            path: RelPath::new(path),
+            old_path: None,
+            status,
+        }
+    }
+
+    #[test]
+    fn edited_sources_keep_the_project() {
+        let files = [
+            changed("crates/a/src/lib.rs", FileStatus::Modified),
+            changed("crates/a/src/bin/tool.rs", FileStatus::Modified),
+            changed("crates/a/src/parse.rs", FileStatus::Added),
+            changed("crates/a/src/old.rs", FileStatus::Deleted),
+            changed("README.md", FileStatus::Added),
+        ];
+        assert!(same_project(&files));
+    }
+
+    #[test]
+    fn a_member_manifest_or_a_new_member_changes_the_project() {
+        // `d3171cf` of Blastr itself: a member under `crates/*` and a binary in
+        // another member, with the root manifest and the lock file untouched.
+        for file in [
+            changed("crates/blastr-mcp/Cargo.toml", FileStatus::Added),
+            changed("crates/blastr/Cargo.toml", FileStatus::Modified),
+            changed("Cargo.lock", FileStatus::Modified),
+            changed("crates/a/build.rs", FileStatus::Modified),
+            changed(".cargo/config.toml", FileStatus::Added),
+        ] {
+            assert!(!same_project(std::slice::from_ref(&file)), "{file:?}");
+        }
+    }
+
+    #[test]
+    fn a_target_cargo_discovers_changes_the_project() {
+        for file in [
+            changed("crates/blastr/src/bin/blastr-mcp.rs", FileStatus::Added),
+            changed("src/bin/tool/main.rs", FileStatus::Deleted),
+            changed("crates/a/tests/server.rs", FileStatus::Added),
+            changed("examples/demo.rs", FileStatus::Added),
+            changed("benches/speed.rs", FileStatus::Deleted),
+            changed("src/main.rs", FileStatus::Added),
+            changed("crates/a/src/lib.rs", FileStatus::Deleted),
+        ] {
+            assert!(!same_project(std::slice::from_ref(&file)), "{file:?}");
+        }
+        // A rename away from such a place removes a target as well.
+        let renamed = ChangedFile {
+            path: RelPath::new("src/tool.rs"),
+            old_path: Some(RelPath::new("src/bin/tool.rs")),
+            status: FileStatus::Renamed,
+        };
+        assert!(!same_project(&[renamed]));
     }
 
     #[test]

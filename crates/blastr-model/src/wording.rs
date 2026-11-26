@@ -252,6 +252,10 @@ fn limit_text(limit: &Limit) -> String {
             let noun = count_noun(*count, "query", "queries");
             format!("rust-analyzer failed on {count} {noun}, so parts of the graph are missing")
         }
+        Limit::CratesWithoutSymbols { crates } => {
+            let names = crates.join(", ");
+            format!("no symbols were found in {names}; that code is missing from the analysis")
+        }
     }
 }
 

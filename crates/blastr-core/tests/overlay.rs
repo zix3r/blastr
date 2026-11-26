@@ -222,6 +222,87 @@ fn a_different_manifest_takes_the_full_path() {
     assert!(phases.has("load head"), "{phases:?}");
 }
 
+/// A workspace whose root manifest names its members by a glob.
+const WORKSPACE: &[(&str, &str)] = &[
+    (
+        "Cargo.toml",
+        "[workspace]\nresolver = \"3\"\nmembers = [\"crates/*\"]\n",
+    ),
+    (
+        "crates/app/Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    ),
+    ("crates/app/src/lib.rs", "pub fn run() -> i64 {\n    1\n}\n"),
+];
+
+/// What the next commit adds to [`WORKSPACE`]: a member the glob picks up and
+/// a binary Cargo finds by its place, while the root manifest stays as it was.
+const NEW_CRATES: &[(&str, &str)] = &[
+    (
+        "crates/tool/Cargo.toml",
+        "[package]\nname = \"tool\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    ),
+    (
+        "crates/tool/src/lib.rs",
+        "pub fn helper() -> i64 {\n    2\n}\n",
+    ),
+    (
+        "crates/app/src/bin/app-cli.rs",
+        "fn main() {\n    let _ = app::run();\n}\n\nfn parse() -> i64 {\n    3\n}\n",
+    ),
+];
+
+/// Checks that crates a commit adds reach the head graph even though the root
+/// manifest did not change; applying the head side to the base project could
+/// not add them, and their symbols went missing without a word.
+#[test]
+fn added_crates_take_the_full_path() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let repo = dir.path().join("repo");
+    write_files(&repo, WORKSPACE);
+    fs::write(repo.join(".gitignore"), "target\nCargo.lock\n").expect("the ignore file is written");
+    git(&repo, &["init", "--quiet", "."]);
+    commit(&repo, "base");
+    write_files(&repo, NEW_CRATES);
+    commit(&repo, "head");
+
+    let phases = Phases::default();
+    let engine = engine(&dir.path().join("cache"));
+    let request = AnalysisRequest {
+        repo_root: &repo,
+        spec: &last_commit(),
+        options: &AnalysisOptions::default(),
+        params: &AnalysisParams::default(),
+    };
+    let analysis = engine
+        .analyze(&request, &phases, &CancelToken::new(), &mut |_| {})
+        .expect("the analysis runs");
+
+    let added: Vec<&str> = analysis
+        .diff
+        .changes
+        .iter()
+        .map(|change| change.symbol.path.as_str())
+        .collect();
+    assert!(added.contains(&"tool::helper"), "{added:?}");
+    assert!(added.contains(&"app_cli::parse"), "{added:?}");
+    assert!(
+        analysis.diff.limits.is_empty(),
+        "{:?}",
+        analysis.diff.limits
+    );
+
+    let [_, head] = graphs(&engine, &repo, &analysis.diff.comparison, &phases);
+    let crates: Vec<&str> = head
+        .crates
+        .iter()
+        .map(|krate| krate.name.as_str())
+        .collect();
+    assert!(crates.contains(&"tool"), "{crates:?}");
+    assert!(crates.contains(&"app_cli"), "{crates:?}");
+    assert!(phases.has("load head"), "{phases:?}");
+}
+
 /// Compares two graphs field by field, so that a failure names the part that differs.
 fn assert_same_graph(actual: &RevisionGraph, expected: &RevisionGraph, side: &str) {
     assert_eq!(actual.crates, expected.crates, "{side}: crates differ");

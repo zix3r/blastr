@@ -153,6 +153,7 @@ pub(crate) fn pipeline(
     let lines = changed_lines_of(run.repo, comparison, &changed_files)?;
     let limits = collect_limits(
         run,
+        &sides.base,
         &sides.head,
         sides.base.failed_queries + sides.head.failed_queries,
         &lines,
@@ -297,6 +298,7 @@ fn changed_lines_of(
 /// rust-analyzer queries that failed while the graphs were extracted.
 pub(crate) fn collect_limits(
     run: &Run<'_>,
+    base: &RevisionGraph,
     head: &RevisionGraph,
     failed_queries: u32,
     changed_lines: &BTreeMap<RelPath, Vec<RangeInclusive<u32>>>,
@@ -315,6 +317,10 @@ pub(crate) fn collect_limits(
         limits.push(Limit::FailedQueries {
             count: failed_queries,
         });
+    }
+    let empty = union_of(&crates_without_symbols(base), &crates_without_symbols(head));
+    if !empty.is_empty() {
+        limits.push(Limit::CratesWithoutSymbols { crates: empty });
     }
     if run.repo.has_submodules()? {
         limits.push(Limit::Submodules);
@@ -343,8 +349,29 @@ pub(crate) fn collect_limits(
     Ok(limits)
 }
 
-/// The union of two lists of crates that did not bring their macros, sorted and
-/// without duplicates.
+/// The crates of `graph` that have no symbol, as `name (root file)`.
+///
+/// Every crate that is extracted has at least its root module, so a crate
+/// without any symbol was loaded but not found again in rust-analyzer's
+/// database, or its files could not be placed in the repository. Either way
+/// its code is missing, and saying so beats a result that looks complete.
+fn crates_without_symbols(graph: &RevisionGraph) -> Vec<String> {
+    let mut used = vec![false; graph.crates.len()];
+    for symbol in &graph.symbols {
+        if let Some(slot) = used.get_mut(symbol.krate.0 as usize) {
+            *slot = true;
+        }
+    }
+    graph
+        .crates
+        .iter()
+        .zip(used)
+        .filter(|(_, used)| !used)
+        .map(|(krate, _)| format!("{} ({})", krate.name, krate.root_file.as_str()))
+        .collect()
+}
+
+/// The union of two lists of crate names, sorted and without duplicates.
 pub(crate) fn union_of(left: &[String], right: &[String]) -> Vec<String> {
     let mut union: Vec<String> = left.iter().chain(right).cloned().collect();
     union.sort();
@@ -356,7 +383,70 @@ pub(crate) fn union_of(left: &[String], right: &[String]) -> Vec<String> {
 mod tests {
     use std::sync::Mutex;
 
+    use blastr_model::{
+        CrateId, CrateInfo, Location, Span, Symbol, SymbolFlags, SymbolKind, SymbolPath,
+        TargetKind, Visibility,
+    };
+
     use super::*;
+
+    /// A crate of the workspace named `name`, rooted at `root`.
+    fn krate(name: &str, kind: TargetKind, root: &str) -> CrateInfo {
+        CrateInfo {
+            name: name.to_owned(),
+            package: name.to_owned(),
+            target_kind: kind,
+            target_name: name.to_owned(),
+            root_file: RelPath::new(root),
+        }
+    }
+
+    /// The root module of crate `index`, named `name`.
+    fn root_module(name: &str, index: u32, root: &str) -> Symbol {
+        Symbol {
+            path: SymbolPath::new(name, SymbolKind::Module),
+            krate: CrateId(index),
+            location: Location {
+                file: RelPath::new(root),
+                span: Span {
+                    start: 0,
+                    end: 1,
+                    start_line: 1,
+                    end_line: 1,
+                },
+            },
+            visibility: Visibility::Public,
+            signature_hash: 0,
+            body_hash: 0,
+            attr_hash: 0,
+            body_sketch: Vec::new(),
+            parent: None,
+            flags: SymbolFlags::default(),
+            impl_info: None,
+        }
+    }
+
+    #[test]
+    fn a_crate_without_symbols_is_named() {
+        // Two crates share a name, as a library and a binary may; only the
+        // root file tells them apart.
+        let mut graph = RevisionGraph::default();
+        graph
+            .crates
+            .push(krate("tool", TargetKind::Lib, "crates/tool/src/lib.rs"));
+        graph
+            .crates
+            .push(krate("tool", TargetKind::Bin, "src/bin/tool.rs"));
+        graph
+            .symbols
+            .push(root_module("tool", 0, "crates/tool/src/lib.rs"));
+        assert_eq!(crates_without_symbols(&graph), ["tool (src/bin/tool.rs)"]);
+
+        graph
+            .symbols
+            .push(root_module("tool", 1, "src/bin/tool.rs"));
+        assert!(crates_without_symbols(&graph).is_empty());
+    }
 
     #[test]
     fn a_step_is_reported_under_the_phase_that_runs_it() {
