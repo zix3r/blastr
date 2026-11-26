@@ -78,9 +78,6 @@ pub fn status(status: &Status) -> Shaped {
             let _ = writeln!(text, "Options: {}", parts.join("; "));
         }
     }
-    if status.busy {
-        text.push_str("A run is in progress.\n");
-    }
     if let Some(failure) = &status.failure {
         let _ = writeln!(text, "Failed: {failure}");
     }
