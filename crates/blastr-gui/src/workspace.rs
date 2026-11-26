@@ -553,9 +553,15 @@ impl Workspace {
 
     /// Goes back from a hypothetical change to the comparison.
     pub(crate) fn leave_what_if(&mut self, cx: &mut Context<Self>) {
+        let was_shown = self.session.what_if.is_some();
         self.session.leave_what_if();
         self.flush_cancels(cx);
         self.rebuild_rows();
+        // The engine stops following the working tree to run a what-if, so
+        // the comparison is run again to follow saves once more.
+        if was_shown && self.session.compare.as_ref().is_some_and(Compare::watches) {
+            self.retry(cx);
+        }
         cx.notify();
     }
 
